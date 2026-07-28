@@ -1,1 +1,36 @@
+WorkerProc hit an exception.
 
+Traceback (most recent call last):
+  File "/vllm-workspace/vllm/vllm/v1/executor/multiproc_executor.py", line 982, in worker_busy_loop
+    output = func(*args, **kwargs)
+  File "/mnt/share/wO0848461/kimi-k3/ver1/ver1/workers/rollout/vllm_rollout/utils.py", line 304, in update_weights_from_ipc
+    receiver.receive_weights()
+  File "/mnt/share/wO0848461/kimi-k3/ver1/ver1/workers/rollout/vllm_rollout/bucketed_weight_transfer.py", line 289, in receive_weights
+    on_bucket_received(weights)
+  File "/mnt/share/wO0848461/kimi-k3/ver1/ver1/workers/rollout/vllm_rollout/utils.py", line 305, in <lambda>
+    on_bucket_received=lambda weights: self._update_weights
+  File "/mnt/share/wO0848461/kimi-k3/ver1/ver1/workers/rollout/vllm_rollout/utils.py", line 390, in _update_weights
+    model.load_weights(param_updates)
+  File "/mnt/share/x00886548/vllm-code/xmz_kimi3/vllm-ascend-kimi-k3/vllm_ascend/models/kimi_k3.py", line 383, in load_weights
+    return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+  File "/vllm-workspace/vllm/vllm/model_executor/model_loader/reload/torchao_decorator.py", line 50, in patched_model_load_weights
+    return original_load_weights(self, weights, *args, **kwargs)
+  File "/vllm-workspace/vllm/vllm/model_executor/models/utils.py", line 368, in load_weights
+    autoloaded_weights = set(self._load_module("", self.module, weights))
+  File "/vllm-workspace/vllm/vllm/model_executor/models/utils.py", line 301, in _load_module
+    yield from self._load_module(
+  File "/vllm-workspace/vllm/vllm/model_executor/models/utils.py", line 274, in _load_module
+    loaded_params = module.load_weights(weights)
+  File "/mnt/share/x00886548/vllm-code/xmz_kimi3/vllm-ascend-kimi-k3/vllm_ascend/models/kimi_k3_text.py", line 758, in load_weights
+    return loader.load_weights(weights)
+  File "/vllm-workspace/vllm/vllm/model_executor/model_loader/reload/torchao_decorator.py", line 50, in patched_model_load_weights
+    return original_load_weights(self, weights, *args, **kwargs)
+  File "/vllm-workspace/vllm/vllm/model_executor/models/utils.py", line 368, in load_weights
+    autoloaded_weights = set(self._load_module("", self.module, weights))
+  File "/vllm-workspace/vllm/vllm/model_executor/models/utils.py", line 301, in _load_module
+    yield from self._load_module(
+  File "/vllm-workspace/vllm/vllm/model_executor/models/utils.py", line 274, in _load_module
+    loaded_params = module.load_weights(weights)
+  File "/mnt/share/x00886548/vllm-code/xmz_kimi3/vllm-ascend-kimi-k3/vllm_ascend/models/kimi_k3_text.py", line 642, in load_weights
+    param.weight_loader(
+AttributeError: 'Parameter' object has no attribute 'weight_loader'
