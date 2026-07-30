@@ -1,1 +1,9 @@
-MindSpeed-Ops针对Kimi Linear、GPT-OSS、Gated DeltaNet系列、DeepSeek V4、Qwen3.5等模型的算子适配均按计划推进上库，目前已上库约23个A3算子、10个A5算子，A5架构攻坚是本月重点且覆盖率仍在持续提升。
+模型	接口（算子）	进展&规划
+Kimi Linear	chunk_kda_fwd_intra、chunk_kda_bwd_wy_dqkg_fused（KDA chunk 前向/反向融合算子）	A3已上库；7月两轮修复精度问题（chunk_kda_bwd，7/18、7/25）；规划适配A5
+GPT-OSS	clipped_swiglu（SwiGLU门控融合算子）	7月新增，A3已上库，实测加速4~8倍；规划补充backward kernel，待A5环境验证后放开
+Gated DeltaNet系列（线性注意力类模型）	chunk_gated_delta_rule（含_fwd_h/_bwd_dhu）、chunk_scaled_dot_kkt、causal_conv1d、rmsnormgated、cumsum、l2norm、wy_fast、solve_tril	6月26日起集中攻坚，A3、A5双架构均已上库；7月对autotune做性能治理（移除fwd_h autotune，避免动态shape重复编译）；规划持续补齐GDN反向链路
+DeepSeek V4	RmsnormWithoutWeight	A3已上库，暂无后续规划
+MoE通用（路由/专家分发）	Sinkhorn（Triton版+TileLang版）、Sort_chunks_by_idx	A3已上库；7月两次更新Sinkhorn标杆以对齐MindSpeed-LLM；TileLang版为本月首个落地的TileLang算子；规划补充Sinkhorn反向
+Qwen3.5	FusedCrossEntropyLoss	A3已上库，暂无后续规划
+MHC类模型	mhc_pre_only、mhc_pre_bmm、mhc_post	A3已上库，暂未见A5适配计划
+通用推理优化（ACLNN路线）	add_rms_norm_bias（Add+RMSNorm融合）	6月新增，ACLNN路线首个落地算子，同步建立独立编译体系（cmake/common/scripts）；规划持续扩充ACLNN算子清单
