@@ -1,25 +1,115 @@
-apt update && apt install -y wget tar bzip2 gcc g++ make libssl-dev libffi-dev
+#!/bin/bash
 
-cd /mnt/share/x00886548/tmp
-wget https://mirrors.tuna.tsinghua.edu.cn/anaconda/miniconda/Miniconda3-latest-Linux-aarch64.sh
 
-bash Miniconda3-latest-Linux-aarch64.sh -b -p /mnt/share/x00886548/miniconda3
+echo "=======start clear env======"
 
-# 永久生效，重启容器不用重新source
-echo "source /mnt/share/x00886548/miniconda3/etc/profile.d/conda.sh" >> /etc/profile
-source /etc/profile
+if python3 -c "import mindspeed_ops" &>/dev/numm; then
+  echo "[+] mindspeed_ops is installed, uninstalling.."
+  # pip3 uninstall mindspeed_ops -y
+else
+  echo "[-] mindspeed_ops is uninstalled"
+fi
 
-# 写入conda配置，指定envs、pkgs目录到挂载盘
-cat > ~/.condarc <<EOF
-envs_dirs:
-  - /mnt/share/vllm/conda_envs
-pkgs_dirs:
-  - /mnt/share/vllm/conda_pkgs
-show_channel_urls: true
-default_channels:
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r
-channel_alias: https://mirrors.tuna.tsinghua.edu.cn/anaconda
-EOF
+if [ -d "MindSpeed-Ops" ]; then
+  echo "[+] MindSpeed-Ops is exists, delete.."
+  # rm -rf MindSpeed-Ops
+else
+  echo "[-] MindSpeed-Ops is not exists"
+fi
 
-source /mnt/share/x00886548/miniconda3/etc/profile.d/conda.sh
+echo "=======finish clear env======="
+
+# git clone https://gitcode.com/Ascend/MindSpeed-Ops.git
+cd MindSpeed-Ops
+# pip3 install -e . --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple --trusted-host triton-ascend.osinfra.cn
+
+echo "=======start ut test======="
+cd tests
+# pytest unit_tests/ | tee result_ut.log
+
+echo "=======finish ut test======="
+
+echo "=======start atk test======="
+TARGET_DIR="atk_tests/triton"
+
+RESULT_SUMMARY="result_acc.log"
+> "$RESULT_SUMMARY"
+
+LOG_DIR="result_atk"
+mkdir -p "$LOG_DIR"
+
+# check TARGET_DIR is exists
+if [ ! -d "$TARGET_DIR" ]; then
+  echo "ERROR! '$$TARGET_DIR' is not exists"
+  exit 1
+fi
+
+mapfile -t dirs < <(find "$TARGET_DIR" -mindepth 1 -maxdepth 1 -type d)
+
+count=${#dirs[@]}
+
+pids=()
+for i in "${!dirs[@]}"; do
+  dir_path="${dirs[$i]}"
+  dir_name=$(basename "$dir_path")
+  LOG_FILE="${LOG_DIR}/${dir_name}.log"
+  yaml_file="${TARGET_DIR}/${dir_name}/${dir_name}.yaml"
+  py_script="${TARGET_DIR}/${dir_name}/generate_${dir_name}.py"
+  triton_file="${TARGET_DIR}/${dir_name}/triton_${dir_name}.py"
+
+  if [ ! -f "$yaml_file" ]; then
+      echo "$yaml_file is not exists, continue"
+      continue
+  fi
+
+  if [ ! -f "$py_script" ]; then
+      echo "$py_script is not exists, continue"
+      continue
+  fi
+
+  if [ ! -f "$triton_file" ]; then
+      echo "$triton_file is not exists, continue"
+      continue
+  fi
+
+  device_id=$((i % 8))
+
+  atk case -f "$yaml_file" -p "$py_script"
+
+
+  # 定义需要特殊处理的目录名称列表
+  SPECIAL_CASES="wy_fast|fused_cross_entropy_loss|conv1d|l2norm"
+
+  # 使用 grep 判断 dir_name 是否在特殊列表中
+  #if echo "$dir_name" | grep -qE "^($SPECIAL_CASES)$"; then
+  echo "Running special task with --max_task 1 for: $dir_name"
+  atk node --backend triton --devices "$device_id" node --backend cpu --devices "$device_id" task --max_task 10 -c result/${dir_name}/json/all_${dir_name}.json --task accuracy -tup ./ -p "$triton_file" -to 1200 >  "$LOG_FILE" 2>&1 &
+  #else
+      # 原有逻辑
+      #atk node --backend triton --devices "$device_id" node --backend cpu --devices "$device_id" task -c result/${dir_name}/json/all_${dir_name}.json --task accuracy -tup ./ -p "$triton_file" >  "$LOG_FILE" 2>&1 &
+  #fi
+  
+  pids+=($!)
+done
+
+for pid in "${pids[@]}"; do
+  wait "$pid"
+done
+
+for dir_path in "${dirs[@]}"; do
+  dir_name=$(basename "$dir_path")
+  LOG_FILE="${LOG_DIR}/${dir_name}.log"
+  yaml_file="${TARGET_DIR}/${dir_name}/${dir_name}.yaml"
+  py_script="${TARGET_DIR}/${dir_name}/generate_${dir_name}.py"
+  triton_file="${TARGET_DIR}/${dir_name}/triton_${dir_name}.py"
+
+  if [ ! -f "$yaml_file" ] || [ ! -f "$py_script" ] || [ ! -f "$triton_file" ]; then
+      continue
+  fi
+
+  STATUS=$(grep -oP 'acc_pass_result:\K[^\s]+' "$LOG_FILE")
+  SUMMARY_LINE="[$dir_name] status: $STATUS"
+  echo "$SUMMARY_LINE" >> "$RESULT_SUMMARY"
+done
+echo "finish all task"
+
