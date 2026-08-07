@@ -1,709 +1,293 @@
-# 投机推理（MTP / EAGLE3）培训材料
+# 投机解码时序图：MTP 与 EAGLE3
 
-面向昇腾 RL、vLLM-Ascend 推理团队，覆盖投机解码的用法、原理、主流方法（MTP、EAGLE 系列）、vLLM 代码实现与昇腾适配实践。全文约 45 分钟。
-
-## 一句话理解
-
-**投机解码**的核心思路是"用廉价小模型快速猜、用大模型并行验证"——猜对了白赚，猜错了也不影响结果，从而将自回归解码的吞吐提升 1.5~4 倍，且输出与原始模型完全一致。**MTP**（Multi-Token Prediction）是 DeepSeek 模型内置的多 token 预测模块，推理时可直接充当"猜测者"，零额外权重。**EAGLE3** 是一种外挂的轻量 draft head 方案，通过多层特征融合实现高接受率，适合追求更高加速的场景。
-
-## 目录
-
-- [1 快速上手：怎么用](#1-快速上手怎么用)（5 分钟）
-- [2 为什么需要它：价值与场景](#2-为什么需要它价值与场景)（5 分钟）
-- [3 核心原理：Draft-Verify 与无损保证](#3-核心原理draft-verify-与无损保证)（10 分钟）
-- [4 方法深入一：MTP](#4-方法深入一mtp)（7 分钟）
-- [5 方法深入二：EAGLE 系列](#5-方法深入二eagle-系列)（7 分钟）
-- [6 方法对比与选型](#6-方法对比与选型)（3 分钟）
-- [7 vLLM v1 代码实现](#7-vllm-v1-代码实现)（4 分钟）
-- [8 昇腾适配（vllm-ascend）](#8-昇腾适配vllm-ascend)（2 分钟）
-- [9 投机解码与 RL rollout](#9-投机解码与-rl-rollout)（2 分钟）
-- [附录：参考资料](#附录参考资料)
+> 基于代码仓 `vllm`（V1 引擎）与 `vllm-ascend`（Ascend NPU 插件）的实际源码整理。
+> 每个调度器迭代（iteration）的宏观循环均为：**目标模型前向（含验证）→ 拒绝采样 → 草稿模型（drafter）K 步起草 → draft tokens 随输出返回调度器 → 下一轮作为输入一起验证**。
+> 图中函数名、类名均与源码一一对应，源码对照见文末附录。
 
 ---
 
-## 1 快速上手：怎么用
+## 一、总体架构与通用概念
 
-> **一句话**：在 vLLM 启动命令中加一个 `--speculative-config` 参数，即可让解码吞吐提升 1.5~4 倍，输出结果与原始模型完全一致。
-
-### 1.1 核心参数说明
-
-在展示具体命令之前，先了解 `--speculative-config` 中几个关键参数的含义：
-
-| 参数 | 含义 | 选择建议 |
+| 概念 | 说明 | 源码位置 |
 | --- | --- | --- |
-| `method` | 投机方法：`deepseek_mtp`、`eagle3`、`eagle`、`ngram` 等 | 模型内置 MTP 则用 `deepseek_mtp`；否则优先 `eagle3` |
-| `model` | draft head 权重的路径 | MTP 不需要此参数（权重内置）；EAGLE3 需要指定社区训练好的 draft head 路径 |
-| `num_speculative_tokens` | 每轮草稿生成的 token 数量（即 γ） | MTP 通常为 1；EAGLE3 可设 3~5，越大不一定越好，需配合实测接受率调整 |
-| `draft_tensor_parallel_size` | draft head 的张量并行度 | draft head 很小，通常设为 1（单卡执行），避免通信开销反而拖慢 |
+| `SpecDecodeMetadata` | 每步投机解码元数据：`draft_token_ids`、`cu_num_draft_tokens`、`target_logits_indices`、`bonus_logits_indices`、`logits_indices` | `vllm/vllm/v1/spec_decode/metadata.py` |
+| `logits_indices` | 需要计算 logits 的 token 位置 = 每请求（K 个 draft 位置 + 1 个 bonus 位置） | `GPUModelRunner._calc_spec_decode_metadata()` |
+| `RejectionSampler` | 验证器：用目标模型 logits 对 draft tokens 做拒绝采样，产出每请求变长的被接受 token 序列 | `vllm/vllm/v1/sample/rejection_sampler.py` |
+| drafter（proposer） | MTP / EAGLE / EAGLE3 均走 `EagleProposer`（`SpecDecodeBaseProposer` 子类，`pass_hidden_states_to_model=True`），即「需要目标模型 hidden states 的自回归起草器」 | `vllm/vllm/v1/spec_decode/eagle.py`、`llm_base_proposer.py` |
+| method 判定 | `--speculative-config` 中模型含 `num_nextn_predict_layers` 等 → `method="mtp"`；draft 路径含 `eagle3` → `method="eagle3"`；`use_eagle()` 覆盖 `eagle/eagle3/mtp/dflash/dspark` | `vllm/vllm/config/speculative.py` |
 
-**为什么 MTP 不需要额外权重，而 EAGLE3 需要？** MTP 模块是 DeepSeek-V3 训练时内置的架构组件，开源权重中已经包含了 MTP 层的参数，所以直接启用即可。EAGLE3 的 draft head 则是一个独立于目标模型的小型网络，需要针对特定目标模型单独训练（或下载社区已训练好的权重），因此需要额外指定 `model` 路径。
-
-### 1.2 最简启用
-
-**模型内置 MTP（如 DeepSeek-V3/R1）——零额外权重：**
-
-```bash
-vllm serve deepseek-ai/DeepSeek-V3-0324 \
-    --speculative-config '{"method": "deepseek_mtp", "num_speculative_tokens": 1}'
-
-```
-
-> **原理简述**：DeepSeek-V3/R1 在预训练时内置了 MTP 模块（详见第 4 节），该模块本身就是模型的一部分，推理时直接用来预测下一个 token 作为草稿。因为不需要加载额外权重，所以是"零成本"起步。`num_speculative_tokens: 1` 表示每轮猜 1 个 token（MTP 模块只有 1 层，目前开源权重不支持更多）。
-
-**外挂 EAGLE3 draft head（如 Qwen3-8B）：**
-
-```bash
-vllm serve Qwen/Qwen3-8B \
-    --speculative-config '{
-        "method": "eagle3",
-        "model": "path/to/eagle3_draft_head",
-        "num_speculative_tokens": 3
-    }'
-
-```
-
-> **原理简述**：EAGLE3 需要单独训练的 draft head（一个很小的神经网络），它学习用目标模型的中间层特征来快速预测后续 token。`num_speculative_tokens: 3` 表示每轮猜 3 个 token——猜得越多，验证时"白赚"的 token 越多，但 draft head 的计算开销也增大，需要实测找到最佳平衡点。社区已为常见模型（如 LLaMA、Qwen 系列）训练好 draft head，可直接下载使用的。
-
-**昇腾（vllm-ascend）启用 EAGLE：**
-
-```python
-from vllm import LLM
-
-llm = LLM(
-    model="meta-llama/Meta-Llama-3.1-8B-Instruct",
-    tensor_parallel_size=4,
-    distributed_executor_backend="mp",
-    enforce_eager=True,
-    async_scheduling=True,
-    speculative_config={
-        "method": "eagle",
-        "model": "yuhuili/EAGLE-LLaMA3.1-Instruct-8B",
-        "draft_tensor_parallel_size": 1,  # draft head 很小，单卡即可
-        "num_speculative_tokens": 2,
-    },
-)
-
-```
-
-> **昇腾适配说明**：昇腾 NPU 上的投机解码实现与 GPU 版逻辑一致，但底层算子和通信方式不同（详见第 8 节）。`draft_tensor_parallel_size: 1` 表示 draft head 只在单卡上运行（因为它很小，多卡并行反而更慢）；`enforce_eager` 和 `async_scheduling` 用于优化调度效率。
-
-### 1.3 你会看到什么
-
-| 指标 | 无投机 | MTP（γ=1） | EAGLE3（γ=3） |
-| --- | --- | --- | --- |
-| 典型加速比 | 1× | 1.5~2× | 3~4× |
-| 输出分布 | 原始 | **完全一致** | **完全一致** |
-| 额外显存 | — | 极小（内置） | draft head 权重 |
-
-关键结论：**加速是无损的**——输出 token 的统计分布与不开投机时严格相同，不影响任何下游任务（包括 RL 训练）。
-
----
-
-## 2 为什么需要它：价值与场景
-
-### 2.1 自回归解码的瓶颈
-
-解码阶段每生成一个 token，都需要将全部模型权重与该请求的 KV Cache（Key-Value 缓存，存储已计算过的注意力键值对，避免重复计算）从 HBM（高带宽显存）读入计算单元。以 671B MoE 模型（激活约 37B）为例，生成单个 token 需搬运几十 GB 数据，而计算量很小，算力大量空转。解码因此是典型的**访存受限（memory-bound）** 阶段——瓶颈不在算力，而在数据搬运速度，单纯增加算力收益很低。
-
-```mermaid
-graph LR
-    A[HBM 权重 + KV Cache] --> B[计算单元]
-    B --> C[输出 1 个 token]
-    D[算术强度极低] --> E[算力利用率不足]
-    C --> F[下一 token 重复搬运全部权重]
-    F --> A
-
-```
-
-### 2.2 关键洞察
-
-一次前向搬运 1 个 token 的权重与搬运 3~5 个 token 的权重，**访存成本几乎相同**，计算增量很小。
-
-- **生成是串行的**（token t+1 依赖 token t）；
-- **验证是并行的**（给定一串候选 token，一次前向即可算出每个位置的下一 token 概率分布）。
-
-投机解码正是利用"**廉价猜测 + 并行验证**"，将多个串行生成步骤压缩为少量并行步骤。
-
-### 2.3 时间线对比
-
-生成 6 个 token：
-
-```mermaid
-gantt
-    title 生成 6 个 token 的时间线对比（示意）
-    dateFormat X
-    axisFormat %s
-    section 普通自回归
-    forward t1 :a1, 0, 1
-    forward t2 :a2, 1, 2
-    forward t3 :a3, 2, 3
-    forward t4 :a4, 3, 4
-    forward t5 :a5, 4, 5
-    forward t6 :a6, 5, 6
-    section 投机解码(gamma=5, 全接受)
-    draft 5 tokens :b1, 0, 1
-    verify 6 位置一次前向 :b2, 1, 2
-
-```
-
-### 2.4 典型受益场景
-
-| 场景 | 痛点 | 投机解码价值 |
-| --- | --- | --- |
-| 在线对话 / Agent | TPOT 敏感，用户体验取决于逐 token 速度 | 直接降低 TPOT 1.5~4× |
-| RL rollout | 每 prompt 生成数千 token，解码占 rollout 耗时绝大部分，且要求采样分布严格不变 | 缩短训练 step time，无损性保证训练正确性 |
-| 长上下文生成 | 上下文越长，单步搬运量越大 | 接受率稳定时收益持续 |
-| 批量离线生成 | 吞吐受限 | 小 batch 下提升单请求吞吐 |
-
----
-
-## 3 核心原理：Draft-Verify 与无损保证
-
-### 3.1 Draft-Verify 范式
-
-每一轮投机包含两个阶段：
-
-1. **Draft（草稿）**：一个轻量模型（Proposer，即草稿模型）自回归（逐 token 串行生成）γ 个草稿 token；
-2. **Verify（验证）**：目标模型一次前向并行验证这 γ 个 token，逐位置判定接受或拒绝。
+**一次迭代的阶段划分（MTP / EAGLE3 共用骨架）：**
 
 ```mermaid
 sequenceDiagram
-    participant P as Draft 模型(Proposer)
-    participant T as Target 模型
-    participant S as 验证采样器(Verifier)
-    participant O as 输出序列
+    autonumber
+    participant SCH as EngineCore 调度器
+    participant RUN as GPUModelRunner
+    participant TGT as 目标模型
+    participant VER as RejectionSampler(验证)
+    participant DRA as Drafter(起草)
 
-    loop 每一轮投机
-        P->>P: 自回归生成 gamma 个草稿 token (x1..x_gamma), 记录草稿概率 q
-        P->>T: 提交草稿序列 x1..x_gamma
-        T->>T: 一次前向, 并行计算 gamma+1 个位置的概率分布 p
-        T->>S: 目标概率 p + 草稿概率 q
-        S->>S: 逐位置拒绝采样 accept/reject
-        S->>O: 接受前缀 + (拒绝则从修正分布补1个 / 全接受则补1个 bonus token)
-    end
-
+    SCH->>RUN: SchedulerOutput(input_ids 已含上一步 K 个 draft tokens)
+    RUN->>RUN: _prepare_inputs + _calc_spec_decode_metadata
+    RUN->>TGT: 目标模型 forward(验证 K drafts + bonus 位置)
+    TGT-->>RUN: hidden_states (+ EAGLE3 时 aux_hidden_states)
+    RUN->>VER: compute_logits → rejection_sample(对比 draft_token_ids)
+    VER-->>RUN: sampled_token_ids [batch, K+1]
+    RUN->>DRA: propose_draft_token_ids(hidden_states, sampled_token_ids, ...)
+    DRA->>DRA: K 步自回归起草(K = num_speculative_tokens)
+    DRA-->>RUN: draft_token_ids [batch, K]
+    RUN-->>SCH: ModelRunnerOutput(sampled_token_ids + draft tokens)
+    Note over SCH,RUN: 下一迭代：draft tokens 追加进 input_ids 一起送入目标模型验证
 ```
-
-三个要点：
-
-1. **验证是一次并行前向**：γ 个草稿 token 拼入输入，一次算出 γ+1 个位置的分布；
-2. **判定从第一个草稿 token 开始逐个进行**，一旦出现拒绝，本轮结束，其后的草稿全部作废；
-3. **每轮至少产出 1 个 token**：拒绝位置从修正分布采样得到一个 token，全部接受则额外采样 1 个 bonus token。
-
-### 3.2 拒绝采样与无损性
-
-投机解码的核心保证是**输出分布与目标模型自回归采样完全一致（无损）**。这通过一套"接受-拒绝"机制实现：
-
-**判定规则**：草稿模型给出一个 token $x$ 及其概率 $q(x)$，目标模型给出同一 token 的概率 $p(x)$。
-
-- 如果 $p(x) \geq q(x)$（目标模型认为这个 token 的概率不低于草稿模型），**直接接受**——草稿猜得没问题；
-- 如果 $p(x) < q(x)$（草稿模型过度自信），以 $p(x)/q(x)$ 的概率接受——越"过度自信"，被拒绝的可能性越大；
-- 被拒绝时，从**修正分布**重新采样一个 token 来替代：
-
-$$
-p_{\text{resample}}(x) = \frac{\max(0,\; p(x) - q(x))}{\sum_{x'} \max(0,\; p(x') - q(x'))}
-$$
-
-修正分布的含义是：从目标分布中"草稿没覆盖到的部分"重新采样。直觉上，草稿模型已经覆盖了 $q(x)$ 的概率质量，拒绝后只需补齐 $p(x) - q(x)$ 的差值。
-
-**无损性保证**：可以数学证明，经过这种接受-拒绝机制后，最终输出的 token 分布与直接用目标模型采样完全一致。因此，草稿模型的质量**只影响速度**（猜得准就接受得多），**不影响输出质量**。
-
-判定流程：
-
-```mermaid
-flowchart TD
-    A[草稿 token x, 草稿概率 q_x, 目标概率 p_x] --> B{u 小于 p_x / q_x ?}
-    B -- 是 --> C[接受 x, 检查下一个草稿 token]
-    B -- 否 --> D[拒绝: 从修正分布 norm max 0 p-q 采样恢复 token]
-    C --> E{还有剩余草稿 token?}
-    E -- 有 --> A
-    E -- 全部接受 --> F[从目标分布采样 bonus token]
-    D --> G[本轮结束, 产出 = 已接受前缀 + 恢复 token]
-    F --> H[本轮结束, 产出 = gamma + 1 个 token]
-
-```
-
-工程实现中有三种判定变体：
-
-| 模式 | 判定方式 | 说明 |
-| --- | --- | --- |
-| greedy（temperature=0） | 草稿 argmax == 目标 argmax 则接受 | 无需概率比较，实现简单 |
-| random（temperature>0） | 按 p/q 拒绝采样 | 需要完整概率分布，严格无损 |
-| synthetic | 使用预设接受率而非 p/q | 用于 n-gram 等无草稿概率的方法 |
-
-> **对 RL 训练的意义**：投机解码不改变 rollout 的采样分布，不会引入策略偏移，可以安全用于 RL 训练的生成加速。
-
-### 3.3 加速比模型
-
-加速比取决于两个因素的博弈——每轮"白赚"了多少 token（收益），以及草稿模型跑了多少步（成本）：
-
-$$
-\text{Speedup} \approx \frac{\bar{a}}{1 + \gamma \cdot c}
-$$
-
-其中：
-- $\gamma$：每轮猜测的 token 数；
-- $c$：草稿模型单步耗时相对于目标模型的比例（通常 0.02~0.1，即草稿模型比目标模型快 10~50 倍）；
-- $\bar{a}$：每轮平均产出的 token 数（含 bonus），$\bar{a} = \frac{1-\alpha^{\gamma+1}}{1-\alpha}$，$\alpha$ 为单 token 接受率。
-
-**直觉理解**：接受率 $\alpha$ 越高，每轮产出的 token 越接近 $\gamma+1$（全部接受 + 1 个 bonus token），收益越大；草稿模型越轻量（$c$ 越小），付出的额外成本越低。两者共同决定加速效果。
-
-⚠️ **边界条件**：大 batch 高并发时目标模型验证逐渐转为 compute-bound，"一次验证多个 token 近似免费"的假设减弱，投机收益被稀释。
 
 ---
 
-## 4 方法深入一：MTP
+## 二、MTP（Multi-Token Prediction）时序图
 
-### 4.1 是什么
-
-MTP（Multi-Token Prediction）出自 DeepSeek-V3，具有**双重身份**：
-
-1. **训练目标**：除了预测下一个 token 的标准目标外，额外用 M 个小模块同时预测第 $i+2$、$i+3$、……个 token。这些附加 loss 以 0.3 的权重加入总 loss，帮助主干学到更丰富的表征（相当于给模型额外的"前瞻"训练信号）；
-2. **推理草稿源**：MTP 模块参数量小、与主干同源，推理时直接充当 draft model。DeepSeek 开源权重已内置 MTP 层，无需任何额外训练。
-
-### 4.2 模块结构
-
-每个 MTP 模块的输入由两部分拼接：主干输出的 hidden state $h_i$（即模型内部每一层的中间表示向量，包含了当前上下文的全部语义信息）与上一轮预测 token $t_{i+k}$ 的 embedding（词嵌入向量）。二者经缩放拼接、线性投影后，经过一个 Transformer block（RMSNorm + Attention + FFN）输出下一位置预测。
-
-```mermaid
-graph TB
-    A[输入序列 tokens] --> B[主干 Transformer N 层]
-    B --> C[hidden state h_i]
-    B --> D[LM Head 预测 t_i+1]
-    C --> E[缩放拼接 with Embed t_i+1]
-    E --> F[MTP 模块 1<br>RMSNorm + Attention + FFN]
-    F --> G[预测 t_i+2]
-    F --> H[输出 hidden state]
-    H --> I[缩放拼接 with Embed t_i+2]
-    I --> J[MTP 模块 2<br>可选级联]
-    J --> K[预测 t_i+3]
-    D --> L[MTP 训练 loss 权重 lambda=0.3]
-    G --> L
-
-```
-
-结构要点：
-
-- MTP 模块**共享主干的 embedding 与输出投影矩阵**，新增参数约等于一层 dense block；
-- MTP 模块维护**独立的 KV Cache**；
-- 级联多个 MTP 模块可推测更多 token，但当前开源权重普遍只有 1 个模块，即 `num_speculative_tokens=1`。
-
-### 4.3 训练与推理的前向过程
+适用：DeepSeek-V3/V3.2/V4 MTP、GLM MoE MTP、Qwen3-Next MTP 等（`method="mtp"`）。
+draft 模型为原模型自带的 next-token 预测层（如 `DeepSeekMTPModel`），**与目标模型共享 embed_tokens 与 lm_head**。
 
 ```mermaid
 sequenceDiagram
-    participant T as 主干 Trunk
-    participant M1 as MTP 模块
-    participant L as Loss
-
-    Note over T,L: 训练阶段(并行, teacher forcing)
-    T->>T: 前向得到全部位置 h_i
-    T->>M1: h_i + Embed t_i+1 (真实 token)
-    M1->>L: 预测 t_i+2, 计算 MTP loss
-    L->>L: total = LM loss + 0.3 * MTP loss
-
-    Note over T,L: 推理阶段(自回归, MTP 充当 draft)
-    T->>T: 前向当前 token, 得到 h_i
-    T->>M1: h_i + Embed t_i+1 (主干刚采样的 token)
-    M1->>M1: 输出草稿 token t_i+2 (及其概率)
-    M1->>T: 下一轮目标模型验证 t_i+2
-
-```
-
-### 4.4 小结
-
-| 维度 | 说明 |
-| --- | --- |
-| 优点 | 权重内置零成本；与主干分布接近，接受率稳定；兼具训练目标身份，不牺牲模型质量 |
-| 缺点 | 开源权重通常只有 1 个 MTP 模块，γ=1，加速上限约 1.5~2× |
-| 适用 | DeepSeek-V3 / R1 / V3.2 等内置 MTP 的模型 |
-
----
-
-## 5 方法深入二：EAGLE 系列
-
-### 5.1 EAGLE-1：特征层自回归
-
-**核心思想**：在特征（hidden state）层面做自回归比在离散 token 层面更容易。所谓"token 分布是多峰的"，是指下一个词往往有多种合理选择（比如"今天天气__"可以填"很好"/"不错"/"很差"），概率分布呈现多个峰值；而连续的特征空间比离散的 token 空间更平滑、更确定，draft head 更容易猜对。
-
-EAGLE-1 使用一个极轻量的 draft head（约一层 decoder layer）：
-
-- **输入**：目标模型最后一层 hidden state 与刚采样 token 的 embedding 拼接；
-- **输出**：下一位置的特征向量，经共享的 LM head 得到草稿 token 分布；
-- **自回归迭代**：上一步输出特征与新采样 token 的 embedding 再次拼接喂入 draft head；
-- **复用目标模型的 KV Cache**：草稿 token 的 KV 追加写入目标模型 cache，注意力上下文与目标模型一致。
-
-```mermaid
-graph TB
-    A[目标模型前向] --> B[最后层 hidden state h]
-    A --> C[采样 token t]
-    C --> D[Embedding e]
-    B --> E[拼接 h + e]
-    D --> E
-    E --> F[EAGLE Draft Head<br>单层 Decoder Layer]
-    F --> G[下一位置特征 f]
-    G --> H[LM Head 共享]
-    H --> I[草稿 token t_draft 与概率]
-    I --> J[Embed t_draft]
-    G --> K[拼接 f + Embed t_draft]
-    J --> K
-    K --> F
-
-```
-
-> **与 MTP 对照**：两者输入形式相同（hidden state + token embedding），区别在于 MTP 模块内置于模型权重、由预训练得到、γ 固定为 1；EAGLE head 是推理时外挂的独立权重，单独训练，可连续自回归多步。
-
-### 5.2 EAGLE-2：动态草稿树
-
-EAGLE-2 将草稿组织为**树结构**，并按置信度动态分配预算：
-
-- draft 阶段维护一棵动态生长的候选树；
-- 用各步 draft 概率估计分支的接受率；
-- 将固定的 token 预算倾斜给高置信度分支（深扩展），剪掉低置信度分支；
-- 验证时使用 **Tree Attention**：按树的父子关系构造稀疏因果掩码，一次前向验证整棵树，接受从根出发的最长被接受路径。
-
-```mermaid
-graph TB
-    R[root 主干输出位置] --> A1[t1 分支 p=0.4]
-    R --> A2[t2 分支 p=0.35]
-    R --> A3[t3 分支 p=0.25]
-    A1 --> B1[t11 p=0.5 置信度高 深扩展]
-    A1 --> B2[t12 p=0.3]
-    A2 --> B3[t21 p=0.2 置信度低 少扩展]
-    B1 --> C1[t111 继续扩展]
-
-```
-
-### 5.3 EAGLE-3：多层特征融合
-
-EAGLE-3 的主要改进：
-
-1. **多层特征融合**：draft head 的输入从单一的最后一层 hidden state，扩展为多层 hidden state 的拼接——早期层捕捉局部语法模式（如词序、短语结构），中期层包含句法信息，后期层编码全局语义。经线性压缩后输入 draft head，使草稿模型能同时利用不同层次的语义信息，接受率显著提升；
-2. **训练数据规模化**并引入蒸馏目标，使 draft head 与主干分布更贴合；
-3. **长上下文能力**：支持 400K+ 上下文场景，长上下文 agent 场景中平均接受长度可达 MTP 的 2 倍以上；
-4. 保留 EAGLE-2 的动态草稿树。
-
-```mermaid
-graph LR
-    A[目标模型前向] --> B[早期层 hidden]
-    A --> C[中期层 hidden]
-    A --> D[后期层 hidden]
-    B --> E[拼接 + 线性压缩]
-    C --> E
-    D --> E
-    E --> F[EAGLE3 Draft Head]
-    G[上一步特征 + token embedding] --> F
-    F --> H[草稿特征]
-    H --> I[LM Head 得到草稿 token]
-
-```
-
-### 5.4 EAGLE propose 执行时序
-
-```mermaid
-sequenceDiagram
-    participant R as ModelRunner
-    participant T as 目标模型
-    participant E as EAGLE Draft Head
-    participant V as 验证采样
-
-    R->>T: 前向当前 token(含上一轮草稿验证)
-    T->>E: hidden state + 采样 token
-    loop gamma 步自回归 draft
-        E->>E: draft head 前向, 得到草稿 token x_k 与概率
-        E->>E: 草稿 token 的 KV 追加写入 KV Cache 临时槽位
-    end
-    E->>R: 返回 gamma 个草稿 token
-    R->>T: 下一轮前向, 输入拼接草稿 token 一次验证
-    T->>V: 目标概率 vs 草稿概率
-    V->>V: 拒绝采样, 接受前缀 + 恢复或 bonus token
-    V->>R: 输出最终 token, 并回滚被拒绝草稿的 KV 槽位
-
-```
-
-### 5.5 小结
-
-| 维度 | 说明 |
-| --- | --- |
-| 优点 | 接受率高，加速上限高（3~4×）；draft head 极小，显存开销低 |
-| 缺点 | 需要针对目标模型训练 draft head（社区已有大量现成权重）；自回归步数多时小 kernel 开销上升 |
-| 适用 | 低时延在线服务、长上下文 agent、对 TPOT 敏感的 RL rollout |
-
----
-
-## 6 方法对比与选型
-
-| 维度 | DeepSeek MTP | EAGLE3 |
-| --- | --- | --- |
-| 本质 | 模型架构/训练目标，权重内置 | 推理优化算法，外挂 draft head |
-| 预测对象 | 离散 token | 特征向量（hidden states） |
-| 额外权重 | 无 | 需训练或下载 draft head |
-| γ | 通常 1 | 3~5，可结合动态树 |
-| 典型加速 | 1.5~2× | 3~4×（场景相关） |
-| vLLM method | `deepseek_mtp` | `eagle3` |
-| vllm-ascend 支持 | ✅ | ✅ |
-
-选型路径：
-
-```mermaid
-flowchart TB
-    A{模型是否内置 MTP?} -- 是 DeepSeek等 --> B[先用 deepseek_mtp<br>零成本, 约1.5-2x]
-    A -- 否 --> C{有现成 EAGLE/EAGLE3 权重?}
-    C -- 有 --> D[用 eagle/eagle3<br>调 num_speculative_tokens]
-    C -- 无 --> E{场景是否高重复文本?}
-    E -- 是 --> F[ngram, 零训练成本]
-    E -- 否 --> G[训练 EAGLE3 draft head<br>或先用独立 draft model]
-
-    B --> H{时延仍不达标?}
-    D --> H
-    H -- 是 --> I[增大 gamma / 启用草稿树 / 检查 batch 是否过大]
-    H -- 否 --> J[完成]
-
-```
-
-**结论**：内置 MTP 的模型优先使用 MTP；时延敏感场景使用 EAGLE3。两者共用同一验证端（拒绝采样），方法切换的成本集中在草稿侧。
-
----
-
-## 7 vLLM v1 代码实现
-
-### 7.1 模块结构
-
-投机解码核心代码位于 `vllm/v1/spec_decode/`，在引擎链路中的位置（从请求调度到 token 输出的完整流程）：
-
-```
-Scheduler → Worker → ModelRunner
-   ├── Target Model.forward()          # 目标模型前向，产出 hidden states + logits
-   ├── Proposer.propose()              # 生成草稿 token
-   ├── Sampler / RejectionSampler      # 拒绝采样，接受/拒绝草稿
-   └── SpecDecodeMetrics               # 接受率等指标上报
-
-```
-
-| 文件 | 类 | 方法 |
-| --- | --- | --- |
-| `eagle.py` | `EagleProposer` | EAGLE / EAGLE3（隐状态自回归，支持树状） |
-| `draft_model.py` | `DraftModelProposer` | 独立小模型草稿 |
-| `medusa.py` | `MedusaProposer` | Medusa 多头 |
-| `ngram_proposer.py` / `ngram_proposer_gpu.py` | `NgramProposer` / `NgramProposerGPU` | N-gram（CPU / GPU） |
-| `dflash.py` | `DFlashProposer` | DFlash（交叉注意力并行推测） |
-| `suffix_decoding.py` | `SuffixDecodingProposer` | 后缀树解码 |
-| `metadata.py` / `metrics.py` | `SpecDecodeMetadata` / `SpecDecodeMetrics` | 索引数据结构 / 指标统计 |
-
-类继承关系：
-
-```mermaid
-classDiagram
-    class SpecDecodeBaseProposer {
-        +device
-        +vocab_size
-        +init_kv_cache()
-        +propose()*
-        +prepare_inputs()
-        +dummy_run()
-        +capture_model()
-        +clear_draft_token_ids()
-    }
-    class EagleProposer {
-        +draft_model (EAGLE head)
-        +num_speculative_tokens
-        +propose()
-        +draft_token_ids
-    }
-    class DFlashProposer
-    class DraftModelProposer
-    class MedusaProposer
-    class NgramProposer
-    class RejectionSampler {
-        +sampler
-        +spec_config
-        +forward()
-    }
-    SpecDecodeBaseProposer <|-- EagleProposer
-    SpecDecodeBaseProposer <|-- DFlashProposer
-    SpecDecodeBaseProposer <|-- DraftModelProposer
-    EagleProposer ..> RejectionSampler : 草稿送入验证
-
-```
-
-上层根据 `speculative_config.method` 选择具体 Proposer，按需加载，避免无关模块初始化开销。
-
-### 7.2 propose 的输入输出契约
-
-以 EAGLE 为例，`propose()` 的输入（来自 ModelRunner）：
-
-| 张量 | 形状 | 含义 |
-| --- | --- | --- |
-| `target_token_ids` | `[num_tokens]` | 目标模型当前 token 序列 |
-| `target_positions` | `[num_tokens]` 或 `[3, num_tokens]`（M-RoPE） | 位置编码 |
-| `target_hidden_states` | `[num_tokens, hidden_size]` | 目标模型隐层输出 |
-| `next_token_ids` | `[batch_size]` | 目标模型刚采样的下一个 token |
-| `common_attn_metadata` | — | block table、slot mapping 等 |
-| `sampling_metadata` | — | temperature、top-p 等 |
-
-输出为 `draft_token_ids`，形状 `[batch_size, num_speculative_tokens]`，随后进入验证链路。
-
-### 7.3 单步执行时序
-
-```mermaid
-sequenceDiagram
-    participant SC as Scheduler
-    participant MR as ModelRunner
-    participant TM as Target Model
-    participant PR as Proposer(EAGLE/MTP)
+    autonumber
+    participant SCH as EngineCore 调度器
+    participant RUN as GPUModelRunner<br/>(gpu_model_runner.py)
+    participant TGT as 目标模型<br/>(如 DeepSeek-V3)
     participant RS as RejectionSampler
-    participant KV as KV Cache
+    participant PRO as drafter=EagleProposer<br/>(SpecDecodeBaseProposer)
+    participant MTP as MTP draft 模型<br/>(DeepSeekMTP)
 
-    SC->>MR: 调度本步请求(含上轮待验证草稿)
-    MR->>TM: forward(token_ids, positions, attn_meta)
-    TM->>MR: logits + hidden_states
-    MR->>RS: target logits 采样 next_token_ids
-    MR->>PR: propose(hidden_states, next_token_ids)
-    PR->>KV: 写入草稿 token 的临时 KV(slot mapping)
-    PR->>MR: draft_token_ids (batch, gamma)
-    MR->>SC: 草稿 token 进入下一步调度
-    Note over SC,KV: 下一步 草稿与 base token 一起 forward 验证
-    MR->>TM: forward(base + draft)
-    TM->>RS: 验证 logits
-    RS->>RS: 拒绝采样 accept/reject
-    RS->>KV: 拒绝位置的 KV 槽位回滚
-    RS->>SC: 最终接受 token + bonus
+    Note over SCH,MTP: 迭代 n（稳态 decode）：input_ids = 已接受 tokens + 上一步的 K 个 draft tokens
 
+    rect rgb(236,244,255)
+    Note over RUN,RS: ① 目标模型前向 + 拒绝采样验证
+    SCH->>RUN: SchedulerOutput(num_scheduled_tokens 含 K 个 draft token)
+    RUN->>RUN: _prepare_inputs() 调用 _calc_spec_decode_metadata()
+    Note right of RUN: 计算 logits_indices(每请求 K+1 个位置)、<br/>target_logits_indices(K 个)、bonus_logits_indices(1 个)、<br/>并从 input_ids 读出 draft_token_ids
+    RUN->>TGT: _model_forward(input_ids, positions)<br/>一次前向同时验证 K 个 draft + 产生 bonus 位置 logits
+    TGT-->>RUN: hidden_states [num_tokens, hidden_size]（最后一层输出）
+    Note right of RUN: DeepSeek-V4 等可通过 get_mtp_target_hidden_states()<br/>改用 pre-hc_head 残差流作为草稿输入
+    RUN->>RUN: logits = compute_logits(hidden_states[logits_indices])
+    RUN->>RS: _sample(logits, spec_decode_metadata)
+    RS->>RS: bonus_token_ids = sampler(logits[bonus_logits_indices])
+    RS->>RS: target_logits = logits[target_logits_indices] (float32)<br/>→ apply_logits_processors / top-k top-p 约束
+    alt 贪心解码(greedy)
+        RS->>RS: rejection_greedy_sample_kernel：<br/>draft_token_id != argmax(target_logits) 即拒绝，<br/>拒绝处写入 target argmax（恢复 token）
+    else 随机采样(probabilistic)
+        RS->>RS: rejection_random_sample_kernel：<br/>target_prob/draft_prob >= uniform 则接受，<br/>否则从 max(target_prob-draft_prob,0) 恢复采样
+    end
+    RS-->>RUN: sampled_token_ids [batch, K+1]（-1 为占位符）
+    RUN->>RUN: RejectionSampler.parse_output()<br/>→ valid_sampled_token_ids（每请求：已接受 tokens + 恢复/bonus token）
+    end
+
+    rect rgb(236,255,240)
+    Note over RUN,MTP: ② MTP 草稿起草（propose_draft_token_ids → drafter.propose）
+    RUN->>PRO: prepare_next_token_ids_padded(sampled_token_ids)<br/>→ next_token_ids（每请求最后被接受 token）、valid_sampled_tokens_count
+    RUN->>PRO: prepare_inputs_padded(common_attn_metadata, spec_decode_metadata, valid_count)<br/>→ token_indices_to_sample、num_rejected_tokens_gpu
+    RUN->>PRO: propose(target_token_ids, target_positions,<br/>target_hidden_states = hidden_states[:total_num_tokens], next_token_ids, ...)
+    PRO->>PRO: set_inputs_first_pass()：<br/>input_ids 左移一位并在每请求末位写入 next_token_ids；<br/>target_hidden_states 写入 hidden_states 缓冲；positions 不变
+    PRO->>PRO: build_per_group_and_layer_attn_metadata()<br/>（draft 层独立 KV cache + slot_mapping）
+    PRO->>MTP: 第 0 步 forward(input_ids, positions, hidden_states)<br/>类 prefill：一次性为全部 token 写入 draft KV cache
+    MTP->>MTP: MTP 层内部：enorm(embeds) ∥ hnorm(prev_hidden) → eh_proj(cat)<br/>→ mtp_block(DecoderLayer) → shared_head
+    MTP-->>PRO: (logit_hidden, recycle_hidden)<br/>（DeepSeekMTPModel 返回 tuple；recycle_hidden 为 post-norm，<br/>回收给下一步作 previous_hidden_states）
+    PRO->>PRO: sample_hidden = logit_hidden[token_indices_to_sample]<br/>compute_logits(shared_head) + argmax → draft_token_0
+    loop K-1 步自回归起草 (token_index = 1..K-1)
+        PRO->>PRO: eagle_step_update_slot_mapping_and_metadata()：<br/>positions+1(clamp 到 max_model_len)、seq_lens+1、更新 slot_mapping
+        PRO->>MTP: forward(上一 draft token 的 embedding 输入,<br/>hidden_states = 上一步 recycle_hidden)
+        MTP-->>PRO: (logit_hidden, recycle_hidden)
+        PRO->>PRO: argmax(compute_logits) → draft_token_i
+    end
+    PRO-->>RUN: draft_token_ids [batch, K]（torch.stack 各步结果）
+    end
+
+    RUN->>RUN: _copy_draft_token_ids_to_cpu()（异步 D2H）
+    RUN-->>SCH: ModelRunnerOutput(valid_sampled_token_ids, draft tokens)
+    Note over SCH,RUN: 调度器将 K 个 draft tokens 追加到各请求 token_ids，<br/>下一迭代随 input_ids 一起送入目标模型验证
+
+    opt 首步 prefill（spec_decode_metadata 为 None，无 draft 可验证）
+        RUN->>TGT: 普通 prefill forward，走普通 Sampler 采样 1 个 token
+        RUN->>PRO: propose(token_indices_to_sample=None → query_start_loc[1:]-1)
+        Note right of PRO: 首遍 forward 同样为「类 prefill」：<br/>为 prompt 全部位置建立 draft KV cache，随后进入 K-1 步起草循环
+    end
 ```
 
-### 7.4 RejectionSampler
+### MTP 关键要点（与源码对应）
 
-位于 `vllm/v1/sample/rejection_sampler.py`，实现第 3.2 节的算法：
-
-```mermaid
-flowchart TB
-    A[forward: target_probs + draft_probs + draft_token_ids] --> B{sampling 模式?}
-    B -- temperature=0 --> C[rejection_greedy_sample_kernel<br>比较 argmax]
-    B -- temperature>0 --> D[rejection_random_sample_kernel<br>u 小于 p/q 判定]
-    C --> E[accepted tokens]
-    D --> E
-    D -- 拒绝位置 --> F[sample_recovered_tokens<br>从修正分布采样]
-    E --> G{该请求全部接受?}
-    G -- 是 --> H[追加 bonus token]
-    G -- 否 --> I[accepted + recovered]
-    H --> J[output = accepted + bonus]
-    F --> I
-    I --> K[合并输出, 更新 metrics]
-
-```
-
-实现要点：
-
-- 贪心与随机两条路径均由 Triton kernel 实现（`rejection_greedy_sample_kernel`、`rejection_random_sample_kernel`）；
-- `uniform_probs` 使用 float64 保证数值稳定；
-- n-gram 等无草稿概率的方法走 synthetic 接受率路径；
-- 输出张量预分配到最大 batch，运行时切片，避免频繁分配。
-
-此外，EAGLE 自回归中的 `eagle_step_slot_mapping_metadata_kernel` 将 slot mapping 更新、attention metadata 更新、位置编码推进三个操作融合为单个 kernel 启动，以降低 launch 开销。这一优化在 NPU 上同样重要。
+1. **draft 模型即 MTP 层本体**：`DeepSeekMTP.forward(input_ids, positions, previous_hidden_states, ...)`，输入三元组，无 aux hidden states。
+2. **层循环**：`DeepSeekMultiTokenPredictor.forward` 按 `spec_step_idx % num_mtp_layers` 选层；通用 `SpecDecodeBaseProposer.propose()` 不传 `spec_step_idx`（默认 0），故通用路径所有草稿步复用第 0 个 MTP 层；只有专用 proposer（如 `Step3p5MTPProposer`，`vllm/v1/spec_decode/step3p5.py`）会逐步传入递增的 `spec_step_idx`。
+3. **hidden 回收**：仅 `DeepSeekMTPModel` 架构的 forward 返回 `(logit_hidden, recycle_hidden)` 双张量（`model_returns_tuple()` 判断），post-norm 的 recycle_hidden 作为下一步的 `previous_hidden_states`；其他 MTP 家族（如 Qwen3NextMTP）返回单张量。
+4. **权重共享**：`load_model()` 中 `_maybe_share_embeddings` / `_maybe_share_lm_head` 对 MTP 强制共享目标模型的 `embed_tokens` 与 `lm_head`（含 MTP 层内的 `shared_head.head`）。
+5. **稀疏注意力（DSV3.2 系）**：`index_share_for_mtp_iteration` 开启时，第 0 步 `set_skip_topk(False)` 计算 topk indices，后续步 `set_skip_topk(True)` 复用，并共享目标模型的 `topk_indices_buffer`。
+6. **draft 概率**：默认贪心起草（`_greedy_sample`），`draft_probs=None`；`rejection_sample_method=standard` + `draft_sample_method=probabilistic` 时才产生 draft_probs 用于无损拒绝采样。
 
 ---
 
-## 8 昇腾适配（vllm-ascend）
+## 三、EAGLE3 时序图
 
-vllm-ascend 作为 vLLM 的昇腾插件（即让 vLLM 能在昇腾 NPU 硬件上运行的适配层），对 spec_decode 做了 NPU 侧适配：
-
-```
-vllm_ascend/
-├── sample/
-│   └── rejection_sample.py      # NPU 版拒绝采样算子
-└── spec_decode/
-    └── mtp_proposer.py          # DeepSeek MTP 层 proposer 适配
-
-```
-
-当前支持的 method：n-gram、EAGLE、EAGLE3、MTP。
-
-适配的主要挑战与对策：
-
-```mermaid
-flowchart TB
-    A[GPU 版投机解码] --> B[NPU 适配]
-    B --> C[Triton Kernel 换成昇腾算子]
-    B --> D[torch.compile / Graph Mode]
-    B --> E[TP 通信适配]
-    B --> F[KV Cache 槽位管理]
-
-    C --> C1[rejection sampler kernel<br>换成 AscendC 自定义算子 / torch-ascend]
-    C --> C2[slot mapping 融合 kernel<br>换成算子融合或 aclgraph]
-    D --> D1[draft head 自回归小步多<br>用图模式减少 launch 开销]
-    E --> E1[draft_tensor_parallel_size=1<br>草稿头小, 单独 TP 组或复制]
-    F --> F1[拒绝回滚依赖 slot mapping<br>与 NPU KV cache 布局对齐]
-
-```
-
-| 挑战 | 说明 | 对策 |
-| --- | --- | --- |
-| Kernel launch 开销 | EAGLE 自回归 γ 步、每步多个小算子 | aclgraph / 图模式捕获、算子融合、减少 host-device 同步 |
-| 拒绝采样算子 | GPU 用 Triton，NPU 无对应实现 | AscendC 或 torch-npu 重写 greedy/random 两条路径，注意 float64 精度 |
-| KV 槽位回滚 | 草稿被拒绝后需丢弃对应 KV | slot mapping 语义与 NPU paged attention 对齐，覆盖边界条件 |
-| 草稿头 TP | draft head 很小，张量并行反而更慢 | `draft_tensor_parallel_size=1`，草稿头单卡执行 |
-| 数值一致性 | 接受率对数值误差敏感 | 对齐 GPU 的 softmax/top-k 精度策略，回归对比接受率 |
-
-> ⚠️ 不同 vllm-ascend 版本对 MTP / EAGLE / DeepSeek 新权重的支持节奏不同，部署前应对照对应版本的 feature guide 与 release notes。
-
----
-
-## 9 投机解码与 RL rollout
-
-### 9.1 为什么 RL rollout 需要投机解码
-
-RL 训练的 rollout 阶段需要为大量 prompt 各生成数千甚至上万 token 的长回复。这一过程的核心瓶颈在于：
-
-- **解码是 memory-bound 的**：每生成一个 token 都要搬运全部模型权重，算力大量空转（详见第 2 节）；
-- **TPOT 直接决定训练效率**：生成越慢，单个训练 step 耗时越长；
-- **采样分布必须严格一致**：rollout 生成的 token 分布任何偏移都会引入策略偏差，影响训练正确性。
-
-投机解码恰好同时解决前两个问题（加速 1.5~4×）且满足第三个约束（无损性），因此成为 rollout 加速的自然选择。
-
-### 9.2 执行流程
+适用：独立训练的 EAGLE3 draft head（如 `Eagle3LlamaForCausalLM`、`Eagle3Qwen3ForCausalLM`，`method="eagle3"`）。
+与 MTP 的本质区别：**目标模型额外输出多个中间层 aux hidden states，draft head 用 FC 层融合后作为条件输入；draft head 是独立小模型（1 层 decoder 为主），自回归 K 步起草。**
 
 ```mermaid
 sequenceDiagram
-    participant RL as RL 训练框架
-    participant ENG as Rollout 引擎(vLLM)
-    participant M as 目标模型
-    participant D as Draft(MTP/EAGLE3)
+    autonumber
+    participant SCH as EngineCore 调度器
+    participant RUN as GPUModelRunner<br/>(gpu_model_runner.py)
+    participant TGT as 目标模型<br/>(SupportsEagle3 + EagleModelMixin)
+    participant RS as RejectionSampler
+    participant PRO as drafter=EagleProposer<br/>(method=eagle3)
+    participant EAG as EAGLE3 draft head<br/>(Eagle3LlamaForCausalLM 等)
 
-    RL->>ENG: 下发 prompts, 请求 n 条 rollout
-    loop 每条请求解码
-        D->>D: 快速生成 gamma 个草稿
-        M->>M: 一次前向批量验证
-        M->>ENG: 接受 token(分布无损)
+    Note over SCH,EAG: 迭代 n（稳态 decode）：input_ids 含上一步 K 个 draft tokens
+
+    rect rgb(236,244,255)
+    Note over RUN,RS: ① 目标模型前向（同时输出 aux hidden states）+ 拒绝采样验证
+    SCH->>RUN: SchedulerOutput
+    RUN->>RUN: _prepare_inputs + _calc_spec_decode_metadata<br/>(与 MTP 完全一致)
+    Note right of TGT: use_aux_hidden_state_outputs=True：<br/>EagleModelMixin._maybe_add_hidden_state 在<br/>aux_hidden_state_layers 各层收集 hidden+residual
+    RUN->>TGT: _model_forward(input_ids, positions)
+    TGT->>TGT: 逐层 forward，在 aux 层（默认第 2 层、L/2 层、倒数第 3 层；<br/>可被 draft config 的 eagle_aux_hidden_state_layer_ids 覆盖）收集
+    TGT-->>RUN: (hidden_states, aux_hidden_states 列表)
+    RUN->>RUN: logits = compute_logits(hidden_states[logits_indices])
+    RUN->>RS: _sample(logits, spec_decode_metadata)
+    RS->>RS: bonus token 采样 + target_logits 约束<br/>+ rejection_sample(与 MTP 完全相同)
+    RS-->>RUN: sampled_token_ids [batch, K+1]
+    RUN->>RUN: parse_output() → valid_sampled_token_ids
     end
-    ENG->>RL: 返回完整回复 + logprobs
+
+    rect rgb(236,255,240)
+    Note over RUN,EAG: ② EAGLE3 起草（融合 aux hidden states → K 步自回归）
+    RUN->>PRO: prepare_next_token_ids_padded + prepare_inputs_padded<br/>(与 MTP 相同)
+    RUN->>PRO: propose(...)，其中 target_hidden_states =<br/>torch.cat(aux_hidden_states[:total_num_tokens], dim=-1)<br/>[num_tokens, 3×target_hidden_size]
+    PRO->>EAG: combine_hidden_states(target_hidden_states)
+    EAG->>EAG: (可选 input_norm / 分块 fc_norm) → fc 线性投影<br/>[num_tokens, 3×hidden] → [num_tokens, draft_hidden_size]
+    PRO->>PRO: set_inputs_first_pass()：<br/>input_ids 左移一位 + 末位写 next_token_ids；<br/>融合后的 hidden 写入 hidden_states 缓冲
+    PRO->>EAG: 第 0 步 forward(input_ids, positions, hidden_states)<br/>类 prefill，写入 draft KV cache
+    EAG->>EAG: 第 0 层：input_layernorm(embed_tokens(input_ids)) ∥ hidden_norm(hidden)<br/>→ cat([embeds, hidden], dim=-1) → qkv(输入维 2×hidden_size)<br/>→ 其余层标准残差 → norm
+    EAG-->>PRO: (last_hidden_states, aux_output)<br/>（aux_output 为 pre-norm 副本，供下一步链式传递）
+    PRO->>PRO: sample_hidden = last_hidden_states[token_indices_to_sample]
+    PRO->>PRO: compute_logits + argmax → draft_token_0<br/>(EAGLE3 自带 lm_head，draft 词表经 d2t 映射回目标词表)
+    loop K-1 步自回归起草
+        PRO->>PRO: eagle_step_update_slot_mapping_and_metadata()<br/>(positions+1、seq_lens+1、slot_mapping)
+        PRO->>EAG: forward(上一 draft token, positions+1,<br/>hidden_states = 上一步 aux_output)
+        EAG-->>PRO: (last_hidden_states, aux_output)
+        PRO->>PRO: argmax → draft_token_i
+    end
+    PRO-->>RUN: draft_token_ids [batch, K]
+    end
+
+    RUN->>RUN: _copy_draft_token_ids_to_cpu()
+    RUN-->>SCH: ModelRunnerOutput
+    Note over SCH,EAG: 与 MTP 相同：draft tokens 进入下一迭代验证循环
+
+    opt 首步 prefill
+        Note right of PRO: 与 MTP 相同：无 spec_decode_metadata，普通采样；<br/>EAGLE3 首遍为 prompt 全量建立 draft KV cache
+    end
 ```
 
-关键特性：投机解码对 RL 训练框架是**透明的**——输入 prompt，输出回复和 logprobs，中间过程与不开投机时完全等价。
+### EAGLE3 关键要点（与源码对应）
 
-### 9.3 MTP 与 EAGLE3 在 rollout 中的选择
+1. **aux 层选择**：`SupportsEagle3.get_eagle3_default_aux_hidden_state_layers()` 默认返回 `(2, num_layers//2, num_layers-3)`；实际生效值由 `set_eagle3_aux_hidden_state_layers()` 写入，优先取 draft hf_config 的 `eagle_aux_hidden_state_layer_ids`（`vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py`）。
+2. **开关**：`eagle_config["use_aux_hidden_state"]`（默认 True）为 False 时退化为只用最后一层 hidden（如 gpt-oss 的 Eagle3 head），此时 `use_aux_hidden_state_outputs` 亦为 False。
+3. **融合层 `combine_hidden_states`**：在 `SpecDecodeBaseProposer.propose()` 入口对 `method in ("eagle3", "dflash")` 立即调用（`llm_base_proposer.py` L526-543），随后断言融合后维度等于 `self.hidden_size`。
+4. **draft 词表**：EAGLE3 head 通常有自己的 `lm_head`（draft_vocab_size）与 `d2t` 映射，`compute_logits` 时 scatter 回目标词表；`use_heterogeneous_vocab` 时起草输入还需经 `vocab_mapping.map_target_to_draft_ids` 转换。
+5. **权重共享判定**：由目标模型接口的 `has_own_embed_tokens` / `has_own_lm_head` 与权重一致性比较决定，EAGLE head 无自有 embed/lm_head 时自动共享目标模型的。
+6. **KV cache**：draft head 的注意力层拥有独立 KV cache（`_draft_attn_layer_names`），每步起草通过 `slot_mapping` 写入；`validate_same_kv_cache_group` 要求所有 draft 层同属一个 KV cache group。
 
-| 维度 | MTP | EAGLE3 |
+---
+
+## 四、vllm-ascend（Ascend NPU）实现差异与时序
+
+vllm-ascend 的 V1 runner 为 `vllm_ascend/worker/model_runner_v1.py` 中的 `NPUModelRunner`（继承 `GPUModelRunner`）。
+**`eagle` / `eagle3` / `mtp` 三种 method 在 Ascend 上统一由 `AscendEagleProposer` 实现**（`get_spec_decode_method()`，`vllm_ascend/spec_decode/__init__.py`），起草入口为 `_propose()`，主循环为 `_run_merged_draft()`（`vllm_ascend/spec_decode/llm_base_proposer.py`）。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SCH as 调度器
+    participant NPU as NPUModelRunner<br/>(model_runner_v1.py)
+    participant TGT as 目标模型(NPU)
+    participant ARS as AscendRejectionSampler
+    participant PRO as AscendEagleProposer<br/>(_propose/_run_merged_draft)
+    participant DRA as draft 模型<br/>(MTP 层 / EAGLE3 head)
+
+    Note over NPU,PRO: 初始化：_set_up_drafter → _get_drafter → get_spec_decode_method<br/>eagle/eagle3/mtp → AscendEagleProposer(pass_hidden_states_to_model=True)；<br/>eagle3 时置 use_aux_hidden_state_outputs
+
+    rect rgb(236,244,255)
+    Note over NPU,ARS: ① 验证路径（与 GPU 版同构）
+    SCH->>NPU: SchedulerOutput
+    NPU->>NPU: _prepare_inputs + _calc_spec_decode_metadata<br/>+ _build_attention_metadata(产出 spec_decode_common_attn_metadata)
+    NPU->>TGT: set_ascend_forward_context 内 _model_forward
+    TGT-->>NPU: hidden_states（eagle3 时含 aux_hidden_states）
+    NPU->>ARS: _sample(logits, spec_decode_metadata)
+    ARS-->>NPU: sampled_token_ids [batch, K+1]
+    NPU->>NPU: _bookkeeping_sync → parse_output
+    end
+
+    rect rgb(236,255,240)
+    Note over NPU,DRA: ② Ascend 起草路径（propose_draft_token_ids → drafter._propose）
+    NPU->>PRO: prepare_next_token_ids_padded（indices/count 模式：<br/>discard_request_indices + num_discarded_requests）
+    NPU->>PRO: prepare_inputs_padded（Ascend triton kernel prepare_inputs_padded_kernel<br/>→ AscendCommonAttentionMetadata + token_indices_to_sample + num_rejected）
+    NPU->>PRO: _propose(num_speculative_tokens=K, target_hidden_states, next_token_ids, ...)
+    PRO->>PRO: eagle3/dflash 时先 combine_hidden_states（同 GPU 版）
+    PRO->>PRO: set_inputs_first_pass（input_ids 移位 + DCP 长序列适配）
+    PRO->>NPU: runner._sync_metadata_across_dp(is_draft_model=True)（DP 对齐）
+    PRO->>PRO: cudagraph_dispatcher.dispatch → aclgraph_runtime_mode<br/>（无 CUDA Graph，用 ACLGraphWrapper；GLM 系列强制 eager）
+    PRO->>PRO: build_draft_attn_metadata + 循环 attn_update_stack_num_spec_norm<br/>一次性预生成 K 步 multi_steps_attn_metadata<br/>（mtp 步用 SpecDecoding 注意力状态，eagle 用 ChunkedPrefill）
+    PRO->>PRO: set_ascend_forward_context(draft_attn_metadatas, aclgraph 模式)
+    PRO->>DRA: _run_merged_draft step0：forward(input_ids, positions, hidden_states)
+    DRA-->>PRO: hidden（DeepSeekMTPModel 时返回 (logit_hidden, recycle_hidden)）
+    PRO->>PRO: maybe_all_gather_and_unpad（flash_comm_v1/SP）
+    PRO->>PRO: compute_draft_token_ids / compute_logits + argmax<br/>（enable_reduce_sample 时本地 argmax reduction，TP 通信 O(2×tp_size)）
+    loop K-1 步起草
+        PRO->>PRO: positions+1(clamp)、写入固定缓冲<br/>input_ids/positions/hidden_states、maybe_pad_and_reduce
+        PRO->>PRO: forward_context.attn_metadata = multi_steps_attn_metadata[draft_index+1]
+        PRO->>DRA: forward(上一 draft token + 上一步 hidden)
+        DRA-->>PRO: hidden
+        PRO->>PRO: argmax → draft_token_i
+    end
+    PRO-->>NPU: draft_token_ids_tensor.swapaxes(0,1) → [batch, K]
+    end
+
+    NPU->>NPU: _copy_draft_token_ids_to_cpu（torch.npu.stream 异步 D2H）
+    NPU-->>SCH: ModelRunnerOutput(spec_token_ids)
+```
+
+### GPU 版与 Ascend 版对照
+
+| 环节 | vllm（GPU） | vllm-ascend（NPU） |
 | --- | --- | --- |
-| 与 RL 训练的协同 | 训练时 MTP loss 增强表征，推理时同一模块加速 rollout，天然协同 | draft head 独立于训练目标，需额外维护 |
-| 长上下文表现 | γ=1，接受长度有限 | 多层特征融合，长上下文接受长度约为 MTP 的 2 倍 |
-| 适用场景 | DeepSeek 系列模型的 RL 训练 | 长上下文 reasoning/agent 场景的 rollout |
+| drafter 选择 | runner 直接按 method 构造 `EagleProposer` 等 | `get_spec_decode_method()` 分发；eagle/eagle3/mtp 均 `AscendEagleProposer` |
+| 起草入口 | `drafter.propose()` | `drafter._propose()` → `_run_merged_draft()` |
+| 图捕获 | PIECEWISE CUDAGraph（`CudagraphDispatcher`） | ACLGraph（`ACLGraphWrapper` 包装整个 `_run_merged_draft`）；GLM 强制 eager |
+| 逐步注意力元数据 | 循环内 `build_per_group_and_layer_attn_metadata(draft_index)` + `eagle_step_update_slot_mapping_and_metadata` | 循环前一次性预生成 `multi_steps_attn_metadata`（`attn_update_stack_num_spec_norm`），循环内仅切换 `forward_context.attn_metadata` |
+| 输入展开算子 | triton kernel `copy_and_expand_eagle_inputs_kernel` | AscendC 算子 `torch.ops._C_ascend.npu_copy_and_expand_eagle_inputs` |
+| 拒绝采样 | `RejectionSampler` | `AscendRejectionSampler`（逻辑同构） |
+| DP/SP | `coordinate_batch_across_dp` | `runner._sync_metadata_across_dp` + `maybe_pad_and_reduce` / `maybe_all_gather_and_unpad`（flash_comm_v1） |
+| 采样优化 | 普通 argmax / `use_local_argmax_reduction` | `enable_reduce_sample` 时 `compute_draft_token_ids`（本地 argmax + TP 聚合） |
+| MTP 特性 | 共享 embed/lm_head、`spec_step_idx` 层循环（专用 proposer） | 同上，另支持 `_maybe_share_topk_indices`（DSV3.2 稀疏注意力）、`_share_mtp_indices` skip_topk 复用 |
 
-### 9.4 注意事项
+> 注：vllm-ascend 还存在实验性 v2 路径（`vllm_ascend/worker/v2/spec_decode/`，`AscendMTPSpeculator`），本文时序图基于生产路径 `model_runner_v1.py`。
 
-1. **权重同步需覆盖 draft 模块**：rollout 引擎与训练框架之间的权重同步如果遗漏 MTP 层或 draft head，会导致接受率骤降甚至输出错误；
-2. **γ 并非越大越好**：接受率随位置衰减，γ 过大反而增加验证开销，应按实测接受率选取拐点；
-3. **大 batch 下收益衰减**：高并发时验证逐渐转为 compute-bound，投机收益被稀释；
-4. **采样参数影响接受率**：temperature/top-p 越高，p/q 越分散，接受率通常下降；
-5. **KV 显存预算**：草稿 token 同样占用 KV 槽位，需预留余量避免抢占；
-6. **昇腾迁移先对齐数值**：接受率对 softmax 精度敏感，先在昇腾上对齐数值再调性能。
+---
 
-### 9.5 关键指标
+## 五、源码对照附录
 
-| 指标 | 定义 | 说明 |
-| --- | --- | --- |
-| 接受率 α | 草稿 token 被接受的比例 | 大于 0.7 时收益显著 |
-| 平均接受长度 | 每轮产出 token 数（含 bonus） | 上限 γ+1 |
-| TPOT / ITL | 每输出 token 时延 | 投机解码的主要优化目标 |
-| 吞吐 tokens/s | 系统级输出速率 | 大 batch 下关注是否回退 |
-
-`SpecDecodeMetrics` 统计接受率与逐位置接受率，可通过引擎 metrics 观察。
+| 主题 | 文件 |
+| --- | --- |
+| 投机元数据 | `vllm/vllm/v1/spec_decode/metadata.py` |
+| 通用 proposer 基类（propose 主流程、set_inputs_first_pass、prepare_inputs_padded、权重共享） | `vllm/vllm/v1/spec_decode/llm_base_proposer.py` |
+| EAGLE proposer | `vllm/vllm/v1/spec_decode/eagle.py` |
+| 逐步 slot/position 更新等工具 | `vllm/vllm/v1/spec_decode/utils.py` |
+| method 推断与配置 | `vllm/vllm/config/speculative.py` |
+| 目标模型 runner（_calc_spec_decode_metadata、_sample、propose_draft_token_ids） | `vllm/vllm/v1/worker/gpu_model_runner.py` |
+| 拒绝采样 | `vllm/vllm/v1/sample/rejection_sampler.py` |
+| MTP draft 模型（DeepSeek） | `vllm/vllm/model_executor/models/deepseek_mtp.py` |
+| EAGLE3 draft 模型 | `vllm/vllm/model_executor/models/llama_eagle3.py`、`qwen3_eagle3.py` |
+| EAGLE3 目标侧接口 | `vllm/vllm/model_executor/models/interfaces.py`（SupportsEagle3、EagleModelMixin） |
+| aux 层注入 | `vllm/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py` |
+| Ascend proposer 分发 | `vllm-ascend/vllm_ascend/spec_decode/__init__.py` |
+| Ascend proposer 基类（_propose/_run_merged_draft） | `vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py` |
+| Ascend EAGLE proposer | `vllm-ascend/vllm_ascend/spec_decode/eagle_proposer.py` |
+| Ascend runner | `vllm-ascend/vllm_ascend/worker/model_runner_v1.py` |
+| Ascend 拒绝采样 | `vllm-ascend/vllm_ascend/sample/rejection_sampler.py` |
+| Ascend MTP 架构映射（hf_config_override） | `vllm-ascend/vllm_ascend/patch/platform/patch_speculative_config.py` |
