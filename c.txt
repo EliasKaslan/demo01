@@ -1,293 +1,43 @@
-# 投机解码时序图：MTP 与 EAGLE3
+# Pre-Norm vs Post-Norm：基本概念
 
-> 基于代码仓 `vllm`（V1 引擎）与 `vllm-ascend`（Ascend NPU 插件）的实际源码整理。
-> 每个调度器迭代（iteration）的宏观循环均为：**目标模型前向（含验证）→ 拒绝采样 → 草稿模型（drafter）K 步起草 → draft tokens 随输出返回调度器 → 下一轮作为输入一起验证**。
-> 图中函数名、类名均与源码一一对应，源码对照见文末附录。
+先厘清两者的定义（假设一个子层为 Attention 或 FFN，输入为 $x_l$）：
 
----
+- **Post-Norm**（原始 Transformer 用法）：
+$$x_{l+1} = \text{LayerNorm}(x_l + \text{Sublayer}(x_l))$$
+归一化在残差相加**之后**。
 
-## 一、总体架构与通用概念
+- **Pre-Norm**（现在绝大多数大模型的标准做法）：
+$$x_{l+1} = x_l + \text{Sublayer}(\text{LayerNorm}(x_l))$$
+归一化只作用在送入子层之前，残差主干本身**不做归一化**，直接原样往后传。
 
-| 概念 | 说明 | 源码位置 |
-| --- | --- | --- |
-| `SpecDecodeMetadata` | 每步投机解码元数据：`draft_token_ids`、`cu_num_draft_tokens`、`target_logits_indices`、`bonus_logits_indices`、`logits_indices` | `vllm/vllm/v1/spec_decode/metadata.py` |
-| `logits_indices` | 需要计算 logits 的 token 位置 = 每请求（K 个 draft 位置 + 1 个 bonus 位置） | `GPUModelRunner._calc_spec_decode_metadata()` |
-| `RejectionSampler` | 验证器：用目标模型 logits 对 draft tokens 做拒绝采样，产出每请求变长的被接受 token 序列 | `vllm/vllm/v1/sample/rejection_sampler.py` |
-| drafter（proposer） | MTP / EAGLE / EAGLE3 均走 `EagleProposer`（`SpecDecodeBaseProposer` 子类，`pass_hidden_states_to_model=True`），即「需要目标模型 hidden states 的自回归起草器」 | `vllm/vllm/v1/spec_decode/eagle.py`、`llm_base_proposer.py` |
-| method 判定 | `--speculative-config` 中模型含 `num_nextn_predict_layers` 等 → `method="mtp"`；draft 路径含 `eagle3` → `method="eagle3"`；`use_eagle()` 覆盖 `eagle/eagle3/mtp/dflash/dspark` | `vllm/vllm/config/speculative.py` |
+## 各自的优劣
 
-**一次迭代的阶段划分（MTP / EAGLE3 共用骨架）：**
+| | Post-Norm | Pre-Norm |
+|---|---|---|
+| 训练稳定性 | 差，深层容易梯度爆炸/消失，几乎必须精细的 warmup，否则训练发散 | 好，残差主干相当于一条"梯度高速公路"（恒等映射），深层也能稳定训练 |
+| 最终性能上限 | 在能训稳的前提下，通常上限更高——因为每层输出都被强制归一化，各层贡献更均衡 | 略逊一筹的倾向：由于残差流不被归一化，其数值范数会随深度大致累积增长，导致后面层的相对贡献被"稀释"，某种程度上削弱了有效深度 |
+| 工程友好度 | 差，深度一大就很难训（历史上 Post-Norm 很少能稳定训到几十层以上） | 好，这也是为什么 GPT-3、LLaMA、PaLM、DeepSeek、Qwen 等几乎清一色选择 Pre-Norm 及其变体 |
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant SCH as EngineCore 调度器
-    participant RUN as GPUModelRunner
-    participant TGT as 目标模型
-    participant VER as RejectionSampler(验证)
-    participant DRA as Drafter(起草)
+正因为 Pre-Norm 的"稳"在超大规模训练里是刚需（一次 loss spike 可能就要浪费几十万美元算力去回滚重训），业界几乎一致转向 Pre-Norm，然后再想办法弥补它"残差流量级失控"这个副作用——常见做法包括在子层输出后再加一次 Norm（所谓 **Sandwich-Norm**，Gemma2、Grok 等在用）、QK-Norm、以及在关键节点插入额外的 RMSNorm。
 
-    SCH->>RUN: SchedulerOutput(input_ids 已含上一步 K 个 draft tokens)
-    RUN->>RUN: _prepare_inputs + _calc_spec_decode_metadata
-    RUN->>TGT: 目标模型 forward(验证 K drafts + bonus 位置)
-    TGT-->>RUN: hidden_states (+ EAGLE3 时 aux_hidden_states)
-    RUN->>VER: compute_logits → rejection_sample(对比 draft_token_ids)
-    VER-->>RUN: sampled_token_ids [batch, K+1]
-    RUN->>DRA: propose_draft_token_ids(hidden_states, sampled_token_ids, ...)
-    DRA->>DRA: K 步自回归起草(K = num_speculative_tokens)
-    DRA-->>RUN: draft_token_ids [batch, K]
-    RUN-->>SCH: ModelRunnerOutput(sampled_token_ids + draft tokens)
-    Note over SCH,RUN: 下一迭代：draft tokens 追加进 input_ids 一起送入目标模型验证
-```
+# 结合 Kimi K3 的架构来看
 
----
+我查了 Moonshot AI 刚发布的 Kimi K3 技术报告，它并没有在文中直接给自己贴"Pre-Norm 模型"或"Post-Norm 模型"这样的标签，但从架构图和模块描述能清楚看出它的设计取向。
 
-## 二、MTP（Multi-Token Prediction）时序图
+**宏观骨架：走的是 Pre-Norm 路线。** Kimi K3 是一个原生多模态 MoE 模型，共 2.8 万亿总参数、1040 亿激活参数，架构沿着序列长度、网络深度、模型宽度三个维度扩展信息流：KDA 提供高效的长序列混合，周期性穿插的 Gated MLA 层保留全局交互能力；Attention Residuals（AttnRes）让每一层可以选择性地读取此前所有层的表示。这套 93 层、2.8T 参数的骨架，如果不用 Pre-Norm 式的恒等残差主干，几乎不可能稳定训练下去——架构图里"Norm → Linear/Attention/FFN"的顺序，正是标准 Pre-Norm 的写法。
 
-适用：DeepSeek-V3/V3.2/V4 MTP、GLM MoE MTP、Qwen3-Next MTP 等（`method="mtp"`）。
-draft 模型为原模型自带的 next-token 预测层（如 `DeepSeekMTPModel`），**与目标模型共享 embed_tokens 与 lm_head**。
+但 K3 有意思的地方在于：**它没有止步于教科书式的 Pre-Norm，而是在好几个关键节点"打补丁"式地插入了额外的局部归一化**，这些补丁基本都是冲着 Pre-Norm 的已知副作用（数值量级失控）去的：
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant SCH as EngineCore 调度器
-    participant RUN as GPUModelRunner<br/>(gpu_model_runner.py)
-    participant TGT as 目标模型<br/>(如 DeepSeek-V3)
-    participant RS as RejectionSampler
-    participant PRO as drafter=EagleProposer<br/>(SpecDecodeBaseProposer)
-    participant MTP as MTP draft 模型<br/>(DeepSeekMTP)
+**1. KDA 内部的 QK-Norm。** 在计算 delta-rule 更新前，K3 对 query 和 key 做 L2 归一化，用来"稳定转移矩阵与输出矩阵的特征值"——这类似 Qwen3、Gemma2 等模型用 QK-Norm 防止注意力 logits 爆炸的思路。
 
-    Note over SCH,MTP: 迭代 n（稳态 decode）：input_ids = 已接受 tokens + 上一步的 K 个 draft tokens
+**2. KDA 输出端的门控前 RMSNorm。** 递归状态输出在送入门控（gating）之前，先经过逐头（head-wise）RMSNorm，再做 sigmoid 门控投影——这相当于在子层内部做了一次"输出侧"归一化，是 Sandwich-Norm 思路在 KDA 模块内的局部体现。
 
-    rect rgb(236,244,255)
-    Note over RUN,RS: ① 目标模型前向 + 拒绝采样验证
-    SCH->>RUN: SchedulerOutput(num_scheduled_tokens 含 K 个 draft token)
-    RUN->>RUN: _prepare_inputs() 调用 _calc_spec_decode_metadata()
-    Note right of RUN: 计算 logits_indices(每请求 K+1 个位置)、<br/>target_logits_indices(K 个)、bonus_logits_indices(1 个)、<br/>并从 input_ids 读出 draft_token_ids
-    RUN->>TGT: _model_forward(input_ids, positions)<br/>一次前向同时验证 K 个 draft + 产生 bonus 位置 logits
-    TGT-->>RUN: hidden_states [num_tokens, hidden_size]（最后一层输出）
-    Note right of RUN: DeepSeek-V4 等可通过 get_mtp_target_hidden_states()<br/>改用 pre-hc_head 残差流作为草稿输入
-    RUN->>RUN: logits = compute_logits(hidden_states[logits_indices])
-    RUN->>RS: _sample(logits, spec_decode_metadata)
-    RS->>RS: bonus_token_ids = sampler(logits[bonus_logits_indices])
-    RS->>RS: target_logits = logits[target_logits_indices] (float32)<br/>→ apply_logits_processors / top-k top-p 约束
-    alt 贪心解码(greedy)
-        RS->>RS: rejection_greedy_sample_kernel：<br/>draft_token_id != argmax(target_logits) 即拒绝，<br/>拒绝处写入 target argmax（恢复 token）
-    else 随机采样(probabilistic)
-        RS->>RS: rejection_random_sample_kernel：<br/>target_prob/draft_prob >= uniform 则接受，<br/>否则从 max(target_prob-draft_prob,0) 恢复采样
-    end
-    RS-->>RUN: sampled_token_ids [batch, K+1]（-1 为占位符）
-    RUN->>RUN: RejectionSampler.parse_output()<br/>→ valid_sampled_token_ids（每请求：已接受 tokens + 恢复/bonus token）
-    end
+**3. AttnRes（跨层注意力）里对 key 做 RMSNorm——这一条最能说明问题。** AttnRes 让每一层像做 attention 一样，去"关注"前面所有层的输出（而不是像标准残差那样把所有层的贡献简单叠加）。但如果骨架是 Pre-Norm，残差流范数会随深度不断累积增长，那么越靠后的层输出量级天然越大，如果不加处理，跨层 attention 的打分就会被这些"量级大但不一定真正重要"的层主导。K3 的解法是在算 attention 权重时对 key 做 RMSNorm，专门用来"防止输出量级过大的层主导权重"——这其实就是在直接对抗 Pre-Norm 本身带来的量级失衡问题。
 
-    rect rgb(236,255,240)
-    Note over RUN,MTP: ② MTP 草稿起草（propose_draft_token_ids → drafter.propose）
-    RUN->>PRO: prepare_next_token_ids_padded(sampled_token_ids)<br/>→ next_token_ids（每请求最后被接受 token）、valid_sampled_tokens_count
-    RUN->>PRO: prepare_inputs_padded(common_attn_metadata, spec_decode_metadata, valid_count)<br/>→ token_indices_to_sample、num_rejected_tokens_gpu
-    RUN->>PRO: propose(target_token_ids, target_positions,<br/>target_hidden_states = hidden_states[:total_num_tokens], next_token_ids, ...)
-    PRO->>PRO: set_inputs_first_pass()：<br/>input_ids 左移一位并在每请求末位写入 next_token_ids；<br/>target_hidden_states 写入 hidden_states 缓冲；positions 不变
-    PRO->>PRO: build_per_group_and_layer_attn_metadata()<br/>（draft 层独立 KV cache + slot_mapping）
-    PRO->>MTP: 第 0 步 forward(input_ids, positions, hidden_states)<br/>类 prefill：一次性为全部 token 写入 draft KV cache
-    MTP->>MTP: MTP 层内部：enorm(embeds) ∥ hnorm(prev_hidden) → eh_proj(cat)<br/>→ mtp_block(DecoderLayer) → shared_head
-    MTP-->>PRO: (logit_hidden, recycle_hidden)<br/>（DeepSeekMTPModel 返回 tuple；recycle_hidden 为 post-norm，<br/>回收给下一步作 previous_hidden_states）
-    PRO->>PRO: sample_hidden = logit_hidden[token_indices_to_sample]<br/>compute_logits(shared_head) + argmax → draft_token_0
-    loop K-1 步自回归起草 (token_index = 1..K-1)
-        PRO->>PRO: eagle_step_update_slot_mapping_and_metadata()：<br/>positions+1(clamp 到 max_model_len)、seq_lens+1、更新 slot_mapping
-        PRO->>MTP: forward(上一 draft token 的 embedding 输入,<br/>hidden_states = 上一步 recycle_hidden)
-        MTP-->>PRO: (logit_hidden, recycle_hidden)
-        PRO->>PRO: argmax(compute_logits) → draft_token_i
-    end
-    PRO-->>RUN: draft_token_ids [batch, K]（torch.stack 各步结果）
-    end
+**4. Stable LatentMoE 里聚合后、上投影前插的 RMSNorm。** 896 个路由专家、16 个激活，这种极端稀疏度下路由分支的输出量级会随被选中的专家和路由权重剧烈波动。K3 在专家聚合结果与上投影之间插入 RMSNorm，用来降低这种波动对与主干（shared expert 分支）合并时的干扰，报告里提到这不仅稳定了训练，还持续改善了验证损失和下游效果。
 
-    RUN->>RUN: _copy_draft_token_ids_to_cpu()（异步 D2H）
-    RUN-->>SCH: ModelRunnerOutput(valid_sampled_token_ids, draft tokens)
-    Note over SCH,RUN: 调度器将 K 个 draft tokens 追加到各请求 token_ids，<br/>下一迭代随 input_ids 一起送入目标模型验证
+## 小结
 
-    opt 首步 prefill（spec_decode_metadata 为 None，无 draft 可验证）
-        RUN->>TGT: 普通 prefill forward，走普通 Sampler 采样 1 个 token
-        RUN->>PRO: propose(token_indices_to_sample=None → query_start_loc[1:]-1)
-        Note right of PRO: 首遍 forward 同样为「类 prefill」：<br/>为 prompt 全部位置建立 draft KV cache，随后进入 K-1 步起草循环
-    end
-```
+可以这样理解 K3 对这对矛盾的取舍：**用 Pre-Norm 的宏观残差结构换训练稳定性（2.8T 参数、93 层、极端稀疏 MoE，不稳你根本训不动）；再用一系列"外科手术式"的局部 RMSNorm/L2Norm（QK-Norm、输出门控前的 Norm、AttnRes 里对 key 的 Norm、MoE 上投影前的 Norm）去弥补 Pre-Norm 天生的量级失控问题，尤其是补足 AttnRes 这种"跨层选择性读取"新机制带来的新失衡点。** 这也是目前前沿大模型的一个普遍趋势——Pre-Norm vs Post-Norm 已经不再是非此即彼的二选一，而是以 Pre-Norm 打底，再按需在关键节点"加料"。
 
-### MTP 关键要点（与源码对应）
-
-1. **draft 模型即 MTP 层本体**：`DeepSeekMTP.forward(input_ids, positions, previous_hidden_states, ...)`，输入三元组，无 aux hidden states。
-2. **层循环**：`DeepSeekMultiTokenPredictor.forward` 按 `spec_step_idx % num_mtp_layers` 选层；通用 `SpecDecodeBaseProposer.propose()` 不传 `spec_step_idx`（默认 0），故通用路径所有草稿步复用第 0 个 MTP 层；只有专用 proposer（如 `Step3p5MTPProposer`，`vllm/v1/spec_decode/step3p5.py`）会逐步传入递增的 `spec_step_idx`。
-3. **hidden 回收**：仅 `DeepSeekMTPModel` 架构的 forward 返回 `(logit_hidden, recycle_hidden)` 双张量（`model_returns_tuple()` 判断），post-norm 的 recycle_hidden 作为下一步的 `previous_hidden_states`；其他 MTP 家族（如 Qwen3NextMTP）返回单张量。
-4. **权重共享**：`load_model()` 中 `_maybe_share_embeddings` / `_maybe_share_lm_head` 对 MTP 强制共享目标模型的 `embed_tokens` 与 `lm_head`（含 MTP 层内的 `shared_head.head`）。
-5. **稀疏注意力（DSV3.2 系）**：`index_share_for_mtp_iteration` 开启时，第 0 步 `set_skip_topk(False)` 计算 topk indices，后续步 `set_skip_topk(True)` 复用，并共享目标模型的 `topk_indices_buffer`。
-6. **draft 概率**：默认贪心起草（`_greedy_sample`），`draft_probs=None`；`rejection_sample_method=standard` + `draft_sample_method=probabilistic` 时才产生 draft_probs 用于无损拒绝采样。
-
----
-
-## 三、EAGLE3 时序图
-
-适用：独立训练的 EAGLE3 draft head（如 `Eagle3LlamaForCausalLM`、`Eagle3Qwen3ForCausalLM`，`method="eagle3"`）。
-与 MTP 的本质区别：**目标模型额外输出多个中间层 aux hidden states，draft head 用 FC 层融合后作为条件输入；draft head 是独立小模型（1 层 decoder 为主），自回归 K 步起草。**
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant SCH as EngineCore 调度器
-    participant RUN as GPUModelRunner<br/>(gpu_model_runner.py)
-    participant TGT as 目标模型<br/>(SupportsEagle3 + EagleModelMixin)
-    participant RS as RejectionSampler
-    participant PRO as drafter=EagleProposer<br/>(method=eagle3)
-    participant EAG as EAGLE3 draft head<br/>(Eagle3LlamaForCausalLM 等)
-
-    Note over SCH,EAG: 迭代 n（稳态 decode）：input_ids 含上一步 K 个 draft tokens
-
-    rect rgb(236,244,255)
-    Note over RUN,RS: ① 目标模型前向（同时输出 aux hidden states）+ 拒绝采样验证
-    SCH->>RUN: SchedulerOutput
-    RUN->>RUN: _prepare_inputs + _calc_spec_decode_metadata<br/>(与 MTP 完全一致)
-    Note right of TGT: use_aux_hidden_state_outputs=True：<br/>EagleModelMixin._maybe_add_hidden_state 在<br/>aux_hidden_state_layers 各层收集 hidden+residual
-    RUN->>TGT: _model_forward(input_ids, positions)
-    TGT->>TGT: 逐层 forward，在 aux 层（默认第 2 层、L/2 层、倒数第 3 层；<br/>可被 draft config 的 eagle_aux_hidden_state_layer_ids 覆盖）收集
-    TGT-->>RUN: (hidden_states, aux_hidden_states 列表)
-    RUN->>RUN: logits = compute_logits(hidden_states[logits_indices])
-    RUN->>RS: _sample(logits, spec_decode_metadata)
-    RS->>RS: bonus token 采样 + target_logits 约束<br/>+ rejection_sample(与 MTP 完全相同)
-    RS-->>RUN: sampled_token_ids [batch, K+1]
-    RUN->>RUN: parse_output() → valid_sampled_token_ids
-    end
-
-    rect rgb(236,255,240)
-    Note over RUN,EAG: ② EAGLE3 起草（融合 aux hidden states → K 步自回归）
-    RUN->>PRO: prepare_next_token_ids_padded + prepare_inputs_padded<br/>(与 MTP 相同)
-    RUN->>PRO: propose(...)，其中 target_hidden_states =<br/>torch.cat(aux_hidden_states[:total_num_tokens], dim=-1)<br/>[num_tokens, 3×target_hidden_size]
-    PRO->>EAG: combine_hidden_states(target_hidden_states)
-    EAG->>EAG: (可选 input_norm / 分块 fc_norm) → fc 线性投影<br/>[num_tokens, 3×hidden] → [num_tokens, draft_hidden_size]
-    PRO->>PRO: set_inputs_first_pass()：<br/>input_ids 左移一位 + 末位写 next_token_ids；<br/>融合后的 hidden 写入 hidden_states 缓冲
-    PRO->>EAG: 第 0 步 forward(input_ids, positions, hidden_states)<br/>类 prefill，写入 draft KV cache
-    EAG->>EAG: 第 0 层：input_layernorm(embed_tokens(input_ids)) ∥ hidden_norm(hidden)<br/>→ cat([embeds, hidden], dim=-1) → qkv(输入维 2×hidden_size)<br/>→ 其余层标准残差 → norm
-    EAG-->>PRO: (last_hidden_states, aux_output)<br/>（aux_output 为 pre-norm 副本，供下一步链式传递）
-    PRO->>PRO: sample_hidden = last_hidden_states[token_indices_to_sample]
-    PRO->>PRO: compute_logits + argmax → draft_token_0<br/>(EAGLE3 自带 lm_head，draft 词表经 d2t 映射回目标词表)
-    loop K-1 步自回归起草
-        PRO->>PRO: eagle_step_update_slot_mapping_and_metadata()<br/>(positions+1、seq_lens+1、slot_mapping)
-        PRO->>EAG: forward(上一 draft token, positions+1,<br/>hidden_states = 上一步 aux_output)
-        EAG-->>PRO: (last_hidden_states, aux_output)
-        PRO->>PRO: argmax → draft_token_i
-    end
-    PRO-->>RUN: draft_token_ids [batch, K]
-    end
-
-    RUN->>RUN: _copy_draft_token_ids_to_cpu()
-    RUN-->>SCH: ModelRunnerOutput
-    Note over SCH,EAG: 与 MTP 相同：draft tokens 进入下一迭代验证循环
-
-    opt 首步 prefill
-        Note right of PRO: 与 MTP 相同：无 spec_decode_metadata，普通采样；<br/>EAGLE3 首遍为 prompt 全量建立 draft KV cache
-    end
-```
-
-### EAGLE3 关键要点（与源码对应）
-
-1. **aux 层选择**：`SupportsEagle3.get_eagle3_default_aux_hidden_state_layers()` 默认返回 `(2, num_layers//2, num_layers-3)`；实际生效值由 `set_eagle3_aux_hidden_state_layers()` 写入，优先取 draft hf_config 的 `eagle_aux_hidden_state_layer_ids`（`vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py`）。
-2. **开关**：`eagle_config["use_aux_hidden_state"]`（默认 True）为 False 时退化为只用最后一层 hidden（如 gpt-oss 的 Eagle3 head），此时 `use_aux_hidden_state_outputs` 亦为 False。
-3. **融合层 `combine_hidden_states`**：在 `SpecDecodeBaseProposer.propose()` 入口对 `method in ("eagle3", "dflash")` 立即调用（`llm_base_proposer.py` L526-543），随后断言融合后维度等于 `self.hidden_size`。
-4. **draft 词表**：EAGLE3 head 通常有自己的 `lm_head`（draft_vocab_size）与 `d2t` 映射，`compute_logits` 时 scatter 回目标词表；`use_heterogeneous_vocab` 时起草输入还需经 `vocab_mapping.map_target_to_draft_ids` 转换。
-5. **权重共享判定**：由目标模型接口的 `has_own_embed_tokens` / `has_own_lm_head` 与权重一致性比较决定，EAGLE head 无自有 embed/lm_head 时自动共享目标模型的。
-6. **KV cache**：draft head 的注意力层拥有独立 KV cache（`_draft_attn_layer_names`），每步起草通过 `slot_mapping` 写入；`validate_same_kv_cache_group` 要求所有 draft 层同属一个 KV cache group。
-
----
-
-## 四、vllm-ascend（Ascend NPU）实现差异与时序
-
-vllm-ascend 的 V1 runner 为 `vllm_ascend/worker/model_runner_v1.py` 中的 `NPUModelRunner`（继承 `GPUModelRunner`）。
-**`eagle` / `eagle3` / `mtp` 三种 method 在 Ascend 上统一由 `AscendEagleProposer` 实现**（`get_spec_decode_method()`，`vllm_ascend/spec_decode/__init__.py`），起草入口为 `_propose()`，主循环为 `_run_merged_draft()`（`vllm_ascend/spec_decode/llm_base_proposer.py`）。
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant SCH as 调度器
-    participant NPU as NPUModelRunner<br/>(model_runner_v1.py)
-    participant TGT as 目标模型(NPU)
-    participant ARS as AscendRejectionSampler
-    participant PRO as AscendEagleProposer<br/>(_propose/_run_merged_draft)
-    participant DRA as draft 模型<br/>(MTP 层 / EAGLE3 head)
-
-    Note over NPU,PRO: 初始化：_set_up_drafter → _get_drafter → get_spec_decode_method<br/>eagle/eagle3/mtp → AscendEagleProposer(pass_hidden_states_to_model=True)；<br/>eagle3 时置 use_aux_hidden_state_outputs
-
-    rect rgb(236,244,255)
-    Note over NPU,ARS: ① 验证路径（与 GPU 版同构）
-    SCH->>NPU: SchedulerOutput
-    NPU->>NPU: _prepare_inputs + _calc_spec_decode_metadata<br/>+ _build_attention_metadata(产出 spec_decode_common_attn_metadata)
-    NPU->>TGT: set_ascend_forward_context 内 _model_forward
-    TGT-->>NPU: hidden_states（eagle3 时含 aux_hidden_states）
-    NPU->>ARS: _sample(logits, spec_decode_metadata)
-    ARS-->>NPU: sampled_token_ids [batch, K+1]
-    NPU->>NPU: _bookkeeping_sync → parse_output
-    end
-
-    rect rgb(236,255,240)
-    Note over NPU,DRA: ② Ascend 起草路径（propose_draft_token_ids → drafter._propose）
-    NPU->>PRO: prepare_next_token_ids_padded（indices/count 模式：<br/>discard_request_indices + num_discarded_requests）
-    NPU->>PRO: prepare_inputs_padded（Ascend triton kernel prepare_inputs_padded_kernel<br/>→ AscendCommonAttentionMetadata + token_indices_to_sample + num_rejected）
-    NPU->>PRO: _propose(num_speculative_tokens=K, target_hidden_states, next_token_ids, ...)
-    PRO->>PRO: eagle3/dflash 时先 combine_hidden_states（同 GPU 版）
-    PRO->>PRO: set_inputs_first_pass（input_ids 移位 + DCP 长序列适配）
-    PRO->>NPU: runner._sync_metadata_across_dp(is_draft_model=True)（DP 对齐）
-    PRO->>PRO: cudagraph_dispatcher.dispatch → aclgraph_runtime_mode<br/>（无 CUDA Graph，用 ACLGraphWrapper；GLM 系列强制 eager）
-    PRO->>PRO: build_draft_attn_metadata + 循环 attn_update_stack_num_spec_norm<br/>一次性预生成 K 步 multi_steps_attn_metadata<br/>（mtp 步用 SpecDecoding 注意力状态，eagle 用 ChunkedPrefill）
-    PRO->>PRO: set_ascend_forward_context(draft_attn_metadatas, aclgraph 模式)
-    PRO->>DRA: _run_merged_draft step0：forward(input_ids, positions, hidden_states)
-    DRA-->>PRO: hidden（DeepSeekMTPModel 时返回 (logit_hidden, recycle_hidden)）
-    PRO->>PRO: maybe_all_gather_and_unpad（flash_comm_v1/SP）
-    PRO->>PRO: compute_draft_token_ids / compute_logits + argmax<br/>（enable_reduce_sample 时本地 argmax reduction，TP 通信 O(2×tp_size)）
-    loop K-1 步起草
-        PRO->>PRO: positions+1(clamp)、写入固定缓冲<br/>input_ids/positions/hidden_states、maybe_pad_and_reduce
-        PRO->>PRO: forward_context.attn_metadata = multi_steps_attn_metadata[draft_index+1]
-        PRO->>DRA: forward(上一 draft token + 上一步 hidden)
-        DRA-->>PRO: hidden
-        PRO->>PRO: argmax → draft_token_i
-    end
-    PRO-->>NPU: draft_token_ids_tensor.swapaxes(0,1) → [batch, K]
-    end
-
-    NPU->>NPU: _copy_draft_token_ids_to_cpu（torch.npu.stream 异步 D2H）
-    NPU-->>SCH: ModelRunnerOutput(spec_token_ids)
-```
-
-### GPU 版与 Ascend 版对照
-
-| 环节 | vllm（GPU） | vllm-ascend（NPU） |
-| --- | --- | --- |
-| drafter 选择 | runner 直接按 method 构造 `EagleProposer` 等 | `get_spec_decode_method()` 分发；eagle/eagle3/mtp 均 `AscendEagleProposer` |
-| 起草入口 | `drafter.propose()` | `drafter._propose()` → `_run_merged_draft()` |
-| 图捕获 | PIECEWISE CUDAGraph（`CudagraphDispatcher`） | ACLGraph（`ACLGraphWrapper` 包装整个 `_run_merged_draft`）；GLM 强制 eager |
-| 逐步注意力元数据 | 循环内 `build_per_group_and_layer_attn_metadata(draft_index)` + `eagle_step_update_slot_mapping_and_metadata` | 循环前一次性预生成 `multi_steps_attn_metadata`（`attn_update_stack_num_spec_norm`），循环内仅切换 `forward_context.attn_metadata` |
-| 输入展开算子 | triton kernel `copy_and_expand_eagle_inputs_kernel` | AscendC 算子 `torch.ops._C_ascend.npu_copy_and_expand_eagle_inputs` |
-| 拒绝采样 | `RejectionSampler` | `AscendRejectionSampler`（逻辑同构） |
-| DP/SP | `coordinate_batch_across_dp` | `runner._sync_metadata_across_dp` + `maybe_pad_and_reduce` / `maybe_all_gather_and_unpad`（flash_comm_v1） |
-| 采样优化 | 普通 argmax / `use_local_argmax_reduction` | `enable_reduce_sample` 时 `compute_draft_token_ids`（本地 argmax + TP 聚合） |
-| MTP 特性 | 共享 embed/lm_head、`spec_step_idx` 层循环（专用 proposer） | 同上，另支持 `_maybe_share_topk_indices`（DSV3.2 稀疏注意力）、`_share_mtp_indices` skip_topk 复用 |
-
-> 注：vllm-ascend 还存在实验性 v2 路径（`vllm_ascend/worker/v2/spec_decode/`，`AscendMTPSpeculator`），本文时序图基于生产路径 `model_runner_v1.py`。
-
----
-
-## 五、源码对照附录
-
-| 主题 | 文件 |
-| --- | --- |
-| 投机元数据 | `vllm/vllm/v1/spec_decode/metadata.py` |
-| 通用 proposer 基类（propose 主流程、set_inputs_first_pass、prepare_inputs_padded、权重共享） | `vllm/vllm/v1/spec_decode/llm_base_proposer.py` |
-| EAGLE proposer | `vllm/vllm/v1/spec_decode/eagle.py` |
-| 逐步 slot/position 更新等工具 | `vllm/vllm/v1/spec_decode/utils.py` |
-| method 推断与配置 | `vllm/vllm/config/speculative.py` |
-| 目标模型 runner（_calc_spec_decode_metadata、_sample、propose_draft_token_ids） | `vllm/vllm/v1/worker/gpu_model_runner.py` |
-| 拒绝采样 | `vllm/vllm/v1/sample/rejection_sampler.py` |
-| MTP draft 模型（DeepSeek） | `vllm/vllm/model_executor/models/deepseek_mtp.py` |
-| EAGLE3 draft 模型 | `vllm/vllm/model_executor/models/llama_eagle3.py`、`qwen3_eagle3.py` |
-| EAGLE3 目标侧接口 | `vllm/vllm/model_executor/models/interfaces.py`（SupportsEagle3、EagleModelMixin） |
-| aux 层注入 | `vllm/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py` |
-| Ascend proposer 分发 | `vllm-ascend/vllm_ascend/spec_decode/__init__.py` |
-| Ascend proposer 基类（_propose/_run_merged_draft） | `vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py` |
-| Ascend EAGLE proposer | `vllm-ascend/vllm_ascend/spec_decode/eagle_proposer.py` |
-| Ascend runner | `vllm-ascend/vllm_ascend/worker/model_runner_v1.py` |
-| Ascend 拒绝采样 | `vllm-ascend/vllm_ascend/sample/rejection_sampler.py` |
-| Ascend MTP 架构映射（hf_config_override） | `vllm-ascend/vllm_ascend/patch/platform/patch_speculative_config.py` |
+需要说明一点：Kimi K3 是 2026 年 7 月才发布、在我的知识截止日期之后的模型，以上内容我是根据技术报告原文整理的，如果你要做更严谨的引用（比如写论文），建议直接查一下 arXiv 上的原始技术报告核实细节。
