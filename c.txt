@@ -1,43 +1,5 @@
-# Pre-Norm vs Post-Norm：基本概念
-
-先厘清两者的定义（假设一个子层为 Attention 或 FFN，输入为 $x_l$）：
-
-- **Post-Norm**（原始 Transformer 用法）：
-$$x_{l+1} = \text{LayerNorm}(x_l + \text{Sublayer}(x_l))$$
-归一化在残差相加**之后**。
-
-- **Pre-Norm**（现在绝大多数大模型的标准做法）：
-$$x_{l+1} = x_l + \text{Sublayer}(\text{LayerNorm}(x_l))$$
-归一化只作用在送入子层之前，残差主干本身**不做归一化**，直接原样往后传。
-
-## 各自的优劣
-
-| | Post-Norm | Pre-Norm |
-|---|---|---|
-| 训练稳定性 | 差，深层容易梯度爆炸/消失，几乎必须精细的 warmup，否则训练发散 | 好，残差主干相当于一条"梯度高速公路"（恒等映射），深层也能稳定训练 |
-| 最终性能上限 | 在能训稳的前提下，通常上限更高——因为每层输出都被强制归一化，各层贡献更均衡 | 略逊一筹的倾向：由于残差流不被归一化，其数值范数会随深度大致累积增长，导致后面层的相对贡献被"稀释"，某种程度上削弱了有效深度 |
-| 工程友好度 | 差，深度一大就很难训（历史上 Post-Norm 很少能稳定训到几十层以上） | 好，这也是为什么 GPT-3、LLaMA、PaLM、DeepSeek、Qwen 等几乎清一色选择 Pre-Norm 及其变体 |
-
-正因为 Pre-Norm 的"稳"在超大规模训练里是刚需（一次 loss spike 可能就要浪费几十万美元算力去回滚重训），业界几乎一致转向 Pre-Norm，然后再想办法弥补它"残差流量级失控"这个副作用——常见做法包括在子层输出后再加一次 Norm（所谓 **Sandwich-Norm**，Gemma2、Grok 等在用）、QK-Norm、以及在关键节点插入额外的 RMSNorm。
-
-# 结合 Kimi K3 的架构来看
-
-我查了 Moonshot AI 刚发布的 Kimi K3 技术报告，它并没有在文中直接给自己贴"Pre-Norm 模型"或"Post-Norm 模型"这样的标签，但从架构图和模块描述能清楚看出它的设计取向。
-
-**宏观骨架：走的是 Pre-Norm 路线。** Kimi K3 是一个原生多模态 MoE 模型，共 2.8 万亿总参数、1040 亿激活参数，架构沿着序列长度、网络深度、模型宽度三个维度扩展信息流：KDA 提供高效的长序列混合，周期性穿插的 Gated MLA 层保留全局交互能力；Attention Residuals（AttnRes）让每一层可以选择性地读取此前所有层的表示。这套 93 层、2.8T 参数的骨架，如果不用 Pre-Norm 式的恒等残差主干，几乎不可能稳定训练下去——架构图里"Norm → Linear/Attention/FFN"的顺序，正是标准 Pre-Norm 的写法。
-
-但 K3 有意思的地方在于：**它没有止步于教科书式的 Pre-Norm，而是在好几个关键节点"打补丁"式地插入了额外的局部归一化**，这些补丁基本都是冲着 Pre-Norm 的已知副作用（数值量级失控）去的：
-
-**1. KDA 内部的 QK-Norm。** 在计算 delta-rule 更新前，K3 对 query 和 key 做 L2 归一化，用来"稳定转移矩阵与输出矩阵的特征值"——这类似 Qwen3、Gemma2 等模型用 QK-Norm 防止注意力 logits 爆炸的思路。
-
-**2. KDA 输出端的门控前 RMSNorm。** 递归状态输出在送入门控（gating）之前，先经过逐头（head-wise）RMSNorm，再做 sigmoid 门控投影——这相当于在子层内部做了一次"输出侧"归一化，是 Sandwich-Norm 思路在 KDA 模块内的局部体现。
-
-**3. AttnRes（跨层注意力）里对 key 做 RMSNorm——这一条最能说明问题。** AttnRes 让每一层像做 attention 一样，去"关注"前面所有层的输出（而不是像标准残差那样把所有层的贡献简单叠加）。但如果骨架是 Pre-Norm，残差流范数会随深度不断累积增长，那么越靠后的层输出量级天然越大，如果不加处理，跨层 attention 的打分就会被这些"量级大但不一定真正重要"的层主导。K3 的解法是在算 attention 权重时对 key 做 RMSNorm，专门用来"防止输出量级过大的层主导权重"——这其实就是在直接对抗 Pre-Norm 本身带来的量级失衡问题。
-
-**4. Stable LatentMoE 里聚合后、上投影前插的 RMSNorm。** 896 个路由专家、16 个激活，这种极端稀疏度下路由分支的输出量级会随被选中的专家和路由权重剧烈波动。K3 在专家聚合结果与上投影之间插入 RMSNorm，用来降低这种波动对与主干（shared expert 分支）合并时的干扰，报告里提到这不仅稳定了训练，还持续改善了验证损失和下游效果。
-
-## 小结
-
-可以这样理解 K3 对这对矛盾的取舍：**用 Pre-Norm 的宏观残差结构换训练稳定性（2.8T 参数、93 层、极端稀疏 MoE，不稳你根本训不动）；再用一系列"外科手术式"的局部 RMSNorm/L2Norm（QK-Norm、输出门控前的 Norm、AttnRes 里对 key 的 Norm、MoE 上投影前的 Norm）去弥补 Pre-Norm 天生的量级失控问题，尤其是补足 AttnRes 这种"跨层选择性读取"新机制带来的新失衡点。** 这也是目前前沿大模型的一个普遍趋势——Pre-Norm vs Post-Norm 已经不再是非此即彼的二选一，而是以 Pre-Norm 打底，再按需在关键节点"加料"。
-
-需要说明一点：Kimi K3 是 2026 年 7 月才发布、在我的知识截止日期之后的模型，以上内容我是根据技术报告原文整理的，如果你要做更严谨的引用（比如写论文），建议直接查一下 arXiv 上的原始技术报告核实细节。
+        gate_up_out = situ_and_mul(
+            gate_up_out,
+            beta=activation.beta,
+            linear_beta=activation.linear_beta,
+        )
