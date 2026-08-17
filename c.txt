@@ -1,19 +1,29 @@
+# vLLM 大模型推理并行技术详解
+
+> 本文基于 vLLM 官方文档（`docs.vllm.ai`）、vLLM 源码仓库（`github.com/vllm-project/vllm`）及 vLLM 官方博客核实。vLLM 迭代很快，专家并行（EP）等特性在文档中被明确标注为"实验性功能，参数名和默认值未来可能变化"，具体参数请以 `vllm serve --help` 或当前版本文档为准。
+
 # 概览
 
-大语言模型推理的显存瓶颈主要来自三部分：**模型权重**、**KV Cache**、**运行时激活值**。随着模型规模增长，单张 GPU 已无法容纳完整模型，必须通过多种并行技术将计算与存储分散到多卡 / 多节点。
+大语言模型推理的显存瓶颈主要来自三部分：**模型权重**、**KV Cache**、**运行时激活值**。随着模型规模增长，单张 GPU 无法容纳完整模型，必须通过多种并行技术把计算与存储分散到多卡 / 多节点。
 
-vLLM 原生支持以下并行/优化维度：**张量并行（TP）、数据并行（DP）、专家并行（EP）、流水线并行（PP）、上下文并行（Prefill CP / Decode CP）**，以及编译期的**序列并行融合（Sequence Parallelism Pass）**。这些维度切分粒度、通信开销、显存收益各不相同，可组合使用以适配不同规模的模型与硬件拓扑。
+vLLM 原生支持以下并行维度：**张量并行（TP）、流水线并行（PP）、数据并行（DP）、专家并行（EP）、上下文并行（Prefill CP / Decode CP）**，以及编译期的**序列并行融合（Sequence Parallelism Pass）**。
 
-> **重要说明**：EP 并不是一个独立可设置的"卡数"维度，而是由 `TP_SIZE × DP_SIZE` 自动派生；Decode Context Parallel（DCP）也不会增加总进程/GPU 数，它复用已有的 TP rank。因此计算总卡数时不能简单做 `PP × TP × EP × DP × CP` 的连乘，具体规则见下文各节。
+> **总卡数的通用公式**：设 PP、TP、PCP（Prefill Context Parallel）、DP 各自的并行度，则
+> ```
+> 总 GPU 数 = PP × TP × PCP × DP
+> ```
+> - **DP 是"整体复制"**：每个 DP rank 都拥有一份完整的 `PP × TP × PCP` 拓扑，因此 DP 直接乘进总卡数。
+> - **DCP（Decode Context Parallel）不占用额外卡数**：它复用已有的 TP 通信域，把一个 TP 组切分为 `tp_size / dcp_size` 个 DCP 子组，因此**不出现在上面的乘法公式里**。
+> - **EP 不是一个独立可设的"卡数"维度**：开启 `--enable-expert-parallel` 后，专家并行度自动等于 `TP_SIZE × DP_SIZE`，同样不额外占卡。
 
 **核心显存计算公式（BF16 精度，标准 MHA/GQA 架构，仅作粗略估算）：**
 
-- 模型权重显存 = 参数量 × 2 Byte
+- 模型权重显存 = 参数量 × 2 Byte（BF16）
 - KV Cache 显存 ≈ 2 × batch_size × seq_len × num_layers × num_kv_heads × head_dim × 2 Byte
   - 第一个系数 2 代表 K、V 两份缓存
   - 第二个系数 2 为 BF16 单元素字节数
-  - 标准 MHA 架构下 `num_kv_heads × head_dim = hidden_size`，可简化为 `batch_size × seq_len × hidden_size × num_layers × 4 Byte`
-  - **注意**：该公式仅适用于标准 MHA/GQA。对于 MLA（Multi-head Latent Attention，如 DeepSeek-R1/Kimi-K2 系列）架构，KV Cache 被压缩到低秩 latent 空间，实际占用远小于该公式估算值，不能直接套用。
+  - 标准 MHA/GQA 下 `num_kv_heads × head_dim` 与 hidden_size 成固定比例，公式常简化为 `batch_size × seq_len × hidden_size × num_layers × 4 Byte`（MHA 特例）
+  - **注意**：该公式仅适用于标准 MHA/GQA。对于 MLA（Multi-head Latent Attention，如 DeepSeek-R1/V3、Kimi-K2 系列）架构，KV Cache 被压缩到低秩 latent 空间，实际占用远小于该公式估算值；对于线性注意力（如下文 Kimi K3 用到的 KDA），甚至不存在随 token 数线性增长的传统 KV Cache，而是固定大小的循环状态（recurrent state）。这些架构都不能直接套用上述公式，必须以模型实际的 `kv_lora_rank` / `qk_rope_head_dim` 等真实维度重新计算，或直接读取 vLLM 启动日志中报告的 KV Cache block 数。
 - 激活显存 ≈ 权重显存的 10%~30%（推理阶段，随 batch 与序列长度变化）
 
 ---
@@ -22,32 +32,14 @@ vLLM 原生支持以下并行/优化维度：**张量并行（TP）、数据并�
 
 ## 原理
 
-张量并行（Tensor Parallelism）是**层内并行**策略：将 Transformer 每一层的权重矩阵（注意力的 Q/K/V/O 投影矩阵、FFN 的门控 / 上 / 下投影矩阵）按行或按列切分到多张 GPU 上，每张卡只持有一部分权重，计算时各自完成分片矩阵乘法，再通过 All-Reduce / All-Gather 集合通信拼合结果。
+张量并行（Tensor Parallelism）是**层内并行**：把 Transformer 每一层的权重矩阵（注意力的 Q/K/V/O 投影、FFN 的门控/上/下投影）按行或列切分到多张 GPU，每张卡只持有一部分权重，计算后通过 All-Reduce / All-Gather 拼合结果。
 
 以线性层 `Y = XA` 为例：
 
-- **列并行**：将 A 按列切分为 `[A₁, A₂]`，各卡独立计算 `XA₁`、`XA₂`，最后沿列维度拼接结果
-- **行并行**：将 A 按行切分为 `[A₁; A₂]`，输入 X 对应沿列切分，各卡独立计算后通过 All-Reduce 求和得到最终结果
-
-## 作用
-
-- 解决单卡放不下单层权重的问题，将模型宽度维度（hidden_size）打散
-- 同节点内通过 NVLink 高速互联，通信延迟低，效率高
-- 降低单卡权重显存，释放更多空间给 KV Cache
+- **列并行**：把 A 按列切成 `[A₁, A₂]`，各卡独立算出 `XA₁`、`XA₂`，沿列维度拼接
+- **行并行**：把 A 按行切成 `[A₁; A₂]`，输入 X 相应地沿列切分，各卡算完后 All-Reduce 求和
 
 ## vLLM 中使用方式
-
-```python
-from vllm import LLM
-
-# 单节点内 8 卡张量并行
-llm = LLM(
-    model="model-path",
-    tensor_parallel_size=8,
-)
-```
-
-命令行启动：
 
 ```bash
 vllm serve model-path --tensor-parallel-size 8
@@ -56,11 +48,8 @@ vllm serve model-path --tensor-parallel-size 8
 ## 对显存的影响
 
 - **模型权重**：单卡权重显存 ≈ 总权重显存 / TP
-- **KV Cache**：默认按 kv-head 维度分片；当 TP 超过 kv-head 数量时，KV Cache 会在多卡间出现重复（详见下文 Decode Context Parallel 一节）
-- **激活值**：中间激活同样按 TP 分片
-- **额外开销**：需预留通信缓冲区
-
-> **注意**：TP 依赖高频集合通信，受限于节点内高速互联，通常不建议跨节点使用，实用上限为单节点 GPU 数（如 8 / 16）。
+- **KV Cache**：按 kv-head 维度分片；当 `TP` 超过 kv-head 数时，KV Cache 会在多卡间重复（详见下文 Decode Context Parallel）
+- **通信**：依赖高频集合通信，通常限制在单节点内（受 NVLink 等高速互联带宽约束），实用上限一般是单节点 GPU 数（如 8 / 16）
 
 ---
 
@@ -68,29 +57,21 @@ vllm serve model-path --tensor-parallel-size 8
 
 ## 原理
 
-数据并行（Data Parallelism）：每份副本持有**完整的模型权重**（或按 TP 切分后的权重副本），请求按 DP rank 拆分分发，各副本独立完成前向计算。在 vLLM 中，每个 DP rank 对应一个独立的"core engine"进程，与前端 API 进程之间通过 ZMQ 通信。
+数据并行（Data Parallelism）下，每个 DP 副本持有**完整的模型权重**（若结合 TP，则是按 TP 切分后的一份完整拓扑），不同副本处理不同的请求。在 vLLM 中，**每个 DP rank 对应一个独立的 "core engine" 进程**，与前端 API 进程之间通过 **ZMQ** 通信；`vllm serve` 本身管理这些 DP 进程，不需要 `torchrun` 之类的外部启动器。
 
-对于 MoE 模型，DP 和 EP/TP 往往结合使用：可以用 DP 处理注意力层（各 rank 独立），用 TP 或 EP 处理专家层；专家层默认会形成大小为 `DP × TP` 的（张量并行）组，只有显式开启 `--enable-expert-parallel` 才会切换为专家并行组。
-
-## 作用
-
-- 提升推理吞吐量
-- 适合高并发、低延迟要求的在线服务场景
-- 每个 DP rank 拥有独立的 KV Cache，配合前缀缓存可提高命中率
+DP 与 EP/TP 经常组合使用：可以用 DP 处理注意力层（各 rank 独立/或在 DP 组内做 TP），用 EP 或 TP 处理专家层——专家层默认会形成大小为 `TP × DP` 的（张量并行）组，只有显式开启 `--enable-expert-parallel` 才会切换为专家并行组。
 
 ## vLLM 中使用方式
-
-vLLM 通过 `vllm serve` 命令行自身管理 DP 进程，不需要 `torchrun` 等外部启动器：
 
 ```bash
 # 单节点 8 卡：DP=4，每副本 TP=2
 vllm serve $MODEL --data-parallel-size 4 --tensor-parallel-size 2
 ```
 
-跨节点部署时，每个节点单独运行一次 `vllm serve`，并指定该节点上的 DP rank 范围：
+跨节点部署时，每个节点单独运行一次 `vllm serve`，指定该节点上的 DP rank 范围：
 
 ```bash
-# Node 0（IP 10.99.48.128），DP ranks 0-1
+# Node 0（主节点，负责接收请求），DP ranks 0-1
 vllm serve $MODEL --data-parallel-size 4 --data-parallel-size-local 2 \
                   --data-parallel-address 10.99.48.128 --data-parallel-rpc-port 13345
 # Node 1，DP ranks 2-3，headless（不提供 API 端点）
@@ -99,64 +80,134 @@ vllm serve $MODEL --headless --data-parallel-size 4 --data-parallel-size-local 2
                   --data-parallel-address 10.99.48.128 --data-parallel-rpc-port 13345
 ```
 
+DP 规模较大时，主节点的 API server 进程本身可能成为瓶颈，可用 `--api-server-count`（如 `--api-server-count=8`）横向扩展 API server 数量，对客户端仍表现为单一 HTTP 端点。
+
 ## 对显存的影响
 
-- **模型权重**：单卡持有权重副本，DP 不降低单卡权重显存（除非结合 TP/EP）
-- **KV Cache**：各副本独立维护，系统总 KV Cache 随 DP 线性增长
-- **适用场景**：当单副本权重已能放入单卡（或 TP 组），需要提升吞吐时使用
-
-> **关键区别**：TP/EP 是"切分权重大家分着放"，DP 是"每份副本独立持有一份（切分后的）权重"，主要用于扩展系统总吞吐量而非单卡显存。
+- **模型权重**：单卡持有一份权重（副本），DP 本身不降低单卡权重显存，除非结合 TP/EP
+- **KV Cache**：各 DP 副本独立维护自己的 KV Cache 与调度队列，总 KV Cache 随 DP 线性增长；配合前缀缓存（prefix caching），把相似请求路由到同一 DP rank 能提高命中率
+- **适用场景**：当单副本权重已能放入单卡（或 TP 组）、需要提升吞吐时使用
 
 ---
 
 # 专家并行 EP
 
+> **官方文档明确标注：EP 是实验性功能，参数名和默认值将来可能变化。**
+
 ## 原理
 
-专家并行（Expert Parallelism）是 **MoE（混合专家）模型专属**的并行维度。MoE 模型每层包含大量独立的 Expert FFN，前向时每个 token 只路由到少数几个专家。EP 将所有 Expert 均匀分布到多张 GPU 上。
-
-计算流程：
-
-1. 路由门控决定每个 token 去往哪些专家
-2. 通过 All-to-All 通信将 token 分发到对应专家所在 GPU
-3. 各卡独立计算本地专家的 FFN
-4. 再次 All-to-All 将计算结果送回原 rank
-
-## 作用
-
-- MoE 模型参数主要集中在专家层，EP 是降低单卡权重显存最直接的手段
-- 可与 TP、DP 组合，形成"注意力层 TP/DP + 专家层 EP"的组合并行
+专家并行（Expert Parallelism）是 **MoE（混合专家）模型专属**的并行维度。MoE 模型每层包含大量独立的 Expert FFN，前向时每个 token 只路由到少数几个专家，EP 把所有 Expert 均匀分布到多张 GPU 上，通过 All-to-All 通信完成 token 的分发（dispatch）与结果的收集（combine）。
 
 ## vLLM 中使用方式
 
-EP **不是**一个独立的 `--expert-parallel-size` 参数，而是需要显式打开 `--enable-expert-parallel` 标志；开启后，专家层的并行度自动等于：
+EP **不是**一个独立的 `--expert-parallel-size` 参数，而是需要显式打开 `--enable-expert-parallel` 标志；开启后，专家并行度自动等于：
 
-```text
+```
 EP_SIZE = TP_SIZE × DP_SIZE
 ```
 
-不开启该标志时，专家层默认仍使用张量并行（组大小同样是 `TP × DP`），只是切分粒度和通信模式不同（All-Reduce vs. All-to-All）。
+不开启该标志时，专家层默认仍使用张量并行（组大小同样是 `TP × DP`，只是通信原语是 All-Reduce 而非 All-to-All）。
 
-开启 EP 后，注意力层的行为取决于 TP 大小：`TP=1` 时注意力权重在所有 DP rank 间复制（数据并行）；`TP>1` 时注意力权重在每个 DP 组内做张量并行切分。
+开启 EP 后，注意力层的行为取决于 TP 大小：
+- `TP = 1` 时，注意力权重在所有 DP rank 间**复制**（数据并行）
+- `TP > 1` 时，注意力权重在每个 DP 组内做**张量并行**切分
+
+例如 `TP=2, DP=4`（共 8 卡）：专家层形成大小为 8 的 EP 组，专家分布到全部 8 张卡；注意力层则在每个 DP 组（4 个）内部做 TP=2 的切分。
+
+单节点示例（用 `DeepSeek-V3-0324` 说明，可在 8×H200/H20 上运行）：
 
 ```bash
-# 单节点 8 卡：TP=1（注意力层复制），DP=8（注意力层数据并行），EP=8（专家层）
+# 单节点 EP 部署：TP=1（注意力层复制），DP=8（注意力层数据并行 + 8 卡专家并行）
 vllm serve deepseek-ai/DeepSeek-V3-0324 \
     --tensor-parallel-size 1 \
     --data-parallel-size 8 \
     --enable-expert-parallel
 ```
 
-跨节点场景需要额外安装 DeepEP/DeepGEMM 等 EP 通信内核，并通过 `--all2all-backend` 选择合适的 All-to-All 后端（如 `deepep_high_throughput`、`deepep_low_latency`、`mori_high_throughput` 等）。
+跨节点场景需要额外安装 DeepEP / DeepGEMM 等 EP 通信内核，并通过 `--all2all-backend` 选择合适的 All-to-All 后端：
+
+| Backend | 场景 | 特点 |
+|---|---|---|
+| `allgather_reducescatter`（默认） | 通用 | 基于 AllGather/ReduceScatter，兼容任意 EP+DP 配置 |
+| `deepep_high_throughput` | 多节点 Prefill | 面向 Prefill 优化的连续布局 GEMM |
+| `deepep_low_latency` | 多节点 Decode | 支持 CUDA Graph，面向 Decode 优化 |
+| `deepep_v2` | — | DeepEP 新版内核 |
+| `flashinfer_nvlink_one_sided` / `_two_sided` | 多机 NVLink（MNNVL） | FlashInfer 的单边/双边 All-to-All 策略 |
+| `mori_high_throughput` / `mori_low_latency` | AMD ROCm 多节点 | MoRI EP 内核，面向 ROCm 平台优化 |
+| `naive` / `nixl_ep` / `pplx` | 其他 | 朴素广播实现 / NIXL 传输 / pplx 内核 |
+
+跨节点两卡示例（`deepep_low_latency`）：
+
+```bash
+# Node 1（主节点，接收请求）
+vllm serve deepseek-ai/DeepSeek-V3-0324 \
+    --all2all-backend deepep_low_latency \
+    --tensor-parallel-size 1 \
+    --enable-expert-parallel \
+    --data-parallel-size 16 \
+    --data-parallel-size-local 8 \
+    --data-parallel-address 192.168.1.100 \
+    --data-parallel-rpc-port 13345 \
+    --api-server-count=8
+
+# Node 2（headless，无 API server）
+vllm serve deepseek-ai/DeepSeek-V3-0324 \
+    --all2all-backend deepep_low_latency \
+    --tensor-parallel-size 1 \
+    --enable-expert-parallel \
+    --data-parallel-size 16 \
+    --data-parallel-size-local 8 \
+    --data-parallel-start-rank 8 \
+    --data-parallel-address 192.168.1.100 \
+    --data-parallel-rpc-port 13345 \
+    --headless
+```
 
 ## 对显存的影响
 
 - **专家权重**：单卡专家权重显存 ≈ 总专家权重 / EP_SIZE
-- **非专家权重**（注意力、嵌入、共享专家、门控等）：按 TP（或在 TP=1 时复制）切分，与 EP_SIZE 无直接关系
-- **通信开销**：每层 MoE 需要两次 All-to-All，通信量与激活 token 数成正比
-- 若同时开启 EPLB（专家负载均衡），需额外预留冗余专家的显存开销，约为 `NUM_MOE_LAYERS × BYTES_PER_EXPERT × NUM_REDUNDANT_EXPERTS / NUM_EP_RANKS`
+- **非专家权重**（注意力、嵌入、共享专家、门控等）：按 TP 切分（`TP=1` 时在 DP 组内复制），与 EP_SIZE 无直接关系
+- **通信开销**：每层 MoE 需要 dispatch + combine 两次 All-to-All
 
-> **核心价值**：对于超大规模 MoE 模型（专家参数占比通常在 90% 以上），EP 是将单卡权重压入有限显存的关键技术。
+## 专家负载均衡 EPLB（Expert Parallel Load Balancer）
+
+MoE 模型训练时通常追求专家负载均衡，但推理阶段实际 token 路由分布往往并不均匀。vLLM 提供 EPLB 周期性地根据统计的 token 负载重新映射专家。
+
+用 `--enable-eplb` 开启，`--eplb-config` 接受一个 JSON 字符串（也可用 `--eplb-config.<key>` 逐项传参）：
+
+| 参数 | 说明 | 默认值 |
+|---|---|---|
+| `window_size` | 用于统计负载的引擎步数窗口 | 1000 |
+| `step_interval` | 每隔多少步重新均衡一次 | 3000 |
+| `log_balancedness` | 是否记录均衡度指标（平均 token 数 ÷ 最大 token 数） | `false` |
+| `num_redundant_experts` | 每个 EP rank 额外持有的全局冗余专家数 | 0 |
+| `use_async` | 是否用非阻塞方式做专家重排以降低延迟开销 | `true` |
+| `policy` | 均衡策略类型 | `"default"` |
+| `communicator` | 专家权重迁移使用的通信后端（`torch_nccl`/`torch_gloo`/`pynccl`/`nixl`/自动） | `null` |
+
+专家分布规律：
+- **默认**：每个 EP rank 持有 `NUM_TOTAL_EXPERTS ÷ NUM_EP_RANKS` 个专家
+- **开启冗余后**：每个 EP rank 持有 `(NUM_TOTAL_EXPERTS + NUM_REDUNDANT_EXPERTS) ÷ NUM_EP_RANKS` 个专家
+
+**显存开销**（这是需要额外预留的部分，官方公式为）：
+
+```
+NUM_MOE_LAYERS × BYTES_PER_EXPERT × (NUM_TOTAL_EXPERTS + NUM_REDUNDANT_EXPERTS) ÷ NUM_EP_RANKS
+```
+
+以 DeepSeek-V3 为例，每个 EP rank 增加 1 个冗余专家，大约带来 **2.4 GB** 的额外显存开销。大规模场景官方建议把 `num_redundant_experts` 设到 32，让最热门的专家始终在多处可用。
+
+```bash
+vllm serve deepseek-ai/DeepSeek-V3-0324 \
+    --tensor-parallel-size 1 --data-parallel-size 8 \
+    --enable-expert-parallel \
+    --enable-eplb \
+    --eplb-config '{"window_size":1000,"step_interval":3000,"num_redundant_experts":2,"log_balancedness":true}'
+```
+
+## 弹性专家并行 Elastic EP
+
+较新的功能：`--enable-elastic-ep` 允许在不重启服务的情况下，通过 `POST /scale_elastic_ep` 请求动态调整 DP 规模、在线扩缩容并重新分布专家；结合 NIXL EP 还能加速故障场景下的重连与专家恢复。目前该特性范围还比较有限（如 `api_server_count` 上限为 1，尚不支持与 DBO 组合），后续会持续扩展。
 
 ---
 
@@ -164,27 +215,9 @@ vllm serve deepseek-ai/DeepSeek-V3-0324 \
 
 ## 原理
 
-流水线并行（Pipeline Parallelism）是**层间并行**策略：将模型按层（Layer）拆分为多个阶段（Stage），每个 GPU 负责连续的若干层。输入数据被拆分为微批次（Micro-batch），像流水线一样依次经过各阶段。
-
-## 作用
-
-- 突破单节点 TP 的规模上限，实现跨节点的超大模型部署
-- 通信量远小于 TP（仅传输层间激活，而非每层内部多次集合通信）
-- 适合极深模型或跨低带宽节点的场景
+流水线并行（Pipeline Parallelism）是**层间并行**：把模型按层拆分为多个阶段（Stage），每个 GPU 负责连续的若干层；输入数据拆成微批次（micro-batch）像流水线一样依次经过各阶段。
 
 ## vLLM 中使用方式
-
-```python
-from vllm import LLM
-
-llm = LLM(
-    model="model-path",
-    pipeline_parallel_size=4,
-    tensor_parallel_size=8,
-)
-```
-
-命令行启动（4 阶段流水线 + 8 卡张量并行）：
 
 ```bash
 vllm serve model-path --pipeline-parallel-size 4 --tensor-parallel-size 8
@@ -194,150 +227,149 @@ vllm serve model-path --pipeline-parallel-size 4 --tensor-parallel-size 8
 
 - **模型权重**：单卡权重显存 ≈ 总权重显存 / PP
 - **KV Cache**：每阶段只保存自己负责层的 KV Cache，约为总量 / PP
-- **额外开销**：需要存储微批次的激活值用于流水线传递
+- **额外开销**：需要保存微批次的激活值用于跨阶段传递
 - **副作用**：存在"流水线气泡"，PP 越大气泡占比越高，首 token 延迟上升
 
-> **选型建议**：优先用满节点内 TP，再用 PP 跨节点扩展。
+> **选型建议**：优先在节点内把 TP 用满，再用 PP 跨节点扩展，因为 PP 的通信量（仅传输阶段间激活）远小于 TP。
 
 ---
 
-# 上下文并行（Prefill CP / Decode CP）
+# 上下文并行：Prefill CP（PCP）与 Decode CP（DCP）
 
-## 原理
+上下文并行沿**序列长度维度**切分，用来解决长上下文场景下 Prefill 和 Decode 两个阶段截然不同的痛点：Prefill 要控制 TTFT（首 token 延迟），Decode 要为 KV Cache 腾出更多空间以提高 batch size（进而提高吞吐）。这是两个相对独立的机制。
 
-vLLM 中的上下文并行沿**序列长度维度**切分，分为两个独立的机制：
+## Prefill Context Parallel（PCP）
 
-- **Prefill Context Parallel（PCP，`-pcp`）**：面向长序列 Prefill，将 `T` 个新 token 的 Q/K/V 计算切分到 `N` 张 GPU，目标是降低 TTFT（首 token 延迟）。PCP **会**扩展进程数，但不增加 KV Cache 的分片数。目前仍在活跃开发中。
-- **Decode Context Parallel（DCP，`-dcp`）**：面向 Decode 阶段，解决 KV Cache 在 TP 维度上的重复问题。当 `TP` 超过模型的 kv-head 数 `H` 时，KV Cache 会重复 `TP/H` 份；DCP 沿 token 维度（`T`）继续切分 KV Cache，采用交错（interleave）布局，配合类 Ring-Attention 的环状通信完成全局注意力计算。**DCP 不增加进程/GPU 总数**，它复用已有的 TP rank，取值范围为 `[1, TP/H]`。
+用 `-pcp` / `--prefill-context-parallel-size` 开启。对一个有 `T` 个新 token 的长请求，PCP 把 Query/Key/Value 的计算切成 `N` 份，分给 `N` 张 GPU 并行处理，目标是降低 TTFT。
 
-## 作用
+**PCP 会真实增加所需的 GPU/进程数**，并使用独立于 TP 的通信域——这与 DCP 不同。不计 DP 时，总 world size：
 
-- PCP：加速长序列 Prefill，降低首 token 延迟
-- DCP：消除/减少 TP 场景下的 KV Cache 重复存储，为更大 batch 或更长上下文腾出显存
-- 均不切分模型权重，可与 TP / PP 正交组合
-
-## vLLM 中使用方式
-
-```bash
-# TP=16，DCP=16：完全消除单头 MLA 模型（如类 DeepSeek-R1/Kimi-K2 架构）的 KV Cache 重复
-vllm serve model-path \
-  --tensor-parallel-size 16 \
-  --decode-context-parallel-size 16
+```
+world_size = PP × TP × PCP
 ```
 
-也可以只部分抵消重复（如 `--decode-context-parallel-size 8`），在减少 KV Cache 重复的同时把 DCP 通信限制在单节点内以降低开销。
+例如 `-tp 2 -pcp 2` 需要 4 张卡。PCP 阶段也会把 KV Cache 沿序列维度分片存储（并非"只扩进程数、不分片 KV Cache"）。根据请求长度，vLLM 采用两种策略之一：Query 部分切分 + 完整 Key/Value（适合还能负担得起持有全量 KV 的场景）；或 Query、Key/Value 都切分，配合 ring-attention 逐块传递 KV（适合序列过长、单卡放不下全量 KV 的场景）。截至目前，PCP 在 vLLM 主线中仍在活跃开发中（部分硬件插件如 vLLM Ascend 已有更完整实现）。
 
-## 对显存的影响
+## Decode Context Parallel（DCP）
 
-- **模型权重**：不切分，与 CP 无关
-- **KV Cache**：DCP 主要用于**消除因 TP 超过 kv-head 数而产生的重复**，而不是无限度线性缩减；PCP 不改变 KV Cache 分片数
-- **通信开销**：DCP 每层注意力需要跨 rank 交换 Q/部分输出及 softmax LSE，通信量随 `dcp_size` 增加而上升
+用 `-dcp` / `--decode-context-parallel-size` 开启。核心问题是：Decode 阶段每步只有少量 Query token，却要对存储在 paged KV Cache 里的大量 Key/Value 做注意力计算，如何在多卡间分摊这部分 KV Cache？
+
+对于有 `H` 个 kv-head 的模型：
+1. 若单卡能放下全部 KV，且性能足够，不需要并行
+2. 先用 TP 沿 `H` 维度切分 KV Cache（加 `-tp <num_gpus>` 即可）
+3. 但 `H` 由模型架构决定，是有限的。当 TP 继续增大超过 `H` 后，每张卡的 KV Cache 会被重复 `tp_size / H` 份——这时加 `-dcp <size>` 继续沿 `T`（token）维度切分 KV Cache
+
+**关键点：DCP 不增加需要启动的 GPU 数**，它只是复用已有的 TP 通信域，把一个 TP 组再切分为 `tp_size / dcp_size` 个 DCP 子组。`dcp_size` 的取值范围是 `[1, tp_size/H]`——dcp 越大，KV Cache 重复越少，但通信开销越高；理论上可以超出这个上限继续切分以加速 Decode，但出于非注意力层如何处理"多出来的" GPU 这一实现复杂度考虑，vLLM 目前把 `dcp_size` 上限设为 `tp_size / H`。KV Cache 沿 `T` 维度采用**交错（interleave）布局**分片，这一方案由 Moonshot 的洪超（Chao Hong）提出。DCP 对 MLA 和标准 GQA 模型都支持，部分注意力后端还支持 DCP 与 MTP（多 token 预测）组合使用以进一步加速 Decode。
+
+**官方给出的真实案例**（均出自 vLLM 文档）：
+
+| 模型 | kv-head 数 `H` | 典型部署 | KV Cache 重复情况 |
+|---|---|---|---|
+| DeepSeek-R1（MLA） | 1 | `-tp 8` | 8 倍重复；加 `-dcp 8` 完全消除 |
+| Kimi-K2（MLA，架构与 DeepSeek-R1 类似但参数更多） | 1 | `-tp 16` | 16 倍重复；`-dcp 16` 完全消除；`-dcp 8` 降到 2 倍重复，且 DCP 通信仅发生在单节点内、开销更小 |
+| Qwen3-235B-A22B（GQA） | 4 | `-tp 8` | 2 倍重复；`-dcp 2` 完全消除 |
+
+**经验法则**：先把 `-tp` 加大到吞吐/延迟满意为止，再加 `-dcp` 消除该 TP 规模下产生的 KV Cache 重复。
 
 ---
 
-# 序列并行融合（Sequence Parallelism Pass）
+# 序列并行融合（Sequence Parallelism，编译期优化）
 
 ## 原理
 
-与前面几种"部署时配置的并行维度"不同，vLLM 中的序列并行是**编译期的图重写优化**（`SequenceParallelismPass`），作用于 TP 场景下的 `AllReduce → RMSNorm` 模式，将其替换为 `ReduceScatter → 本地 RMSNorm → AllGather`，把非注意力的逐元素算子（如 RMSNorm）的输入沿序列维度切分到各 TP rank 上处理，从而消除这些算子在 TP 模式下的重复计算/存储。
+这与前面几种"部署时配置的并行维度"不同，是 vLLM 在 `torch.compile` 编译阶段做的一个**图重写优化**（`enable_sp`）：识别 TP 场景下 `AllReduce → RMSNorm`（或 `RMSNorm → Quant`）的模式，把它替换为 `ReduceScatter → 本地 RMSNorm/Quant → AllGather`，让这些逐 token 的算子的输入沿序列维度分片到各 TP rank 上计算，从而消除它们在 TP 模式下的重复计算。
 
-该 pass 本身不直接带来性能提升，而是为后续的 **AsyncTP**（`fuse_gemm_comms`，把 GEMM 与 ReduceScatter/AllGather 融合，利用 `torch.ops.symm_mem` 重叠通信与计算）铺路。
+## 触发条件（已确认部分）
 
-## 触发条件
+- 需要 `use_inductor_graph_partition=True`，或采用分段（piecewise）编译且各段的静态尺寸能被 `tensor_parallel_size` 整除
+- 目前主要在 NVIDIA CUDA 上验证；ROCm 上可能可用但未被充分测试
+- 结合 FP8 量化时，AllGather 环节要求 **SM90（Hopper）及以上**架构
+- 该 pass 若判断序列并行未生效则直接跳过（no-op）；具体的自动开启阈值由编译优化等级和内部 `PassConfig` 共同决定，会随版本迭代，建议以当前版本源码 / 文档为准而非死记某个具体数字
 
-- 仅在全图编译模式下生效：需要 `use_inductor_graph_partition=True`，或 `splitting_ops` 为空（分段编译不支持，因为残差张量会在 TP rank 间被切分，导致子图边界处的尺寸不一致）
-- 目前只在 NVIDIA H100/SM90 及以上、且模型 `hidden_size ≥ 8192` 时按 token 数阈值自动开启，阈值可通过 `PassConfig.sp_min_token_num` 配置
-- 无需（也没有）额外的环境变量手动开关，由编译优化等级（`-O1` 及以上）和上述条件共同决定
+## 与 AsyncTP 的关系
+
+序列并行本身不直接带来性能提升，而是为后续的 **AsyncTP**（`fuse_gemm_comms`）铺路：AsyncTP 把 GEMM 计算与前后的 ReduceScatter/AllGather 融合，借助 `torch.ops.symm_mem` 对称内存原语，让通信与计算相互重叠。
 
 ## 对显存的影响
 
 - **模型权重**：无影响，权重仍按 TP 切分
-- **激活显存**：非注意力逐元素算子的激活按序列维度分片，可降低该部分的峰值显存
+- **激活显存**：非注意力逐元素算子（RMSNorm 等）的激活按序列维度分片，可降低该部分峰值显存
 - **KV Cache**：不涉及
-- **通信开销**：将原本的 All-Reduce 拆分为 Reduce-Scatter + All-Gather，通信总量相近，但为后续通信-计算重叠创造了条件
+- **通信开销**：把原本一次 All-Reduce 拆成 ReduceScatter + AllGather，通信总量相近，但为后续通信-计算重叠创造了条件
 
 ---
 
-# 其它并行与优化技术
+# 其他相关技术：Prefill/Decode 分离部署
 
-## Prefill / Decode 分离部署（PD Disaggregation）
-
-将预填充（Prefill）和解码（Decode）拆分为独立实例分别部署。Prefill 计算密集、KV 写入量大；Decode 访存密集、KV 读取频繁。分离后可各自优化并行配置与硬件选型。
-
-## Expert Parallel Load Balancer（EPLB）
-
-针对 MoE 模型专家负载不均衡的问题，vLLM 提供 EPLB，通过 `--enable-eplb` 开启，周期性根据统计的 token 分布重新映射专家。可配置冗余专家数量（`num_redundant_experts`），但会带来额外显存开销。
+将 Prefill 和 Decode 拆分为独立实例分别部署（PD Disaggregation）。Prefill 计算密集、一次性写入大量 KV；Decode 访存密集、需要频繁读取 KV。分离后两类实例可以各自选择最合适的并行拓扑与通信后端——例如 EP 官方文档给出的建议是：Prefill 实例用 `deepep_high_throughput` 后端，Decode 实例用 `deepep_low_latency` 后端；两者之间通过 NIXL 或其他 KV connector（如 `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'`）传输 KV Cache。
 
 ---
 
-# 案例：Kimi-K3模型多机部署显存测算
+# 案例：Kimi K3 的真实部署（2026 年 7 月发布）
 
-## 模型参数
+原方案里常见的"假设某个万亿参数模型"式推演，不如直接用一个近期真实发布、vLLM 已提供 day-0 支持的模型来说明——Moonshot AI 于 2026 年 7 月发布的 **Kimi K3** 正好合适，而且它的架构对"如何应用上述并行技术"提出了一个很好的反例。
 
-| 参数项 | 数值（假设） |
-|--------|------|
-| 总参数量 | 2.8T |
+## 模型架构（真实参数，出自 Moonshot 官方发布与 vLLM 官方博客）
+
+| 参数项 | 数值 |
+|---|---|
+| 总参数量 | 约 2.8T |
 | 激活参数量 | 约 104B / token |
-| 网络层数 | 93 层 |
-| 路由专家数 | 896 个 / 层，每 token 选 16 个 |
-| 共享专家数 | 2 个 / 层 |
-| 权重精度 | BF16 |
-| 总权重大小 | 2.8T × 2 Byte ≈ **5.6 TB** |
-| 上下文窗口（假设） | 1,048,576 token |
+| 网络层数 | 93 层，其中 **69 层 Kimi Delta Attention（KDA）+ 24 层 Gated MLA** |
+| 路由专家数 | 896 个，每 token 选 16 个 |
+| 共享专家数 | 2 个 |
+| 原生权重精度 | MXFP4（专家权重），非专家部分精度更高 |
+| 上下文窗口 | 1,048,576 token（1M） |
 
-## 硬件配置
+**这个混合注意力架构非常关键**：KDA 是一种线性注意力（delta-rule 循环机制），携带的是**固定大小的循环状态**，而不是随 token 数线性增长的传统 KV Cache；只有穿插在其中的 24 层 Gated MLA 才有类似 DeepSeek-R1 那样、可压缩的传统 KV Cache。这意味着：
+- 前文标准的"KV Cache 随 TP/DCP 重复、需要用 `-dcp` 消除"这套推理，**只对这 24 层 Gated MLA 成立**，对 69 层 KDA 不直接适用（它们的状态量本身就很小、且不随上下文长度线性增长）
+- 权重显存的估算不能简单套用"参数量 × 2 Byte"的 BF16 公式，因为模型原生就是 MXFP4（专家部分约 0.5 Byte/参数量级），2.8T 参数在 MXFP4 下的权重体量数量级大约是 1.4~1.75 TB，而不是 BF16 下的约 5.6 TB——量化格式对权重显存的影响，往往比调整并行度更直接
 
-- 节点数：16 台，单节点 GPU 数：16 卡，单卡显存：64 GB
-- 总卡数：256 卡，总显存：16 TB
+## 官方给出的真实部署拓扑
 
-## 推荐并行拓扑（PP + TP + EP，DCP 复用 TP rank，不额外占用卡数）
+vLLM 官方博客给出的单节点最简命令（`-tp 8`，未开 EP/DP，仅作为最基本示例）：
 
-| 并行维度 | 取值 | 说明 |
-|----------|------|------|
-| PP（流水线并行） | 16 | 跨 16 节点，每节点一个流水线阶段 |
-| TP（张量并行） | 2 | 节点内每 2 卡做层内张量切分 |
-| DP（数据并行） | 1 | 单副本 |
-| EP（专家并行，`--enable-expert-parallel`） | = TP × DP = 2 | **注意**：若要让专家并行度达到 8（如原文设想），需要相应提高 TP 或 DP，例如 `TP=8, DP=1` 才能得到 `EP_SIZE=8`，而不能脱离 TP/DP 单独设置 EP=8 |
-| DCP（Decode Context Parallel，复用 TP rank） | ≤ TP/H（H 为 kv-head 数） | 不额外增加卡数，仅用于消除 KV Cache 在 TP 维度的重复 |
+```bash
+vllm serve moonshotai/Kimi-K3 \
+    --tensor-parallel-size 8 \
+    --trust-remote-code \
+    --load-format fastsafetensors \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser kimi_k3 \
+    --reasoning-parser kimi_k3
+```
 
-**总卡数** = PP × TP × DP = 16 × TP × DP，需要根据目标 EP_SIZE 反推合适的 TP、DP 组合，使 `PP × TP × DP = 256` 且 `TP × DP` 达到期望的 EP 并行度。
+vLLM 官方博客同时指出：完整模型体量已经接近单台 NVIDIA DGX B300 的极限，在这一代硬件上做严肃生产部署，最少需要 **16 张 B200/GB200** 级别 GPU；vLLM Recipes 页面给出的另一条路径是单节点 **8×GB300**。
 
-## 单卡显存测算（示意，需按最终确定的 TP/DP 重新计算）
+vLLM Ascend 官方教程给出了两个已验证的多机拓扑（均满足 `EP = TP × DP` 的公式）：
 
-### 1. 模型权重显存
+| 拓扑 | 节点数 | 每节点卡数 | 说明 |
+|---|---|---|---|
+| DP4 / TP16 / EP64 | 4 | 16 | 每节点跑 1 个 DP rank，节点内 16 卡做 TP；`TP16 × DP4 = EP64` |
+| DP8 / TP8 / EP64 | 8 | 8 | 每节点跑 1 个 DP rank 且同时处理 Prefill 和 Decode；`TP8 × DP8 = EP64` |
 
-**每流水线阶段权重** = 总权重 / PP = 5.6 TB / 16 = **350 GB**
-
-- **非专家部分**（约占 5%）：17.5 GB / 阶段，按 TP 切分
-- **专家部分**（约占 95%）：332.5 GB / 阶段，按 EP_SIZE（= TP × DP）切分
-
-### 2. KV Cache 显存
-
-> 若模型采用 MLA 等压缩 KV Cache 的架构，标准 MHA 公式会严重高估实际占用，务必以 vLLM 实测的 `kv_lora_rank`/`qk_rope_head_dim` 等真实维度重新计算，或直接以 vLLM 启动日志中报告的 KV Cache block 数为准。
-
-### 3. 显存汇总与安全边际
-
-- 建议预留 5%~10% 显存余量，设置 `--gpu-memory-utilization 0.9`
-- 长上下文场景优先通过 DCP（消除 KV 重复）+ FP8 KV Cache 量化控制显存，而非简单假设"CP 线性缩减总卡数"
+两种拓扑专家并行度都是 64，区别在于用更少的大节点（16 卡/节点，TP 更大）还是更多的小节点（8 卡/节点，DP 更大）来达到同样的 EP 规模——这正是前文"TP vs DP vs EP 该如何取舍"的一个真实缩影：TP 更大能让节点内的专家/注意力权重切得更细、通信走高速互联；DP 更大能让更多独立请求并行处理、KV Cache 相互独立、扩展更线性，但代价是非专家权重被复制的份数也更多。
 
 ---
 
 # 各并行技术对比总结
 
-| 维度 | 切分对象 | 主要作用 | 单卡权重显存 | 单卡 KV 显存 | 通信开销 | 是否独立增加卡数 |
-|------|----------|----------|-------------|-------------|----------|-------------|
+| 维度 | 切分对象 | 主要作用 | 单卡权重显存 | 单卡 KV 显存 | 通信开销 | 是否独立占用卡数 |
+|---|---|---|---|---|---|---|
 | **TP 张量并行** | 层内权重矩阵 | 层内加速、降低单卡权重 | ÷ TP | 依赖 kv-head 数，可能重复 | 高（每层多次 All-Reduce） | 是 |
-| **DP 数据并行** | 请求/Batch 维度 | 提升系统总吞吐量 | 不变（不结合 TP/EP 时） | 不变（各副本独立） | 低 | 是 |
-| **EP 专家并行** | MoE 专家 FFN | MoE 模型降单卡权重 | 专家部分 ÷ (TP×DP) | 不变 | 中（每层两次 All-to-All） | 否（= TP × DP，需 `--enable-expert-parallel`） |
 | **PP 流水线并行** | 层（Layer） | 跨节点扩模型规模 | ÷ PP | ÷ PP | 低（仅阶段间传激活） | 是 |
-| **PCP（Prefill CP）** | 序列（Prefill） | 降低长序列 Prefill 的 TTFT | 不变 | 不变 | 中 | 是 |
-| **DCP（Decode CP）** | KV Cache（Decode，沿 token 维交错） | 消除 TP 导致的 KV Cache 重复 | 不变 | 减少重复（非线性缩减） | 中（环状/A2A 通信 + softmax LSE 合并） | 否（复用 TP rank） |
-| **序列并行融合（Pass）** | 非注意力逐元素算子的激活 | 降低激活显存、为 AsyncTP 铺路 | 不变 | 不变 | 低（Reduce-Scatter+All-Gather 替代 All-Reduce） | 否（编译期优化） |
+| **DP 数据并行** | 请求/Batch 维度 | 提升系统总吞吐量 | 不变（不结合 TP/EP 时） | 不变（各副本独立） | 低 | 是（整体复制） |
+| **EP 专家并行** | MoE 专家 FFN | MoE 模型降低单卡权重 | 专家部分 ÷ (TP×DP) | 不变 | 中（每层两次 All-to-All） | 否（= TP × DP，需 `--enable-expert-parallel`，官方标注为实验特性） |
+| **PCP（Prefill CP）** | 序列（Prefill，Q/K/V 均可切） | 降低长序列 Prefill 的 TTFT | 不变 | 会分片（非"不变"） | 中～高 | **是**（独立通信域，`world_size` 含 PCP 因子） |
+| **DCP（Decode CP）** | KV Cache（Decode，沿 token 维交错切分） | 消除 TP 导致的 KV Cache 重复 | 不变 | 减少重复（非线性缩减，上限 `tp_size/H`） | 中（复用 TP 通信域） | 否（复用 TP rank） |
+| **序列并行融合（enable_sp）** | 非注意力逐元素算子的激活 | 降低激活显存、为 AsyncTP 铺路 | 不变 | 不变 | 低（Reduce-Scatter+All-Gather 替代 All-Reduce） | 否（编译期优化） |
 
 **选型原则**：
 
-1. 单节点内优先用 **TP** 吃满 NVLink 带宽
-2. MoE 模型需要显式加 **`--enable-expert-parallel`** 才能获得专家并行带来的显存/效率收益
-3. 跨节点扩展用 **PP**，通信量最小
-4. TP 超过 kv-head 数、出现 KV Cache 重复时，加 **DCP** 消除重复；追求超长 Prefill 低延迟时考虑 **PCP**
-5. 需要高吞吐量再加 **DP**
+1. 节点内优先用 **TP** 吃满 NVLink 带宽
+2. MoE 模型要显式加 **`--enable-expert-parallel`** 才能获得专家并行带来的显存/效率收益，且这仍是实验特性，行为可能随版本变化
+3. 跨节点扩展优先用 **PP**，通信量最小；DP 用于横向扩吞吐
+4. TP 超过 kv-head 数、出现 KV Cache 重复时，加 **DCP** 消除重复（几乎零额外成本）；追求超长 Prefill 低延迟、且预算允许增加真实卡数时，再考虑 **PCP**
+5. 混合注意力架构（如 Kimi K3 的 KDA + Gated MLA）需要重新审视上述"标准" KV Cache 假设，不能照搬纯 MHA/MLA 模型的推算方式
+6. 原生低精度权重格式（如 MXFP4）对权重显存的影响量级，通常比单纯调整并行度更显著，应一并纳入显存预算
