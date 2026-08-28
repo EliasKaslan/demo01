@@ -1,1328 +1,462 @@
-# vLLM V1 架构深度解读 —— 基于 v0.26.0 源码（含 vllm-ascend 生效机制全解）
-
-> **源码基线**
-> - vLLM：`v0.26.0`（commit `568afb3`），工作区路径 `./vllm/`
-> - vllm-ascend：`main` 分支（commit `9c7ef37`，即 v0.26.0 开发版；写作时官方尚未打出 `v0.26.0rc` tag，最新 tag 为 `v0.25.1rc1`，main 分支即对应 vLLM v0.26 的适配开发版），工作区路径 `./vllm-ascend/`
->
-> **阅读方式**：本文所有图均为 Mermaid 图，可在 GitHub / VS Code（装 Mermaid 插件）/ Typora 中直接渲染。所有"模块定位"均给出真实文件路径，可对照工作区源码阅读。
-
----
-
-## 目录
-
-- [1. 为什么要有 V1：一次彻底的架构重写](#1-为什么要有-v1一次彻底的架构重写)
-- [2. V1 总体架构鸟瞰](#2-v1-总体架构鸟瞰)
-- [3. 核心组件逐一拆解](#3-核心组件逐一拆解)
-- [4. 请求全生命周期：时序图视角](#4-请求全生命周期时序图视角)
-- [5. 关键机制深潜](#5-关键机制深潜)
-- [6. vllm-ascend 是如何"生效"的](#6-vllm-ascend-是如何生效的)
-- [7. 端到端全景：一次 NPU 上的推理迭代](#7-端到端全景一次-npu-上的推理迭代)
-- [8. 学习路线与参考资料](#8-学习路线与参考资料)
-
----
-
-## 1. 为什么要有 V1：一次彻底的架构重写
-
-vLLM V0 架构（`LLMEngine` + `AsyncLLMEngine`）在 2023~2024 年统治了开源推理生态，但它有三个结构性瓶颈：
-
-| V0 痛点 | 具体表现 | V1 解法 |
-|---|---|---|
-| **单进程耦合** | API 处理、调度、前后处理与 GPU 执行在同一个（异步）进程里，GIL 与 CPU 前后处理阻塞 GPU | **EngineCore 独立进程**，前端与核心引擎经 ZMQ 通信，tokenize/detokenize 与 GPU 计算真正并行 |
-| **prefill/decode 两阶段调度** | 先集中 prefill 再切 decode，decode 被 prefill 阻塞，TTFT/ITL 抖动大 | **统一调度**：每个请求只维护 `num_computed_tokens`，调度器每步把它向 `num_tokens_with_spec` 推进，prefill/decode 天然同框（Chunked Prefill 自然支持） |
-| **每步全量传输** | 每次调度都序列化完整请求对象给 Worker | **差量传输**：首次传全量，后续只传新增 block id / token id |
-
-V1 从 2025 年初 alpha 起逐步成为默认引擎（`vllm/v1/` 目录），到本文分析的 v0.26.0，V1 已经完全成熟并独占主线：**`vllm/engine/` 只剩 `arg_utils.py` 等配置壳，真正的引擎全部在 `vllm/v1/`**。
-
-```mermaid
-flowchart LR
-    subgraph V0["V0 时代（旧）"]
-        A1["AsyncLLMEngine<br/>(单进程 asyncio)"] --> A2["LLMEngine"]
-        A2 --> A3["Scheduler<br/>(prefill/decode 两态)"]
-        A3 --> A4["GPUExecutor"]
-        A4 --> A5["Worker/ModelRunner"]
-    end
-    subgraph V1["V1 时代（现行）"]
-        B1["AsyncLLM / LLM<br/>(前端进程)"] -->|"ZMQ<br/>(EngineCoreClient)"| B2["EngineCore<br/>(独立进程)"]
-        B2 --> B3["Scheduler<br/>(统一 token 预算)"]
-        B2 --> B4["Executor"]
-        B4 --> B5["Worker × N<br/>(每卡一进程)"]
-        B5 --> B6["GPUModelRunner"]
-    end
-    V0 -.->|"架构重写"| V1
-```
-
-**一句话记忆 V1**：`前端进程（tokenize/detokenize） --ZMQ--> EngineCore 进程（Scheduler + KV Cache 管理） --> Worker 进程（ModelRunner + 模型前向 + 采样）`。
-
----
-
-## 2. V1 总体架构鸟瞰
-
-### 2.1 分层架构图
-
-```mermaid
-flowchart TB
-    subgraph L1["L1 入口层 vllm/entrypoints/"]
-        CLI["vllm CLI<br/>entrypoints/cli/"] --> API["OpenAI API Server<br/>entrypoints/openai/api_server.py"]
-        API --> ASYNC["AsyncLLM<br/>v1/engine/async_llm.py"]
-        PYAPI["LLM 离线推理类<br/>entrypoints/llm.py"] --> LLMENG["LLMEngine<br/>v1/engine/llm_engine.py"]
-    end
-
-    subgraph L2["L2 引擎层 vllm/v1/engine/"]
-        ASYNC --> IP["InputProcessor<br/>input_processor.py<br/>prompt→token ids"]
-        ASYNC --> OP["OutputProcessor<br/>output_processor.py<br/>增量 detokenize/停止判断"]
-        IP --> CC["EngineCoreClient<br/>core_client.py<br/>Inproc/SyncMP/AsyncMP"]
-        LLMENG --> CC
-    end
-
-    subgraph L3["L3 引擎核心（独立进程）vllm/v1/engine/core.py"]
-        CC -->|"ZMQ msgpack"| EC["EngineCore<br/>调度+执行主循环 step()"]
-        EC --> SCHED["Scheduler<br/>v1/core/sched/scheduler.py"]
-        EC --> KV["KVCacheManager<br/>v1/core/kv_cache_manager.py"]
-    end
-
-    subgraph L4["L4 执行层 vllm/v1/executor/"]
-        EC --> EXE["Executor<br/>abstract.py"]
-        EXE --> UNI["UniProcExecutor"]
-        EXE --> MP["MultiprocExecutor<br/>(每卡一个子进程)"]
-        EXE --> RAY["RayDistributedExecutor"]
-    end
-
-    subgraph L5["L5 Worker 层 vllm/v1/worker/"]
-        MP --> WW["WorkerWrapperBase<br/>worker_base.py<br/>(按 worker_cls 动态加载)"]
-        WW --> W["Worker<br/>gpu_worker.py"]
-        W --> MR["GPUModelRunner<br/>gpu_model_runner.py<br/>(7043 行核心)"]
-        MR --> IB["InputBatch<br/>gpu_input_batch.py"]
-    end
-
-    subgraph L6["L6 功能子系统 vllm/v1/"]
-        MR --> ATT["Attention 后端<br/>attention/backend.py"]
-        MR --> SMP["Sampler<br/>sample/sampler.py"]
-        MR --> SPEC["投机解码<br/>spec_decode/"]
-        MR --> STRUCT["结构化输出<br/>structured_output/"]
-        SCHED -.->|"grammar bitmask"| STRUCT
-    end
-
-    subgraph L7["L7 平台抽象层 vllm/platforms/"]
-        PLAT["Platform 基类<br/>platforms/interface.py"]
-        PLAT --> CUDA["CudaPlatform"]
-        PLAT --> ROCM["RocmPlatform"]
-        PLAT --> OOT["OOT 插件平台<br/>(vllm-ascend 的 NPUPlatform)"]
-        MR -.->|"current_platform"| PLAT
-        ATT -.->|"get_attn_backend_cls"| PLAT
-        EC -.->|"check_and_update_config"| PLAT
-    end
-```
-
-### 2.2 进程模型（在线服务部署视角）
-
-V1 是**多进程**架构。以 `vllm serve` 启动 TP=2 为例，真实进程拓扑如下：
-
-```mermaid
-flowchart TB
-    subgraph P0["进程 0：API Server（前端）"]
-        UV["uvicorn/fastapi<br/>entrypoints/openai/api_server.py"] --> ASYNCLLM["AsyncLLM<br/>v1/engine/async_llm.py"]
-        ASYNCLLM --> INP["InputProcessor（tokenize）"]
-        ASYNCLLM --> OUTP["OutputProcessor（detokenize）<br/>+ 后台 output_handler 线程"]
-    end
-
-    subgraph P1["进程 1：EngineCore（引擎核心，busy-loop）"]
-        direction TB
-        T1["input 线程（ZMQ DEALER 收请求）"]
-        T2["output 线程（ZMQ PUB 发结果）"]
-        T3["主线程：busy-loop<br/>EngineCore.step()"]
-        T1 --> Q1[/"input_queue"/]
-        Q1 --> T3
-        T3 --> Q2[/"output_queue"/]
-        Q2 --> T2
-        T3 --> SCH["Scheduler"]
-    end
-
-    subgraph P2["进程 2：TP rank0 Worker"]
-        W0["WorkerWrapperBase → Worker<br/>(GPU0)"]
-    end
-
-    subgraph P3["进程 3：TP rank1 Worker"]
-        W1["WorkerWrapperBase → Worker<br/>(GPU1)"]
-    end
-
-    ASYNCLLM <-->|"ZMQ: EngineCoreRequest<br/>(msgpack 序列化)"| T1
-    T2 -->|"ZMQ: EngineCoreOutputs"| OUTP
-    T3 -->|"SchedulerOutput"| W0
-    T3 -->|"SchedulerOutput 广播"| W1
-    W0 <-.->|"NCCL/HCCL 集合通信"| W1
-```
-
-> 三个进程的分工要点：
-> - **API Server 进程**：HTTP/WebSocket、参数校验、**tokenize 与 detokenize 都在前端**（CPU 密集，与 GPU 解耦）；
-> - **EngineCore 进程**：一个 Python 进程跑 `busy-loop`（`EngineCoreProc.run_engine_core`，见 `v1/engine/core.py`），内部有 input/output 两条后台线程专门做 ZMQ 收发与序列化，主线程纯调度；
-> - **Worker 进程**：每个 GPU/NPU 一个进程（由 `MultiprocExecutor` spawn），加载权重、执行前向。进程间通过 `init_process_group` 建立 NCCL（NPU 上是 HCCL）通信。
-
-EngineCoreClient 的三种形态（`vllm/v1/engine/core_client.py`）决定了部署形态：
-
-| Client 类 | 模式 | 场景 |
-|---|---|---|
-| `InprocClient` | 同进程直调 | 离线 `LLM()`（默认 `multiprocess_mode=False` 时的兼容路径） |
-| `SyncMPClient` | ZMQ + 后台进程（同步） | 离线 `LLM()` 的新路径 |
-| `AsyncMPClient` | ZMQ + 后台进程（asyncio） | 在线 `vllm serve` / `AsyncLLM` |
-
-### 2.3 源码目录地图（模块定位速查）
-
-```
-vllm/                                # 主包
-├── entrypoints/                     # ── 入口层
-│   ├── llm.py                       #    LLM 离线推理类（最常用的 API）
-│   ├── openai/api_server.py         #    OpenAI 兼容 HTTP 服务
-│   ├── cli/                         #    `vllm serve` 等命令行
-│   └── serve/                       #    serving 子命令实现
-├── engine/arg_utils.py              # ── EngineArgs / AsyncEngineArgs（全部 CLI 参数定义）
-├── config/                          # ── 配置包：VllmConfig / ModelConfig / CacheConfig / ParallelConfig ...
-│   └── vllm.py                      #    VllmConfig 根配置（含 check_and_update_config 钩子调用点）
-├── v1/                              # ── ★ V1 引擎本体 ★
-│   ├── engine/                      #    AsyncLLM / LLMEngine / EngineCore / EngineCoreClient
-│   │   ├── async_llm.py             #      AsyncLLM（前端，在线）
-│   │   ├── llm_engine.py            #      LLMEngine（前端，离线）
-│   │   ├── core.py                  #      EngineCore + EngineCoreProc（独立进程包装）
-│   │   ├── core_client.py           #      EngineCoreClient 三兄弟 + DPLB 路由
-│   │   ├── input_processor.py       #      输入预处理（chat 模板、tokenize、mm 数据）
-│   │   ├── output_processor.py      #      输出后处理（增量 detok、stop、RequestOutputCollector）
-│   │   ├── detokenizer.py           #      IncrementalDetokenizer
-│   │   └── coordinator.py           #      DP Coordinator（数据并行负载均衡）
-│   ├── core/                        #    调度与 KV Cache
-│   │   ├── sched/scheduler.py       #      Scheduler（2520 行，统一调度器）
-│   │   ├── sched/async_scheduler.py #      AsyncScheduler（异步调度重叠）
-│   │   ├── kv_cache_manager.py      #      KVCacheManager（对外门面）
-│   │   ├── kv_cache_coordinator.py  #      KVCacheCoordinator（多类型缓存编排）
-│   │   ├── block_pool.py            #      BlockPool（物理块池 + prefix caching）
-│   │   └── single_type_kv_cache_manager.py  # 单类型（full/swa/mamba...）缓存管理
-│   ├── executor/                    #    执行器
-│   │   ├── abstract.py              #      Executor 基类（get_class 选择 mp/ray/uni）
-│   │   ├── uniproc_executor.py      #      单进程执行器
-│   │   ├── multiproc_executor.py    #      多进程执行器（默认，TP>1 或 PP>1）
-│   │   └── ray_executor.py          #      Ray 集群执行器
-│   ├── worker/                      #    Worker
-│   │   ├── worker_base.py           #      WorkerBase / WorkerWrapperBase（worker_cls 动态解析）
-│   │   ├── gpu_worker.py            #      Worker（GPU，1259 行）
-│   │   ├── gpu_model_runner.py      #      GPUModelRunner（7043 行，单卡执行核心）
-│   │   └── gpu_input_batch.py       #      InputBatch（常驻 GPU 的批次状态）
-│   ├── attention/                   #    注意力后端
-│   │   ├── backend.py               #      AttentionBackend / AttentionImpl 抽象接口
-│   │   └── selector.py              #      get_attn_backend()：经 current_platform 选择后端
-│   ├── sample/sampler.py            #    Sampler（温度/top-k/top-p 采样）
-│   ├── spec_decode/                 #    投机解码（EAGLE/MTP/ngram/dflash...）
-│   ├── structured_output/           #    结构化输出（xgrammar/outlines/guidance）
-│   ├── metrics/                     #    指标（Prometheus / logging）
-│   └── request.py                   #    Request 对象（waiting/running 状态机）
-├── platforms/                       # ── 平台抽象层（vllm-ascend 的接入点！）
-│   ├── interface.py                 #    Platform 抽象基类
-│   ├── __init__.py                  #    current_platform 惰性发现（内置+OOT 插件）
-│   └── cuda.py / rocm.py / tpu.py / xpu.py / cpu.py
-├── plugins/__init__.py              # ── entry_points 插件加载（vllm.platform_plugins 等分组）
-├── model_executor/                  # ── 模型执行（Attention/MoE/Linear 等 layer 实现）
-├── models/                          # ── 模型定义（Qwen/Llama/DeepSeek...）
-└── transformers_utils/ / tokenizers/ # tokenizer 与 HF 配置工具
-```
-
----
-
-## 3. 核心组件逐一拆解
-
-### 3.1 前端：LLM 与 AsyncLLM
-
-两个前端类共享同一套后端，区别只在同步/异步与进程模式：
-
-| | `LLM`（`entrypoints/llm.py`） | `AsyncLLM`（`v1/engine/async_llm.py`） |
-|---|---|---|
-| 用法 | 离线批量推理 `llm.generate()` | 在线服务（`vllm serve` 内部） |
-| 引擎 | `LLMEngine`（`v1/engine/llm_engine.py`） | 直接持有 `AsyncLLM` |
-| EngineCore 客户端 | `SyncMPClient` / `InprocClient` | `AsyncMPClient` |
-| 输出方式 | 同步收集 `RequestOutput` | `AsyncGenerator[RequestOutput]` |
-
-`AsyncLLM` 内部结构要点（对照 `async_llm.py`）：
-
-- `generate()` / `add_request()` → **`InputProcessor`**（tokenize + 多模态预处理）→ 得到 `EngineCoreRequest` → 经 `EngineCoreClient` 发给 EngineCore 进程；
-- 同时为每个请求创建 **`RequestOutputCollector`**（`output_processor.py`），这是一个小的"输出信箱"；
-- 一个后台线程 **`_run_output_handler()`** 持续从 EngineCore 拉 `EngineCoreOutputs`，交给 **`IncrementalDetokenizer`** 增量解码、**`OutputProcessor`** 做停止条件判断/日志概率整理，再塞进每个请求的 collector，唤醒对应的 asyncio 任务。
-
-```mermaid
-flowchart LR
-    U["用户/HTTP"] --> AR["AsyncLLM.add_request()"]
-    AR --> IPX["InputProcessor<br/>tokenize / mm 预处理"]
-    IPX --> REQ["EngineCoreRequest"]
-    REQ --> EC["EngineCore 进程"]
-    EC --> OUT["EngineCoreOutputs"]
-    OUT --> OH["_run_output_handler 线程"]
-    OH --> DT["IncrementalDetokenizer<br/>detokenizer.py"]
-    DT --> OPP["OutputProcessor<br/>stop/finish 判断"]
-    OPP --> COLL["RequestOutputCollector"]
-    COLL -->|"asyncio 唤醒"| STREAM["StreamingResponse"]
-```
-
-### 3.2 EngineCore：引擎心脏（`v1/engine/core.py`）
-
-`EngineCore` 是"调度 + 执行"的合体，它的 `__init__` 顺序本身就是一份架构清单：
-
-```python
-# vllm/v1/engine/core.py（节选，注释为本文所加）
-class EngineCore:
-    def __init__(self, vllm_config, executor_class, log_stats, ...):
-        load_general_plugins()                      # ① 加载 vllm.general_plugins 插件
-        self.model_executor = executor_class(...)   # ② 创建 Executor（拉起 Worker 进程）
-        kv_cache_config = self._initialize_kv_caches(vllm_config)  # ③ 显存 profile → KV Cache 规划
-        self.structured_output_manager = ...        # ④ 结构化输出管理器
-        Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
-        self.scheduler = Scheduler(...)             # ⑤ 调度器（可被 vllm-ascend 换成定制调度器）
-        ...
-```
-
-**主循环 `step()`**（`core.py:576`）——这是整个 V1 最重要的一段代码：
-
-```python
-def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
-    if not self.scheduler.has_requests():           # 无请求直接空转返回
-        return {}, False
-    scheduler_output = self.scheduler.schedule(...) # 1) 调度：产出一批 token 的执行计划
-    future = self.model_executor.execute_model(scheduler_output, non_block=True)  # 2) 异步下发执行
-    grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)         # 3) 语法约束位掩码
-    model_output = future.result()                  # 4) 等待 ModelRunnerOutput（logits→采样后 token）
-    self._process_aborts_queue()                    # 5) 处理执行期间的 abort
-    engine_core_outputs = self.scheduler.update_from_output(scheduler_output, model_output)  # 6) 状态推进
-    return engine_core_outputs, ...
-```
-
-对应的循环驱动在 `EngineCoreProc.run_engine_core`（同文件）：`while True: outputs = self.step(); self.emit(outputs)`——一个不眠不休的 busy-loop，空闲时也每步轮询（保证最低调度延迟）。
-
-```mermaid
-flowchart TD
-    LOOP["EngineCore busy-loop<br/>run_engine_core()"] --> HAS{"scheduler.has_requests()?"}
-    HAS -->|否| IDLE["空转（等待新请求）"] --> LOOP
-    HAS -->|是| S1["① scheduler.schedule()<br/>产出 SchedulerOutput<br/>（新 token 数 / block 表 / 抢占列表）"]
-    S1 --> S2["② executor.execute_model(scheduler_output)<br/>广播给所有 Worker 进程"]
-    S2 --> S3["③ scheduler.get_grammar_bitmask()<br/>(结构化输出约束)"]
-    S3 --> S4["④ future.result()<br/>等待 ModelRunnerOutput<br/>（含 sampled_token_ids）"]
-    S4 --> S5["⑤ 处理 abort 队列"]
-    S5 --> S6["⑥ scheduler.update_from_output()<br/>· KV block 落账<br/>· 请求状态推进（finished?）<br/>· 产出 EngineCoreOutputs"]
-    S6 --> S7["⑦ output 线程 ZMQ 发回前端"]
-    S7 --> LOOP
-```
-
-### 3.3 Scheduler：统一调度器（`v1/core/sched/scheduler.py`）
-
-V1 调度器的**核心思想只有一句话**（源码注释原话，`scheduler.py:427`）：
-
-> "There's no 'decoding phase' nor 'prefill phase' in the scheduler. Each request just has the `num_computed_tokens`. At each step, the scheduler tries to assign tokens to the requests so that each request's `num_computed_tokens` can catch up its `num_tokens_with_spec`."
-
-即：**调度器不做"阶段"管理，只做"token 预算分配"**。每个 step 把 `max_num_batched_tokens` 的预算切给若干请求——正在 prefill 的请求拿到大块 token（chunked prefill），正在 decode 的请求每次拿 1 个（或 spec decode 的 k+1 个）。
-
-```mermaid
-flowchart TD
-    START["schedule() 每 step 调用"] --> BUDGET["token_budget = max_num_batched_tokens<br/>block 预算 = KVCacheManager 剩余块"]
-    BUDGET --> RUN["第一优先级：遍历 running 队列<br/>（已在跑的请求，含 chunked prefill 中途的请求）"]
-    RUN --> NEED{"num_tokens_with_spec −<br/>num_computed_tokens > 0 ?"}
-    NEED -->|是| ALLOC["分配 min(需求, token_budget) 个 token<br/>调用 kv_cache_manager 分配块<br/>（prefix cache 命中则复用已有块）"]
-    NEED -->|否| SKIP["跳过（本轮无需计算）"]
-    ALLOC --> CHK{"token_budget 或<br/>KV 块耗尽？"}
-    CHK -->|KV 块不足| PREEMPT["抢占：recompute 模式<br/>把最后的请求踢回 waiting<br/>（_preempt_request）"]
-    CHK -->|token 预算还有| WAIT["第二优先级：从 waiting 队列<br/>准入新请求（准入条件：KV 够放 prompt）"]
-    PREEMPT --> WAIT
-    WAIT --> ASSEMBLE["组装 SchedulerOutput：<br/>· scheduled_new/resumed/running_reqs<br/>· num_scheduled_tokens[]<br/>· block_tables[]（新分配块 id）<br/>· total_num_scheduled_tokens"]
-    ASSEMBLE --> DONE["返回给 EngineCore"]
-```
-
-请求状态机（`v1/request.py` 的 `RequestStatus`）：
-
-```mermaid
-stateDiagram-v2
-    [*] --> WAITING: add_request()
-    WAITING --> RUNNING: 调度准入（prompt 首块分配）
-    RUNNING --> RUNNING: 每 step 推进 num_computed_tokens
-    RUNNING --> PREEMPTED: KV 不足被抢占
-    PREEMPTED --> WAITING: 重新排队（recompute）
-    RUNNING --> FINISHED_STOPPED: 满足 stop 条件
-    RUNNING --> FINISHED_LENGTH: 达到 max_tokens
-    RUNNING --> FINISHED_ABORTED: 客户端 abort
-    FINISHED_STOPPED --> [*]
-    FINISHED_LENGTH --> [*]
-    FINISHED_ABORTED --> [*]
-```
-
-**调度器可插拔**：`vllm_config.scheduler_config.get_scheduler_cls()` 按配置字符串解析调度器类（`vllm/config/scheduler.py`）。vllm-ascend 正是利用这一点注入了自己的增强调度器（后文 6.4 详述）。
-
-### 3.4 KV Cache 管理（`v1/core/`）
-
-V1 的 KV Cache 管理是一套精美的"三级分权"结构：
-
-| 组件 | 文件 | 职责 |
-|---|---|---|
-| **KVCacheManager** | `v1/core/kv_cache_manager.py` | 门面：请求级语义（"为这个请求分配 n 个块"），内部按 group 委托给 Coordinator |
-| **KVCacheCoordinator** | `v1/core/kv_cache_coordinator.py` | 编排多种 KVCacheSpec 类型（full attention / sliding window / mamba / cross...），每组一个 SingleTypeKVCacheManager |
-| **BlockPool** | `v1/core/block_pool.py` | 物理块池：空闲块分配、**prefix caching 的哈希表**（block hash → 物理块）、块引用计数 |
-| **SingleTypeKVCacheManager** | `v1/core/single_type_kv_cache_manager.py` | 单一类型缓存的管理策略（分配/释放/滑动窗口推进） |
-
-**块（Block）模型**：KV Cache 被切成固定大小的块（如 16/32/128 token 每块，`CacheConfig.block_size`），每个请求有一张 `block_table`（块 id 列表）。这继承自 PagedAttention 思想，但 V1 把"逻辑块/物理块"简化成了"请求 → 物理块表"单层映射。
-
-**Prefix Caching**：以块为单位计算 hash（block 内 token 序列 + 前缀块 hash 链式），相同前缀（典型：system prompt / few-shot）的请求直接复用物理块（引用计数 +1），免算 prefill。由 `CacheConfig.enable_prefix_caching` 开关（V1 默认开启）。
-
-```mermaid
-flowchart LR
-    subgraph Manager["KVCacheManager (kv_cache_manager.py)"]
-        CO["KVCacheCoordinator"]
-    end
-    CO --> G1["FullAttentionManager<br/>(single_type_kv_cache_manager.py)"]
-    CO --> G2["SlidingWindowManager"]
-    CO --> G3["MambaManager (mamba_utils.py)"]
-    CO --> G4["CrossAttentionManager"]
-    G1 --> BP["BlockPool (block_pool.py)<br/>· free_block_queue 空闲链表<br/>· cached_block_hash: 前缀哈希表<br/>· ref_cnt 引用计数"]
-    G2 --> BP
-    G4 --> BP
-    subgraph GPU["GPU/NPU 显存"]
-        TENSOR["KV Cache 张量池<br/>(ModelRunner.initialize_kv_cache)"]
-    end
-    BP -.->|"block_id → 显存偏移"| TENSOR
-```
-
-**KV Cache 容量是怎么定出来的？**（启动期，`EngineCore._initialize_kv_caches`）
-
-```mermaid
-sequenceDiagram
-    participant EC as EngineCore (core.py)
-    participant EX as Executor
-    participant W as Worker (gpu_worker.py)
-    participant MR as ModelRunner
-
-    EC->>EX: ① collective_rpc("get_kv_cache_spec")
-    EX->>W: 转发 RPC
-    W->>MR: 每层的 KVCacheSpec（页大小/shape）
-    MR-->>EC: 返回各层 spec
-    EC->>EX: ② collective_rpc("determine_available_memory")
-    W->>MR: profile_run()：加载权重+dummy 前向
-    MR-->>W: 峰值显存占用
-    W-->>EC: 剩余可用显存
-    EC->>EC: ③ get_kv_cache_config()<br/>（kv_cache_utils.py：按 spec + 剩余显存计算块数）
-    EC->>EX: ④ initialize_from_config(kv_cache_config)
-    EX->>W: 广播
-    W->>MR: initialize_kv_cache()：分配 KV 张量池<br/>+ 绑定 attention backend 的块表
-```
-
-### 3.5 Executor 与 Worker：执行层
-
-**Executor**（`v1/executor/abstract.py`）是"怎么把模型跑起来"的编排者。`Executor.get_class()` 根据 `--distributed-executor-backend` 选择实现：
-
-```mermaid
-classDiagram
-    class Executor {
-        <<abstract, v1/executor/abstract.py>>
-        +get_class(vllm_config) type[Executor]$
-        +execute_model(scheduler_output) Future
-        +collective_rpc(method, args)
-        +initialize_from_config(kv_cache_configs)
-    }
-    class UniProcExecutor {
-        v1/executor/uniproc_executor.py
-        单进程，Worker 同进程直调
-    }
-    class MultiprocExecutor {
-        v1/executor/multiproc_executor.py
-        spawn 子进程（默认 TP/PP 路径）
-    }
-    class RayDistributedExecutor {
-        v1/executor/ray_executor.py
-        跨机 Ray Actor
-    }
-    Executor <|-- UniProcExecutor
-    Executor <|-- MultiprocExecutor
-    Executor <|-- RayDistributedExecutor
-```
-
-**Worker 的加载是"字符串驱动"的**——这是 vllm-ascend 能整体替换执行层的关键机制（`v1/worker/worker_base.py:250`）：
-
-```python
-# vllm/v1/worker/worker_base.py（节选）
-class WorkerWrapperBase:
-    def init_worker(self, all_kwargs):
-        ...
-        parallel_config = vllm_config.parallel_config
-        if isinstance(parallel_config.worker_cls, str):
-            worker_class = resolve_obj_by_qualname(parallel_config.worker_cls)  # ← 按全名字符串 import
-        ...
-        self.worker = worker_class(**kwargs)   # 实例化真正的 Worker
-```
-
-默认 `worker_cls = "auto"`，由**平台层**在配置期解析（如 CUDA 平台把它写成 `"vllm.v1.worker.gpu_worker.Worker"`，见 `platforms/cuda.py:312`）。昇腾平台则写成 `"vllm_ascend.worker.worker.NPUWorker"`——执行层就此被"偷梁换柱"。
-
-```mermaid
-classDiagram
-    class WorkerBase {
-        <<abstract, v1/worker/worker_base.py>>
-        +execute_model()
-        +get_kv_cache_spec()
-        +determine_available_memory()
-        +load_model()
-    }
-    class WorkerWrapperBase {
-        每进程一个壳
-        +init_worker() 按 worker_cls 动态 import
-    }
-    class Worker {
-        v1/worker/gpu_worker.py (CUDA)
-        分布式初始化/显存管理
-    }
-    class NPUWorker {
-        vllm_ascend/worker/worker.py (昇腾)
-        ACLGraph/CaMem/HCCL 适配
-    }
-    class CPUWorker
-    class XPUWorker
-    WorkerBase <|-- Worker
-    WorkerBase <|-- NPUWorker
-    WorkerBase <|-- CPUWorker
-    WorkerBase <|-- XPUWorker
-    WorkerWrapperBase o-- WorkerBase : worker
-    note for NPUWorker "vllm-ascend 通过把 parallel_config.worker_cls\n改写为全限定类名，让 WorkerWrapper\n动态加载自己的 NPUWorker"
-```
-
-**GPUModelRunner**（`v1/worker/gpu_model_runner.py`）是单卡执行的总指挥（7043 行），职责：
-
-1. `_update_states()`：把 SchedulerOutput 增量落到常驻显存的 `InputBatch`（`gpu_input_batch.py`：`token_ids_cpu`、`block_table`、`seq_lens` 等张量缓冲区）；
-2. `_prepare_inputs()`：拼 attention metadata（调 `AttentionMetadataBuilder`）；
-3. `_model_forward()`：`model(ids, positions, intermediate_tensors)`（若开了 torch.compile/CUDA Graph 则走编译后的图）；
-4. `_sample()`：logits → `Sampler`（温度/top-k/top-p，`v1/sample/sampler.py`）→ `sampled_token_ids`；
-5. 输出打包为 `ModelRunnerOutput`（`v1/outputs.py`），回传 EngineCore。
-
-```mermaid
-flowchart TD
-    SO["SchedulerOutput 到达 Worker 进程"] --> U["① update_states()<br/>InputBatch 增量更新<br/>（新请求落位/结束请求移除/块表更新）"]
-    U --> P["② prepare_inputs()<br/>· input_ids / positions 拼接<br/>· _build_attention_metadata()"]
-    P --> F["③ model forward<br/>（torch.compile piecewise / CUDA Graph / eager）"]
-    F --> ATTN["Attention 层: forward_expand()<br/>（经 AttentionImpl → 后端算子）"]
-    ATTN --> L["LogitsProcessor → logits"]
-    L --> S["④ sample()<br/>Sampler: temperature/top-k/top-p"]
-    S --> O["ModelRunnerOutput<br/>sampled_token_ids / logprobs"]
-    O -->|"future.result()"| ECORE["EngineCore"]
-```
-
-### 3.6 Attention 后端抽象（`v1/attention/`）
-
-Attention 是推理引擎最核心的可变点（FlashAttention/FlashInfer/MLA...），V1 用经典的三件套抽象：
-
-- **`AttentionBackend`**（`v1/attention/backend.py`）：工厂与静态属性（支持什么、kv cache 布局偏好）；
-- **`AttentionImpl`**：每个注意力层一个实例，实现 `forward()`（decode/extend 两条路径）；
-- **`AttentionMetadataBuilder`**：从 SchedulerOutput 构建 `AttentionMetadata`（query 起止表、block table 视图等）。
-
-**后端选择**发生在 `v1/attention/selector.py` 的 `get_attn_backend()`：它最终调用 **`current_platform.get_attn_backend_cls()`**——又一个平台插件钩子，vllm-ascend 在此返回昇腾的注意力后端类。
-
-```mermaid
-flowchart LR
-    MR["GPUModelRunner"] -->|"get_attn_backend(head_size, dtype,<br/>use_mla, use_sparse...)"| SEL["selector.py<br/>_cached_get_attn_backend()"]
-    SEL --> CP["current_platform<br/>.get_attn_backend_cls()"]
-    CP -->|"CUDA"| FA["FlashAttentionBackend"]
-    CP -->|"NPU (vllm-ascend)"| ASC["vllm_ascend.attention.*<br/>AscendAttentionBackend / MLA / SFA / DSA / FA3"]
-    FA -.-> IMPL1["AttentionImpl.forward()"]
-    ASC -.-> IMPL2["Ascend 实现<br/>(torch_npu flash attention 算子)"]
-```
-
-### 3.7 平台抽象层：为"换芯片"而生（`vllm/platforms/`）
-
-这是理解 vllm-ascend 的**最关键一层**。`Platform`（`platforms/interface.py`）定义了约 30 个可覆写的钩子，覆盖设备识别、显存、通信、算子、图编译、worker 选择：
-
-| 钩子（节选） | 作用 | NPU 侧的覆写（`vllm_ascend/platform.py`） |
-|---|---|---|
-| `device_type` / `device_name` | 设备标识 | `"npu"` |
-| `check_and_update_config()` | 启动期改写 VllmConfig | 十步改写（见 6.4），**含 worker_cls 替换** |
-| `get_attn_backend_cls()` | 注意力后端选择 | 返回 Ascend 各后端类名 |
-| `get_device_communicator_cls()` | 集合通信 | `NPUCommunicator`（HCCL） |
-| `get_compile_backend()` | torch.compile 后端 | `vllm_ascend.compilation.compiler_interface.AscendCompiler` |
-| `get_static_graph_wrapper_cls()` | 图捕获包装 | `vllm_ascend.compilation.acl_graph.ACLGraphWrapper`（ACLGraph 替代 CUDA Graph） |
-| `get_punica_wrapper()` | LoRA 算子 | `PunicaWrapperNPU` |
-| `get_pass_manager_cls()` | Inductor 自定义 pass | `GraphFusionPassManager`（算子融合） |
-| `register_custom_kv_cache_specs()` | 自定义 KV 布局 | `register_ascend_kv_cache_specs()` |
-| `import_kernels()` | 导入自定义算子 | `bootstrap_custom_op_env()`（`torch.ops.vllm_ascend.*`） |
-
-**平台发现机制**（`platforms/__init__.py`）——`current_platform` 是惰性单例，首次访问时执行：
-
-```mermaid
-flowchart TD
-    A["任意代码首次访问<br/>vllm.platforms.current_platform"] --> B["resolve_current_platform_cls_qualname()"]
-    B --> C["遍历内置插件：<br/>tpu / cuda / rocm / xpu / cpu<br/>(platforms/__init__.py:202)"]
-    B --> D["load_plugins_by_group('vllm.platform_plugins')<br/>(plugins/__init__.py:36)<br/>→ 扫描 pip 安装的 entry_points"]
-    D --> E["调用每个插件的发现函数<br/>返回平台类全限定名或 None"]
-    C --> F{"哪些插件返回了类名？"}
-    E --> F
-    F -->|"仅 1 个 OOT 插件"| G["✅ 激活该 OOT 平台<br/>（如 vllm_ascend → NPUPlatform）"]
-    F -->|"仅 1 个内置"| H["激活内置平台"]
-    F -->|"≥2 个 OOT"| I["❌ RuntimeError：<br/>只允许一个平台插件"]
-    F -->|"0 个"| J["UnspecifiedPlatform"]
-    G --> K["resolve_obj_by_qualname() import 类<br/>实例化 → current_platform"]
-    H --> K
-    J --> K
-```
-
-> 插件之所以必须"惰性"初始化（`__getattr__` 里的懒加载，见 `platforms/__init__.py:261`），是因为 OOT 插件包要先 `from vllm.platforms import Platform` 继承基类——若 vllm 在 import 期就解析 current_platform 会造成循环依赖。这个细节在源码注释里写得很清楚。
-
----
-
-## 4. 请求全生命周期：时序图视角
-
-### 4.1 在线服务（`vllm serve`）一次流式请求的完整时序
-
-以用户向 OpenAI 兼容接口发一条 `/v1/chat/completions` 为例，从 HTTP 到 token 逐字返回的全过程：
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as 客户端(SSE)
-    participant API as API Server进程<br/>api_server.py
-    participant FE as AsyncLLM<br/>async_llm.py
-    participant IP as InputProcessor<br/>input_processor.py
-    participant CC as AsyncMPClient<br/>core_client.py
-    participant EC as EngineCore进程<br/>core.py
-    participant SC as Scheduler<br/>sched/scheduler.py
-    participant EX as Executor
-    participant WK as Worker进程<br/>gpu_worker.py
-    participant MR as GPUModelRunner
-
-    C->>API: POST /v1/chat/completions (stream=true)
-    API->>API: chat模板渲染 → prompt字符串
-    API->>FE: AsyncLLM.generate(prompt, params)
-    FE->>IP: process_inputs()
-    IP->>IP: tokenize（含多模态预处理）
-    IP-->>FE: EngineCoreRequest（prompt_token_ids等）
-    FE->>CC: add_request_async(request)
-    CC->>EC: ZMQ DEALER: EngineCoreRequest
-    EC->>SC: add_request() → waiting队列
-    Note over FE: 为该请求创建 RequestOutputCollector
-
-    loop 每个引擎 step（busy-loop）
-        EC->>SC: schedule()
-        SC->>SC: waiting→running准入 / token预算分配<br/>KV块分配(prefix命中复用)/必要时抢占
-        SC-->>EC: SchedulerOutput
-        EC->>EX: execute_model(scheduler_output)
-        EX->>WK: 广播(首rank携带完整输出)
-        WK->>MR: execute_model(scheduler_output)
-        MR->>MR: update_states → prepare_inputs<br/>→ forward → sample
-        MR-->>WK: ModelRunnerOutput(sampled_token_ids)
-        WK-->>EX: 汇聚
-        EX-->>EC: ModelRunnerOutput
-        EC->>SC: update_from_output()<br/>（推进num_computed_tokens/标记完成）
-        EC-->>CC: ZMQ: EngineCoreOutputs
-    end
-
-    CC-->>FE: output_handler线程收到输出
-    FE->>FE: IncrementalDetokenizer增量解码<br/>OutputProcessor停止判断
-    FE-->>API: RequestOutput(new_text="…")
-    API-->>C: SSE: data: {"choices":[{"delta":{"content":"…"}}]}
-    Note over FE,C: 循环直到 FINISH_STOPPED/<br/>FINISHED_LENGTH → data: [DONE]
-```
-
-**读图要点**：
-
-1. **tokenize 在前端进程、调度在 EngineCore 进程、前向在 Worker 进程**——三段真并行；
-2. 前端与 EngineCore 之间**只传 token id 和增量输出**（msgpack 序列化），不传任何张量；张量级数据（如 Worker 返回的 logits 派生结果）在 EngineCore↔Worker 间走进程通信/共享内存；
-3. 每次迭代里 Scheduler 只把"新 token + 新 block id"的**差量**写进 SchedulerOutput，Worker 里的 `InputBatch` 常驻显存、增量更新。
-
-### 4.2 离线推理（`LLM.generate`）时序
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant U as 用户代码
-    participant LLM as LLM<br/>entrypoints/llm.py
-    participant LE as LLMEngine<br/>v1/engine/llm_engine.py
-    participant IP as InputProcessor
-    participant CC as SyncMPClient
-    participant EC as EngineCore进程
-    participant WK as Worker进程
-
-    U->>LLM: llm = LLM(model=..., ...)
-    Note over LLM,WK: 启动期：EngineArgs→VllmConfig<br/>→平台check_and_update_config→<br/>拉起EngineCore子进程→Executor拉起Worker→<br/>KV Cache profiling与初始化
-    U->>LLM: llm.generate(["你好", ...], sampling_params)
-    LLM->>LE: add_request()×N
-    LE->>IP: tokenize
-    LE->>CC: EngineCoreRequest×N
-    CC->>EC: ZMQ批量发送
-    loop step循环（所有请求完成）
-        EC->>EC: schedule → execute_model → update_from_output
-        EC-->>CC: EngineCoreOutputs
-        CC-->>LE: 轮询收取
-        LE->>LE: OutputProcessor整理RequestOutput
-    end
-    LE-->>LLM: 全部RequestOutput
-    LLM-->>U: outputs（同步返回全部文本）
-```
-
-### 4.3 一条请求的"数据形态变迁"
-
-```mermaid
-flowchart LR
-    A["HTTP JSON<br/>{messages, params}"] -->|"chat模板"| B["prompt str"]
-    B -->|"InputProcessor<br/>tokenize"| C["EngineCoreRequest<br/>prompt_token_ids: list[int]"]
-    C -->|"Scheduler.schedule<br/>(SchedulerOutput)"| D["待计算token+block分配计划<br/>num_scheduled_tokens[] / block_tables[]"]
-    D -->|"Worker.prepare_inputs"| E["GPU张量：input_ids/positions/<br/>attn_metadata/block_table(device)" ]
-    E -->|"model forward"| F["logits [num_tokens, vocab]"]
-    F -->|"Sampler"| G["sampled_token_ids [num_reqs]"]
-    G -->|"update_from_output"| H["EngineCoreOutputs<br/>(token_ids + finish_reason)"]
-    H -->|"前端 Detokenizer"| I["RequestOutput<br/>delta text / logprobs"]
-```
-
----
-
-## 5. 关键机制深潜
-
-### 5.1 Chunked Prefill：长 prompt 切片与混合批
-
-V1 默认 `enable_chunked_prefill=True`：一个长 prompt 会被切成多个 chunk 跨多次迭代计算，且**与 decode 混在同一个 batch**里跑——这靠统一调度器天然实现（对调度器而言 chunked prefill 请求只是一个"每步要很多 token"的 running 请求）。
-
-```mermaid
-flowchart TD
-    subgraph Step_n["Step n（max_num_batched_tokens=8192）"]
-        R1["Req A（prefill中，还剩6000 token）"]
-        R2["Req B（decode，需1 token）"]
-        R3["Req C（decode，需1 token）"]
-        P["调度器分配：<br/>A←6000, B←1, C←1<br/>剩余预算2190可再准入新请求" ]
-    end
-    Step_n --> Step_n1["Step n+1：A 还剩的部分继续<br/>（A.is_prefill_chunk=True）<br/>B/C 各得1 token…" ]
-    Step_n1 --> DONE["A 的 prompt 计算完毕后<br/>转入decode：每步1 token"]
-```
-
-好处：decode 请求不再被长 prefill 独占阻塞（ITL 稳定），同时 GPU 每步都有大 batch 可跑（吞吐不掉）。代价：TTFT 略增，可用 `--long-prefill-token-threshold` 等参数调节。
-
-### 5.2 Prefix Caching：块级前缀复用
-
-```mermaid
-flowchart TD
-    REQ["新请求：prompt = [sys, 5000] + [user, 20]"]
-    REQ --> HASH["逐块计算 BlockHash：<br/>hash(块内容, 前块hash, extra) <br/>(core/kv_cache_utils.py)"]
-    HASH --> LOOKUP["BlockPool.cached_block_hash 查询"]
-    LOOKUP -->|"前 312 块全部命中"| REUSE["直接复用物理块（ref_cnt+1）<br/>num_computed_tokens += 4992"]
-    LOOKUP -->|"尾部块未命中"| ALLOC2["只为剩余 8 token 分配新块" ]
-    REUSE --> ALLOC2
-    ALLOC2 --> FWD["本次 forward 只算 8 个 token！<br/>（TTFT 大幅下降）"]
-    FWD -.->|"请求结束"| EVICT["块引用计数-1；归零且被新块挤兑时<br/>按 LRU 逐出哈希表" ]
-```
-
-### 5.3 torch.compile 与 CUDA Graph（GPU 路径）
-
-V1 的编译体系（`vllm/compilation/` + `config/compilation.py`）分两层：
-
-- **piecewise torch.compile**：`CompilationMode` 支持 `FULL` / `PIECEWISE`（默认）。PIECEWISE 把模型图在 `splitting_ops`（attention 等）处切开，attention 之外的子图用 Inductor 编译，attention 保留 eager（后端相关）；
-- **CUDA Graph**：对 decode 小 batch 的整图捕获重放（`cudagraph_mode`: FULL / PIECEWISE / NONE），消除 Python/kernel launch 开销。
-
-昇腾路径对这两层都有对应实现（AscendCompiler + ACLGraph），见 6.8。
-
-### 5.4 投机解码（`v1/spec_decode/`）
-
-V1 的 spec decode 是"调度器原生"的：draft token 直接计入 `num_tokens_with_spec`，一次 step 验证 k 个草稿 token（目标模型 forward k+1 个 token），再用 `RejectionSampler`（`v1/sample/rejection_sampler.py`）接受/拒绝。支持 EAGLE/MTP/ngram/dflash 等多种 proposer，接口在 `spec_decode/` 各 proposer 文件。vllm-ascend 全套适配了这条链路（`vllm_ascend/worker/v2/spec_decode/` 有原生实现）。
-
----
-
-## 6. vllm-ascend 是如何"生效"的
-
-前面五章把 vLLM 主干讲完了，其中埋了三处伏笔：**worker_cls 字符串解析**（3.5）、**attention 后端选择钩子**（3.6）、**平台层 current_platform**（3.7）。vllm-ascend 的全部魔法，就是沿着这三条（以及更多）官方预留的扩展点，把执行层换成昇腾 NPU 实现，而**调度、KV Cache 管理、前端 API 全部复用 vLLM 主干**。
-
-先给出结论全景图（后文逐条展开）：
-
-```mermaid
-flowchart TB
-    subgraph VLLMSIDE["vLLM 主干（不改一行代码）"]
-        FE["前端 AsyncLLM / LLM<br/>tokenize / detokenize"]
-        EC["EngineCore 进程<br/>调度循环 + KV Cache 管理"]
-        SCH["Scheduler"]
-        EXE["MultiprocExecutor"]
-        WW["WorkerWrapperBase<br/>worker_cls 动态加载"]
-        SEL["attention selector"]
-        CFG["VllmConfig<br/>check_and_update_config 钩子"]
-    end
-    subgraph ASCEND["vllm-ascend 插件"]
-        REG["entry_points 注册<br/>setup.py"]
-        NPU["NPUPlatform<br/>platform.py"]
-        NPW["NPUWorker<br/>worker/worker.py"]
-        NMR["NPUModelRunner<br/>worker/model_runner_v1.py"]
-        ATTN2["Ascend Attention 后端<br/>attention/*.py"]
-        OPS["torch.ops.vllm_ascend.*<br/>ops/ + csrc"]
-        ACLG["ACLGraphWrapper<br/>compilation/acl_graph.py"]
-        AC["AscendCompiler<br/>compilation/compiler_interface.py"]
-    end
-    REG -.->|"①发现"| VLLMSIDE
-    NPU -.->|"②配置改写"| CFG
-    NPU -.->|"③worker_cls=NPUWorker"| WW
-    NPU -.->|"④注意力后端映射"| SEL
-    WW --> NPW
-    NPW --> NMR
-    NMR --> ATTN2
-    NMR --> ACLG
-    CFG --> AC
-    NMR --> OPS
-    ATTN2 --> OPS
-    FE & EC & SCH & EXE -.->|"完全复用"| VLLMSIDE
-    style ASCEND fill:#fff3e0,stroke:#e65100
-    style VLLMSIDE fill:#e3f2fd,stroke:#0d47a1
-```
-
-### 6.1 vllm-ascend 与 vLLM 的关系：插件式共生
-
-vllm-ascend 是 vLLM 官方社区维护的**昇腾 NPU 硬件插件**（Out-Of-Tree 插件），版本号与 vLLM 严格对齐（如 vllm-ascend v0.9.1 对应 vLLM v0.9.1）。本文分析的 main 分支即 v0.26 开发版，依赖 torch 2.10 + torch-npu 2.10 + CANN 工具链（见 `vllm-ascend/pyproject.toml`）。
-
-用户侧体验极其简单：
-
-```bash
-pip install vllm==0.26.0
-pip install vllm-ascend   # 装完即生效，无需改任何启动命令
-vllm serve Qwen/Qwen3-32B --tensor-parallel-size 8
-```
-
-不需要传 `--device npu`，不需要改 API——安装即接入。这背后是 Python 标准的 **entry_points 发现机制**。
-
-### 6.2 第一步：entry_points 注册（安装期）
-
-`vllm-ascend/setup.py:518`：
-
-```python
-setup(
-    name="vllm-ascend",
-    entry_points={
-        "vllm.platform_plugins": [          # ← 平台插件组：决定 current_platform
-            "ascend = vllm_ascend:register",
-        ],
-        "vllm.general_plugins": [            # ← 通用插件组：随各进程启动加载
-            "ascend_kv_connector = vllm_ascend:register_connector",
-            "ascend_model_loader = vllm_ascend:register_model_loader",
-            "ascend_service_profiling = vllm_ascend:register_service_profiling",
-            "ascend_model = vllm_ascend:register_model",
-        ],
-        "ms_service_metric.providers": [     # ← 昇腾可观测性生态
-            "vllm-ascend = vllm_ascend.observability:get_metric_provider",
-        ],
-    },
-)
-```
-
-`pip install` 后，这些声明被写进该包的 dist-info 元数据。vLLM 侧对应的消费端是 `vllm/plugins/__init__.py` 的 `load_plugins_by_group()`（importlib.metadata.entry_points 扫描），vLLM 预定义了五个插件组：
-
-| 插件组（vllm/plugins/__init__.py） | 加载时机 | vllm-ascend 注册的入口 | 用途 |
-|---|---|---|---|
-| `vllm.platform_plugins` | 首次访问 current_platform | `register` → 返回 NPUPlatform 类名 | **接管整个平台层** |
-| `vllm.general_plugins` | 每个进程启动（EngineCore/Worker） | `register_connector` 等 4 个 | KV 迁移连接器、网络加载器、性能采集、模型注册 |
-| `vllm.io_processor_plugins` | 仅前端进程 | — | 输入/输出处理器扩展 |
-| `vllm.stat_logger_plugins` | 仅 serve 异步模式 | — | 自定义统计日志 |
-| `vllm.endpoint_plugins` | 仅 API Server 前端 | — | 额外 HTTP 路由 |
-
-而 `vllm_ascend/__init__.py:68` 的 `register()` 一行就完成了"亮明身份"：
-
-```python
-def register():
-    """Register the NPU platform."""
-    return "vllm_ascend.platform.NPUPlatform"
-```
-
-> 控制反转（IoC）：vLLM 不 import vllm-ascend，vllm-ascend 也不改 vLLM 源码。双方只约定"组名 + 返回类全名"这一契约。
-
-### 6.3 第二步：平台发现与激活（启动期）
-
-完整时序（含关键源码位置）：
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant U as 用户
-    participant CLI as vllm CLI<br/>entrypoints/cli/
-    participant VP as vllm.platforms<br/>__init__.py
-    participant PL as vllm.plugins<br/>__init__.py
-    participant VA as vllm_ascend<br/>__init__.py
-    participant CFG as VllmConfig<br/>config/vllm.py
-    participant NPU as NPUPlatform<br/>platform.py
-
-    U->>CLI: vllm serve ...
-    CLI->>CFG: 构造 VllmConfig（EngineArgs）
-    CFG->>VP: 首次访问 current_platform
-    VP->>VP: __getattr__ 懒加载<br/>resolve_current_platform_cls_qualname()
-    VP->>PL: load_plugins_by_group("vllm.platform_plugins")
-    PL->>PL: entry_points 扫描发现 ascend
-    PL->>VA: plugin.load() → register()
-    VA-->>PL: "vllm_ascend.platform.NPUPlatform"
-    PL-->>VP: {ascend: register}
-    VP->>VP: 遍历内置(cuda/rocm/tpu...)均返回 None<br/>OOT 仅 ascend 返回类名 → 激活
-    VP->>VA: resolve_obj_by_qualname() import 类
-    Note over VA: import torch_npu 等依赖<br/>（此处若非 NPU 环境会导入失败）
-    VP->>NPU: NPUPlatform() 实例化
-    VP-->>CFG: current_platform = NPUPlatform
-    CFG->>NPU: check_and_update_config(vllm_config)<br/>（配置期十步改写，见 6.4）
-    NPU-->>CFG: 改写后的 vllm_config
-```
-
-**两个防御性细节**（来自源码）：
-
-1. 若同一环境装了两个 OOT 平台插件且都"亮明身份"，vLLM 直接报错：`"Only one platform plugin can be activated"`（`platforms/__init__.py:230`）；
-2. `VLLM_PLUGINS` 环境变量可做白名单过滤（`plugins/__init__.py:40`），排查插件冲突时可用来禁用个别插件。
-
-### 6.4 第三步：check_and_update_config 十步改写（配置期）
-
-`NPUPlatform.check_and_update_config()`（`vllm_ascend/platform.py:410`）是 vllm-ascend 影响面最大的单个函数。它把一份"为 CUDA 准备的默认配置"改写成"适合昇腾的配置"：
-
-```mermaid
-flowchart TD
-    S["NPUPlatform.check_and_update_config(vllm_config)<br/>platform.py:410"]
-    S --> S1["① 配置昇腾日志（文件+console）"]
-    S --> S2["② device_type 一致性早退检查<br/>（非 npu 则跳过全部改写）"]
-    S --> S3["③ 量化方法自动探测<br/>maybe_auto_detect_quantization()"]
-    S --> S4["④ 兼容性修复 _fix_incompatible_config()<br/>（如关闭不支持的特性）"]
-    S --> S5["⑤ 初始化 ascend_config<br/>（additional_config 合并默认值）"]
-    S --> S6["⑥ 编译/图模式更新<br/>_update_compilation_modes()：<br/>ACLGraph FULL/PIECEWISE 映射"]
-    S --> S7["⑦ 编译后端设置<br/>compile_backend=AscendCompiler<br/>+ GraphFusionPassManager"]
-    S --> S8["⑧ ★ Worker 类替换 + 调度器替换<br/>_setup_worker_and_scheduler()（platform.py:1189）"]
-    S --> S9["⑨ SFA/DCP/KV/SP 一致性校验"]
-    S --> S10["⑩ 设置 PYTORCH_NPU_ALLOC_CONF<br/>（expandable_segments 内存优化）"]
-    S8 --> W1["worker_cls: auto →<br/>vllm_ascend.worker.worker.NPUWorker<br/>（310P 机器 → NPUWorker310；<br/>Xlite 场景 → XliteWorker）"]
-    S8 --> W2["custom_ops = ['all']<br/>（启用全量自定义算子替换）"]
-    S8 --> W3["scheduler_cls 可选替换：<br/>DyntraLBScheduler / BatchJobAwareScheduler /<br/>ProfilingChunkScheduler（vllm_ascend/core/）"]
-    style S8 fill:#fff3e0,stroke:#e65100
-    style W1 fill:#fff3e0,stroke:#e65100
-```
-
-其中第⑧步的源码（`platform.py:1189`）最能说明"插件如何接管执行层"：
-
-```python
-def _setup_worker_and_scheduler(vllm_config, ascend_config):
-    parallel_config = vllm_config.parallel_config
-    if parallel_config and parallel_config.worker_cls == "auto":
-        if is_310p():
-            parallel_config.worker_cls = "vllm_ascend._310p.worker_310p.NPUWorker310"
-        elif ascend_config.xlite_graph_config.enabled:
-            parallel_config.worker_cls = "vllm_ascend.xlite.xlite_worker.XliteWorker"
-        else:
-            parallel_config.worker_cls = "vllm_ascend.worker.worker.NPUWorker"
-    refresh_block_size(vllm_config)          # 昇腾块大小适配
-    if get_ascend_device_type() != AscendDeviceType._310P:
-        vllm_config.compilation_config.custom_ops = ["all"]  # 全量算子替换
-    # ……可选的调度器替换（dyntra 负载均衡 / batch-job-aware / profiling chunk）
-```
-
-> 对照 3.5 节：vLLM 的 CUDA 平台在同样位置写的是 `"vllm.v1.worker.gpu_worker.Worker"`（`platforms/cuda.py:312`）。**同一个钩子，两套实现**——这就是平台插件协议的优雅之处。
-
-### 6.5 第四步：Worker 进程内的替换链（运行期）
-
-配置改写完成后，`MultiprocExecutor` 为每张 NPU 卡 spawn 一个 Worker 子进程，进程入口是 `WorkerWrapperBase`，它按配置里的 worker_cls 字符串动态 import 并实例化 NPUWorker：
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant MP as MultiprocExecutor<br/>multiproc_executor.py
-    participant WW as WorkerWrapperBase<br/>worker_base.py
-    participant NPW as NPUWorker<br/>vllm_ascend/worker/worker.py
-    participant D as 分布式层<br/>vllm_ascend/distributed/
-    participant NMR as NPUModelRunner<br/>model_runner_v1.py
-    participant EC as EngineCore
-
-    MP->>WW: spawn 子进程(每卡一个)
-    MP->>WW: init_worker(all_kwargs)
-    WW->>WW: resolve_obj_by_qualname(worker_cls)
-    WW->>NPW: NPUWorker(vllm_config, local_rank, rank, ...)
-    NPW->>NPW: ① adapt_patch()（打 monkey patch，见6.9）
-    NPW->>NPW: ② 注册自定义算子 ops.register_dummy_fusion_op()<br/>register_ascend_customop()
-    NPW->>NPW: ③ init_ascend_config(vllm_config)
-    NPW->>D: ④ init_ascend_model_parallel()<br/>（HCCL init_process_group，CPU 亲和绑定）
-    NPW->>NMR: ⑤ 创建 NPUModelRunner
-    NMR->>NMR: attn_backend = get_attn_backend(...)<br/>→ AscendAttentionBackend 等
-    NMR->>NMR: input_batch = NPUInputBatch(npu_input_batch.py)
-    NPW->>NPW: ⑥ load_model()（权重加载/量化）
-    EC->>MP: get_kv_cache_spec / determine_available_memory
-    MP->>NPW: collective_rpc 转发
-    NPW->>NMR: profile_run() → 剩余 HBM
-    EC->>MP: initialize_from_config(kv_cache_config)
-    NPW->>NMR: initialize_kv_cache()（昇腾 KV 布局）
-    NPW->>NPW: ⑦ compile_or_warm_up_model()<br/>（ACLGraph 捕获 / AscendCompiler 编译）
-    loop 引擎 step
-        EC->>MP: execute_model(scheduler_output)
-        MP->>NPW: 广播
-        NPW->>NMR: execute_model → prepare_inputs<br/>→ torch_npu forward → sample
-        NMR-->>EC: ModelRunnerOutput
-    end
-```
-
-**NPUWorker 与 NPUModelRunner 的继承关系**（注意：ModelRunner 直接继承 vLLM 的 GPUModelRunner，复用其 90% 骨架，只重写 NPU 差异部分）：
-
-```mermaid
-classDiagram
-    class WorkerBase {
-        <<vllm/v1/worker/worker_base.py>>
-    }
-    class GPUWorker {
-        <<vllm/v1/worker/gpu_worker.py>>
-    }
-    class NPUWorker {
-        <<vllm_ascend/worker/worker.py (993行)>>
-        +sleep/wake_up (CaMemAllocator)
-        +init_weight_transfer_engine (RL权重热更)
-        +profile (TorchNPUProfilerWrapper)
-        +determine_available_memory
-    }
-    class GPUModelRunner {
-        <<vllm/v1/worker/gpu_model_runner.py>>
-    }
-    class NPUModelRunner {
-        <<vllm_ascend/worker/model_runner_v1.py (4600行)>>
-        +_build_attention_metadata (昇腾版)
-        +execute_model (ACLGraph/编译路径)
-        +initialize_kv_cache (昇腾布局)
-        +_use_aclgraph()
-    }
-    class NPUInputBatch {
-        <<vllm_ascend/worker/npu_input_batch.py>>
-    }
-    WorkerBase <|-- GPUWorker
-    WorkerBase <|-- NPUWorker
-    GPUModelRunner <|-- NPUModelRunner
-    NPUWorker *-- NPUModelRunner
-    NPUModelRunner *-- NPUInputBatch
-    note for NPUWorker "vllm-ascend v0.26 起 Worker 不再继承 GPUWorker<br/>而是直接继承 WorkerBase，避免 CUDA 语义残留；<br/>另有实验性 v2 Runner（worker/v2/，见 issue #5208）"
-```
-
----
-
-### 6.6 第五步：Attention 后端接管
-
-模型每个 Attention 层在初始化时都会调 `get_attn_backend()`（`vllm/v1/attention/selector.py:101`），它最终落到 `current_platform.get_attn_backend_cls()`。NPUPlatform 的实现（`platform.py:217`）是一个按"模型注意力形态"查表的映射：
-
-```python
-# vllm_ascend/platform.py:217（节选）
-@classmethod
-def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads=None):
-    if _validate_fa3_backend(key, attn_selector_config):
-        return "vllm_ascend.attention.fa3_v1.AscendFABackend"     # FlashAttention3 形态
-    backend_map = {
-        (True,  False, False): "vllm_ascend.attention.mla_v1.AscendMLABackend",       # MLA（DeepSeek系）
-        (False, False, False): "vllm_ascend.attention.attention_v1.AscendAttentionBackend",  # GQA/MHA
-        (True,  True,  False): "vllm_ascend.attention.sfa_v1.AscendSFABackend",       # 稀疏注意力
-        (True,  False, True):  "vllm_ascend.attention.dsa_v1.AscendDSABackend",       # DSA（DeepSeek V4）
-    }
-    if is_310p():  # Atlas 300I Duo 走专用实现
-        return "vllm_ascend._310p.attention.attention_v1.AscendAttentionBackend310"
-    return backend_map[(use_mla, use_sparse, use_compress)]
-```
-
-各后端均实现 vLLM 的 `AttentionBackend` 三件套接口，并用 vLLM 的注册器声明自定义后端（`attention_v1.py:77`）：
-
-```python
-@register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
-class AscendAttentionBackend(AttentionBackend):
-    @staticmethod
-    def get_impl_cls(): ...        # AscendAttentionBackendImpl：真正的 forward
-    @staticmethod
-    def get_builder_cls(): ...     # AscendAttentionMetadataBuilder：构建元数据
-    @staticmethod
-    def get_kv_cache_shape(): ...  # 昇腾 KV 布局（如 NZ 格式）
-```
-
-```mermaid
-flowchart LR
-    subgraph Model["模型 forward（vLLM 侧统一代码）"]
-        L["Attention 层<br/>model_executor/layers/attention/"]
-    end
-    L -->|"初始化时"| SEL["get_attn_backend()<br/>v1/attention/selector.py"]
-    SEL --> CP["current_platform.get_attn_backend_cls()"]
-    CP -->|"CUDA"| FAB["FlashAttentionBackend" ]
-    CP -->|"NPU"| MAP["NPUPlatform.backend_map<br/>platform.py:224"]
-    MAP --> B1["AscendAttentionBackend<br/>GQA/MHA + 分块 prefill"]
-    MAP --> B2["AscendMLABackend<br/>DeepSeek MLA（吸收 kv_lora）"]
-    MAP --> B3["AscendSFABackend<br/>稀疏注意力（MoSE/NSA）"]
-    MAP --> B4["AscendDSABackend<br/>DeepSeek V4 DSA"]
-    MAP --> B5["AscendFABackend<br/>FA3 形态（A5/950）"]
-    B1 & B2 & B3 & B4 & B5 --> IMPL["forward_extend / forward_decode<br/>→ torch_npu.npu_fusion_attention 等 ACL 算子"]
-```
-
-> 注意 `NPUPlatform.opaque_attention_op() = True`（platform.py:127）：attention 对编译器是"黑盒" op，保证 torch.compile/ACLGraph 不会试图展开注意力内部。同时 `support_hybrid_kv_cache()`、`use_custom_op_collectives()` 等能力位声明让上层选择适配路径。
-
-### 6.7 第六步：算子生态全面接管
-
-vLLM 的模型层算子（RMSNorm/RoPE/ MoE/量化...）都走 `torch.ops.vllm::*` 自定义算子系统。vLLM 预留了"同名替换"机制：每层 Op 声明名与实现分离，平台可通过 `Platform.import_kernels()` 导入自己的算子库覆盖同名 op。vllm-ascend 的对应实现：
-
-| 算子类别 | vllm-ascend 位置 | 说明 |
-|---|---|---|
-| 自定义算子注册 | `vllm_ascend/ops/__init__.py` + `csrc/ascend/` | C++/Ascend C 实现，注册为 `torch.ops.vllm_ascend::*`；配置期 `custom_ops=["all"]` 后由 `register_ascend_customop()` 全量映射 |
-| Flash Attention | `torch_npu.npu_fusion_attention` | ACL 原生算子（attention_v1.py 内直接调用） |
-| 量化 | `vllm_ascend/quantization/`（w8a8/w4a4/fp8/mxfp4...） | 实现 vLLM QuantizationMethod 接口 |
-| MoE | `vllm_ascend/ops/fused_moe/` | MC2 通信融合、fused MoE kernel |
-| 集合通信 | `vllm_ascend/distributed/device_communicators/npu_communicator.py` | HCCL（由 `get_device_communicator_cls()` 返回） |
-| LoRA | `vllm_ascend/lora/punica_npu.py` | `get_punica_wrapper()` 返回 PunicaWrapperNPU |
-| KV Cache 布局 | `vllm_ascend/core/kv_cache_interface.py` | `register_custom_kv_cache_specs()`：注册昇腾专用 KVCacheSpec（如 NZ 排布、GQA 分离 K/V 池） |
-| 采样 | `vllm_ascend/worker/v2/sample/` | NPU 采样算子（v2）/ logits processor 适配 |
-
-### 6.8 第七步：图编译——ACLGraph 与 AscendCompiler
-
-v0.26 时代 vllm-ascend 的编译体系已完成一次重要演进：**早期版本（v0.7~v0.9 时代）依赖 torchair（图编译引擎）做 npu_backend 图模式，现已移除**，改为两条更贴近 vLLM 主干的路径：
-
-```mermaid
-flowchart TB
-    subgraph Compile["torch.compile 路径（vllm_ascend/compilation/）"]
-        CB["NPUPlatform.get_compile_backend()<br/>→ AscendCompiler (compiler_interface.py)"]
-        PM["GraphFusionPassManager<br/>(graph_fusion_pass_manager.py)<br/>Inductor 自定义 pass：算子融合"]
-        CB --> PM
-        PM --> PC["piecewise 编译：<br/>非 attention 子图编译优化"]
-    end
-    subgraph Graph["图捕获路径（静态图）"]
-        AG["ACLGraphWrapper<br/>(acl_graph.py)<br/>替代 CUDA Graph"]
-        BG["BreakableACLGraph<br/>(breakable_aclgraph.py)<br/>可选可中断图"]
-        SS["静态图支持 support_static_graph_mode()=True"]
-        AG & BG
-    end
-    MODE["cudagraph_mode 配置映射（_update_compilation_modes）：<br/>FULL→整图 ACLGraph / PIECEWISE→分段图 / NONE→eager"]
-    MODE --> Compile
-    MODE --> Graph
-    NMR2["NPUModelRunner.execute_model()<br/>model_runner_v1.py:4876"]
-    NMR2 -->|"use_aclgraph 判定（_use_aclgraph()）"| Graph
-    NMR2 -->|"其余子图"| Compile
-    style Graph fill:#fff3e0,stroke:#e65100
-    style Compile fill:#fff3e0,stroke:#e65100
-```
-
-ACLGraph 捕获与重放的典型流程（与 CUDA Graph 同构，但用 `torch.npu.graph` API）：
-
-```mermaid
-flowchart TD
-    A["compile_or_warm_up_model()（Worker 启动尾期）"] --> B["按 capture_sizes（1,2,4,...max_num_reqs）<br/>逐个 batch size 捕获"]
-    B --> C["dummy 输入 → torch.npu.graph 捕获<br/>（图内固定输入/输出 buffer 地址）"]
-    C --> D["记录每层的 graph params workspace<br/>（get_graph_params / update_graph_params_workspaces）"]
-    D --> E["运行时：按实际 batch 选最近捕获尺寸<br/>更新 input buffer → graph replay"]
-    E --> F["从固定 output buffer 读 sampled_token_ids"]
-```
-
-> 源码细节：NPUPlatform 还通过 `get_pass_manager_cls()` 向 Inductor 注入 `GraphFusionPassManager`，用 pattern matcher 做昇腾特定算子融合（platform.py:165）；`simple_compile_backend="eager"` 保证默认不误触 Inductor CUDA 后端。
-
-### 6.9 第八步：运行时补丁（Monkey Patch）与 general_plugins
-
-并非所有差异都能通过官方钩子解决（vLLM 迭代快，部分内部行为对 OOT 插件不透明）。vllm-ascend 的兜底手段是"补丁模块"：
-
-```python
-# vllm_ascend/utils.py:529
-def adapt_patch(is_global_patch: bool = False):
-    if is_global_patch:
-        from vllm_ascend.patch import platform   # 引擎/调度层补丁（所有进程）
-    else:
-        from vllm_ascend.patch import worker     # worker 层补丁（worker 进程）
-```
-
-补丁目录（`vllm_ascend/patch/`）按进程角色分两组：
-
-- **platform 组**（`patch/platform/`）：修补调度/引擎相关——如 `patch_kv_cache_coordinator.py`（昇腾 KV 布局协调）、`patch_multiproc_executor.py`（进程启动参数）、`patch_distributed.py`、`patch_fused_moe.py`、`patch_torch_accelerator.py` 等 20+ 个；
-- **worker 组**（`patch/worker/`）：修补模型执行层——如 `patch_cudagraph.py`、`patch_bind_kv_cache.py`、各模型专用 patch（`patch_qwen3vl.py` / `patch_deepseek_v2.py`...）。
-
-加上 `vllm.general_plugins` 组里注册的四个入口（在 EngineCore/Worker 进程启动时被 `load_general_plugins()` 调用，见 `v1/engine/core.py:110`）：
-
-| 入口函数 | 位置 | 作用 |
-|---|---|---|
-| `register_connector()` | `__init__.py:74` | 注册 P/D 分离 KV 迁移连接器与权重传输引擎 |
-| `register_model_loader()` | `__init__.py:84` | 注册网络流式/RFork 权重加载器 |
-| `register_service_profiling()` | `__init__.py:94` | 生成昇腾服务化 profiling 配置 |
-| `register_model()` | `__init__.py:102` | 注册 vllm-ascend 的模型实现/补丁 |
-
-### 6.10 vllm-ascend 目录地图
-
-```
-vllm-ascend/
-├── setup.py                        # ★ entry_points 注册（518 行）
-├── vllm_ascend/
-│   ├── __init__.py                 # ★ register() 等插件入口 + triton 兼容 stub
-│   ├── platform.py                 # ★ NPUPlatform（1529 行）：平台钩子总入口
-│   ├── ascend_config.py            # 昇腾专用配置（additional_config 解析）
-│   ├── worker/
-│   │   ├── worker.py               # ★ NPUWorker（993 行）
-│   │   ├── model_runner_v1.py      # ★ NPUModelRunner（4600 行，主力）
-│   │   ├── npu_input_batch.py      # NPUInputBatch
-│   │   ├── block_table.py / dcp_utils.py / encoder_acl_graph.py
-│   │   └── v2/                     # 实验性 Model Runner V2（issue #5208）
-│   ├── attention/                  # ★ 注意力后端家族
-│   │   ├── attention_v1.py         #   GQA/MHA（PagedAttention 语义）
-│   │   ├── mla_v1.py               #   MLA（DeepSeek）
-│   │   ├── sfa_v1.py / dsa_v1.py / fa3_v1.py
-│   │   └── indexer.py              #   稀疏索引器
-│   ├── compilation/                # ★ 图编译
-│   │   ├── acl_graph.py            #   ACLGraphWrapper（静态图捕获/重放）
-│   │   ├── breakable_aclgraph.py   #   可中断图
-│   │   ├── compiler_interface.py   #   AscendCompiler（torch.compile backend）
-│   │   └── graph_fusion_pass_manager.py  # Inductor 融合 pass
-│   ├── ops/                        # ★ 自定义算子（+ csrc/ C++ 源）
-│   ├── quantization/               # 量化方法（w8a8/w4a4/mxfp4/fp8...）
-│   ├── distributed/                # HCCL 通信、P/D 分离 KV 传输
-│   ├── core/                       # 增强调度器（dyntra LB / batch-job-aware /<br/>#   profiling chunk / recompute / short-request-first）
-│   │   └── kv_cache_interface.py   # 昇腾 KVCacheSpec 注册
-│   ├── patch/                      # ★ monkey patch（platform 组 + worker 组）
-│   ├── device_allocator/           # CaMemAllocator（sleep 模式显存释放）
-│   ├── models/                     # 昇腾模型实现/注册
-│   ├── spec_decode/                # 投机解码适配（EAGLE/MTP...）
-│   ├── _310p/                      # Atlas 300I Duo 专用分支
-│   └── xlite/                      # openEuler Xlite 虚拟化
-```
-
----
-
-## 7. 端到端全景：一次 NPU 上的推理迭代
-
-把第 4 章的"通用时序"与第 6 章的"替换链"叠加，就是用户在昇腾集群上 `vllm serve` 的真实运行图景：
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as 客户端
-    participant API as API Server进程<br/>(vLLM主干)
-    participant FE as AsyncLLM + InputProcessor<br/>(vLLM主干, 前端)
-    participant EC as EngineCore进程<br/>(vLLM主干)
-    participant SC as Scheduler<br/>(vLLM主干 / 或vllm-ascend增强调度器)
-    participant MP as MultiprocExecutor<br/>(vLLM主干)
-    participant W0 as NPUWorker rank0<br/>(vllm-ascend)
-    participant W1 as NPUWorker rank1<br/>(vllm-ascend)
-
-    Note over EC,W1: ── 启动期（一次性） ──
-    EC->>MP: Executor.get_class()
-    MP->>W0: spawn NPUWorker(worker_cls字符串解析)
-    MP->>W1: spawn NPUWorker
-    W0->>W0: adapt_patch + 算子注册 + HCCL初始化
-    W0->>W0: load_model（权重/量化） + profile_run
-    EC->>W0: KV Cache 规划 + initialize_from_config
-    W0->>W0: initialize_kv_cache（昇腾布局）<br/>+ ACLGraph 捕获
-
-    Note over C,W1: ── 服务期（每个 step 循环） ──
-    C->>API: HTTP 请求
-    API->>FE: generate() → tokenize
-    FE->>EC: ZMQ: EngineCoreRequest
-    EC->>SC: add_request
-    SC->>SC: schedule()（统一token预算）
-    EC->>MP: execute_model(SchedulerOutput)
-    MP->>W0: 广播
-    MP->>W1: 广播
-    par rank0
-        W0->>W0: NPUModelRunner：prepare_inputs<br/>→ ACLGraph replay / torch_npu forward<br/>→ AscendAttention（npu_fusion_attention）<br/>→ Sampler → ModelRunnerOutput
-    and rank1
-        W1->>W1: 同样流程（张量并行切片）
-    end
-    W0->>W1: HCCL all-reduce / all-gather（集合通信）
-    W1-->>W0: 结果汇聚
-    W0-->>EC: ModelRunnerOutput（首 rank 汇聚）
-    EC->>SC: update_from_output()
-    EC-->>FE: ZMQ: EngineCoreOutputs
-    FE->>FE: 增量 detokenize + stop 判断
-    FE-->>API: RequestOutput
-    API-->>C: SSE 流式返回
-```
-
-### 7.1 vllm-ascend 生效点汇总表（速查）
-
-| # | 生效点 | vLLM 侧机制（文件） | vllm-ascend 侧实现（文件） |
-|---|---|---|---|
-| 1 | 平台激活 | entry_points `vllm.platform_plugins`（`plugins/__init__.py`）| `setup.py` + `__init__.py:register()` |
-| 2 | 平台单例 | `current_platform` 懒加载（`platforms/__init__.py:261`）| `NPUPlatform`（`platform.py:77`）|
-| 3 | 配置改写 | `VllmConfig` 构造时调 `check_and_update_config`（`config/vllm.py`）| 十步改写（`platform.py:410`）|
-| 4 | Worker 选择 | `worker_cls` 字符串（`config/parallel.py:257` + `worker_base.py:250`）| `NPUWorker` / `NPUWorker310` / `XliteWorker` |
-| 5 | 调度器替换 | `scheduler_cls` 字符串（`config/scheduler.py`）| `vllm_ascend/core/*_scheduler.py` 可选注入 |
-| 6 | 注意力后端 | `get_attn_backend()`（`v1/attention/selector.py:101`）| Ascend 五大后端（`attention/*.py`）|
-| 7 | 自定义算子 | `custom_ops` + `Platform.import_kernels()` | `ops/` + `csrc/`，`register_ascend_customop()` |
-| 8 | 集合通信 | `get_device_communicator_cls()` | `NPUCommunicator`（HCCL）|
-| 9 | 图编译 | `get_compile_backend()` / `get_static_graph_wrapper_cls()` | `AscendCompiler` / `ACLGraphWrapper` |
-| 10 | 编译融合 pass | `get_pass_manager_cls()` | `GraphFusionPassManager` |
-| 11 | KV 布局 | KVCacheSpec 体系（`v1/kv_cache_interface.py`）| `register_ascend_kv_cache_specs()`（`core/kv_cache_interface.py`）|
-| 12 | 量化 | QuantizationMethod 注册 | `quantization/`（w8a8/w4a4/mxfp4...）|
-| 13 | LoRA | `get_punica_wrapper()` | `lora/punica_npu.py` |
-| 14 | 显存 sleep | `is_cumem_allocator_available()` | `device_allocator/camem.py` |
-| 15 | KV 迁移/权重热更 | `vllm.general_plugins`（connector）| `register_connector()`（P/D 分离、RL）|
-| 16 | 兼容性兕底 | — | `patch/` monkey patch（`utils.py:adapt_patch`）|
-
-### 7.2 验证插件是否生效（实操）
-
-```bash
-# 1. 确认安装
-pip show vllm-ascend
-
-# 2. 启动日志里找这一行（platforms/__init__.py:237 输出）
-#    "Platform plugin ascend is activated"
-vllm serve Qwen/Qwen3-8B --tensor-parallel-size 8 2>&1 | grep -i "platform"
-
-# 3. 排查插件冲突时，可用白名单环境变量
-export VLLM_PLUGINS=ascend   # 只加载 ascend 平台插件
-```
-
----
-
-## 8. 学习路线与参考资料
-
-### 8.1 源码阅读顺序建议
-
-```mermaid
-flowchart TD
-    A["第1周：跑起来 + 入口"] --> A1["LLM.generate → v1/engine/llm_engine.py<br/>→ input_processor / output_processor"]
-    A1 --> B["第2周：引擎主循环"]
-    B --> B1["v1/engine/core.py：EngineCore.step()<br/>core_client.py：三种Client"]
-    B1 --> C["第3周：调度与KV"]
-    C --> C1["v1/core/sched/scheduler.py：schedule()<br/>kv_cache_manager.py / block_pool.py"]
-    C1 --> D["第4周：执行层"]
-    D --> D1["v1/worker/gpu_worker.py<br/>gpu_model_runner.py：execute_model全链"]
-    D1 --> E["第5周：平台抽象"]
-    E --> E1["platforms/interface.py：全部钩子<br/>platforms/__init__.py：插件发现"]
-    E1 --> F["第6周：vllm-ascend"]
-    F --> F1["platform.py → worker/worker.py<br/>→ model_runner_v1.py → attention/attention_v1.py<br/>→ compilation/acl_graph.py"]
-```
-
-调试技巧：
-- `VLLM_LOGGING_LEVEL=DEBUG` 看平台发现细节；
-- `VLLM_TRACE_FUNCTIONS=1` 打开函数调用追踪；
-- 断点首选：`EngineCore.step()`（`v1/engine/core.py:576`）与 `GPUModelRunner.execute_model()`——所有请求都会经过这两处；
-- 看一个请求怎么被调度：在 `Scheduler.schedule()` 入口打日志，观察 `num_computed_tokens` 逐步逼近 `num_tokens_with_spec`。
-
-### 8.2 官方资料
-
-- vLLM 官方设计文档（必读，v1 架构的权威叙述）：
-  - <https://blog.vllm.ai/2025/01/29/v1-alpha-announcement.html>（V1 Alpha 发布公告：为什么重写）
-  - <https://docs.vllm.ai/en/latest/design/arch_overview.html>（v1 architecture overview，含进程模型图）
-  - <https://docs.vllm.ai/en/latest/design/v1/additional_features.html>（spec decode / structured output 等）
-- vllm-ascend 官方文档：<https://vllm-ascend.readthedocs.io/>（安装、支持矩阵、FAQ）
-- vllm-ascend 仓库：<https://github.com/vllm-project/vllm-ascend>
-
-### 8.3 优秀的社区解读（中文，推荐按序阅读）
-
-1. 知乎专栏《vllm v1 源码精读》系列——逐行级解读：
-   - （一）为什么要重写 & `LLM()` 背后发生了什么：<https://zhuanlan.zhihu.com/p/2057789729739891768>
-   - （二）generate() 计算流（EngineCore.step / Executor.execute_model 源码级分析）
-2. CSDN《vLLM v1 系统级架构分析（总）》——六层分层 + 各子模块逐个剖析：<https://blog.csdn.net/zhonglinzhang/article/details/160330100>
-3. 博客园《vllm 代码分析》——含多机多 DP 启动过程与 EngineCore 线程模型：<https://www.cnblogs.com/gaoruimin/p/19512298>
-4. CSDN《vLLM-Ascend 推理部署与性能调优深度实战指南》——从 entry_points 机制讲透插件生效：<https://blog.csdn.net/m0_63947499/article/details/156239515>
-5. CSDN《vLLM-Ascend 入门实战：昇腾 NPU 上的大模型推理部署全攻略》——仓结构与部署全流程：<https://blog.csdn.net/qq_57761637/article/details/156240728>
-6. CSDN《vLLM v1 Engine 架构深度拆解》——从 v0 瓶颈到 v1 调度器设计：<http://www.chenxutan.com/d/5997.html>
-
-> 以上社区文章的源码基线多为 v0.8~v0.19，与本文的 v0.26 存在细节差异（例如 v0.26 中 `platforms/plugin.py` 已重构为 `platforms/__init__.py` + `plugins/__init__.py` 双模块、vllm-ascend 已移除 torchair 工作流），但其叙事脉络与本文互为印证。
-
-### 8.4 本文与源码的对照实验建议
-
-```bash
-# 在工作区中验证本文结论：
-# 1. 平台发现链
- grep -rn "PLATFORM_PLUGINS_GROUP" vllm/vllm/plugins/__init__.py vllm/vllm/platforms/__init__.py
-
-# 2. worker_cls 替换
- grep -n "worker_cls" vllm-ascend/vllm_ascend/platform.py
-
-# 3. attention 后端映射
- grep -n "backend_map" vllm-ascend/vllm_ascend/platform.py
-
-# 4. 引擎主循环
- sed -n '576,606p' vllm/vllm/v1/engine/core.py   # EngineCore.step()
-```
-
----
-
-## 附录：术语速查
-
-| 术语 | 含义 |
-|---|---|
-| TTFT / ITL | Time To First Token / Inter-Token Latency（首 token 延迟/逐 token 间隔）|
-| PagedAttention / Block | KV Cache 分页管理；块是分配的最小单位（block_size 个 token）|
-| Prefix Caching | 相同前缀复用 KV 块，免重复 prefill |
-| Chunked Prefill | 长 prompt 切片多步计算，与 decode 混批 |
-| EngineCore | V1 引擎核心（调度+执行循环）所在进程/类 |
-| ZMQ | 前端与 EngineCore 的进程间消息库（msgpack 序列化）|
-| OOT 插件 | Out-Of-Tree 插件，如 vllm-ascend（不随 vLLM 主干发布）|
-| entry_points | Python 包元数据的插件发现机制，vLLM 插件协议的基石 |
-| current_platform | 平台层单例，全部设备相关差异的统一出口 |
-| ACL / CANN / HCCL | 昇腾计算语言/异构计算架构/集合通信库（对应 CUDA/cuBLAS/NCCL）|
-| ACLGraph | 昇腾静态图捕获重放机制（对应 CUDA Graph）|
-| torch_npu | PyTorch 昇腾适配层（对应设备后端）|
-| P/D 分离 | Prefill/Decode 分离部署（vllm-ascend 支持的 KV 迁移场景）|
-
----
-
-*文档生成于 2026-08-26，基于 vLLM v0.26.0 与 vllm-ascend main（v0.26 开发版）源码实测解析。*
+#!/bin/bash
+# run_batch_invariant_tests.sh
+# 参数化运行 batch invariance 测试，支持 Model、TP、温度、max_tokens、max_prompt_num、
+# enable_prefix_caching 的全组合 + Custom Op 模式（针对 Qwen3-1.7B 测试 False/True）
+# max_num_batched_tokens 动态计算为 MAX_PROMPT_NUMS * 1024
+# 结果输出到带时间戳的目录，包含详细日志及 CSV/Markdown 汇总表格
+#
+# 特性：
+#   - 每个组合最多运行3次
+#   - 若三次全部 PASS → 最终状态 PASS
+#   - 若某次 FAIL/SKIP → 立即停止，最终状态为 FAIL/SKIP
+#   - 若某次 ERROR → 杀进程、等待30分钟，继续重试（最多3次）
+#   - 每次运行后（除 ERROR 重试前）等待1分钟释放资源
+
+export VLLM_BATCH_INVARIANT=1
+export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+set -euo pipefail
+
+# ---------- 参数定义（可通过环境变量覆盖）----------
+
+export VLLM_ASCEND_USE_TRITON_DSA_INDEXER=1
+export VLLM_ASCEND_USE_TRITON_DSA_ATTENTION=1
+
+MODEL_LIST=${VLLM_TEST_MODEL_LIST:-"/mnt/weight/Qwen3.5-35B-A3B/"} # /home/data/Qwen3-1.7B,/home/data/Qwen3-30B-A3B
+TP_SIZES=${VLLM_TEST_TP_SIZES:-"4"}
+TEMPERATURES=${VLLM_TEST_TEMPERATURES:-"0.0"}
+MAX_TOKENS_LIST=${VLLM_TEST_MAX_TOKENS:-"16"} # ,10240,20480
+MAX_PROMPT_NUMS=${VLLM_TEST_MAX_PROMPT_NUMS:-"2"}
+ENABLE_PREFIX_CACHING_LIST=${VLLM_TEST_ENABLE_PREFIX_CACHING_LIST:-"False"}
+PROMPT_LENGTHS=${VLLM_TEST_PROMPT_LENGTHS:-"4096"} # ,1024,2048
+
+# 重试等待时间（秒）- 当发生 ERROR 时等待后重试
+RETRY_WAIT_TIME=${VLLM_TEST_RETRY_WAIT_TIME:-15}  # 默认30分钟（调试时改为10秒）
+# 每次运行后的等待时间（秒）- 用于释放资源
+POST_RUN_WAIT_TIME=${VLLM_TEST_POST_RUN_WAIT_TIME:-5}  # 默认1分钟（调试时改为5秒）
+
+# 最大尝试次数
+MAX_ATTEMPTS=2
+
+# 转换为数组
+IFS=',' read -ra model_array <<< "$MODEL_LIST"
+IFS=',' read -ra tp_array <<< "$TP_SIZES"
+IFS=',' read -ra temp_array <<< "$TEMPERATURES"
+IFS=',' read -ra token_array <<< "$MAX_TOKENS_LIST"
+IFS=',' read -ra prompt_array <<< "$MAX_PROMPT_NUMS"
+IFS=',' read -ra prefix_cache_array <<< "$ENABLE_PREFIX_CACHING_LIST"
+IFS=',' read -ra prompt_len_array <<< "$PROMPT_LENGTHS"
+
+# ---------- 创建输出目录 ----------
+timestamp=$(date +"%Y%m%d_%H%M%S")
+output_dir="batch_invariant_results_${timestamp}"
+mkdir -p "$output_dir"
+
+summary_csv="$output_dir/summary.csv"
+# CSV 表头：新增详细的失败统计列
+echo "Model,TP,Temperature,MaxTokens,MaxPrompts,PromptLength,MaxNumBatchedTokens,EnablePrefixCaching,CustomOpEnabled,Status,TotalFailures,StepMismatch,TokenMismatch,LogprobMismatch,FirstFailureReason,LogFiles" > "$summary_csv"
+
+total_combos=$(( ${#model_array[@]} * ${#tp_array[@]} * ${#temp_array[@]} * ${#token_array[@]} * ${#prompt_array[@]} * ${#prefix_cache_array[@]} * ${#prompt_len_array[@]} ))
+total_combos=$(( total_combos / 6 * (4 * 2 + 3) ))
+current=0
+
+echo "========================================"
+echo "Total combos: $total_combos"
+echo "Output dir: $output_dir"
+echo "Max attempts per combo: $MAX_ATTEMPTS"
+echo "Retry wait time (ERROR recovery): $RETRY_WAIT_TIME seconds"
+echo "Post-run wait time: $POST_RUN_WAIT_TIME seconds"
+echo "Triton DSA Indexer: ${VLLM_ASCEND_USE_TRITON_DSA_INDEXER}"
+echo "Triton DSA Attention: ${VLLM_ASCEND_USE_TRITON_DSA_ATTENTION}"
+echo "========================================"
+
+# ---------- 函数：计算 max_num_batched_tokens ----------
+calculate_batched_tokens() {
+    local max_prompts=$1
+    echo $((max_prompts * 4096))
+}
+
+# ---------- 函数：解析失败统计文件 ----------
+parse_failure_stats() {
+    local stats_file="batch_invariant_failure_stats.txt"
+    local total_failures=0
+    local step_mismatch=0
+    local token_mismatch=0
+    local logprob_mismatch=0
+    local first_reason=""
+    
+    if [ -f "$stats_file" ]; then
+        while IFS='=' read -r key value; do
+            case "$key" in
+                "TOTAL_FAILURES") total_failures=$value ;;
+                "STEP_MISMATCH") step_mismatch=$value ;;
+                "TOKEN_MISMATCH") token_mismatch=$value ;;
+                "LOGPROB_MISMATCH") logprob_mismatch=$value ;;
+                "FIRST_FAILURE_REASON") first_reason=$value ;;
+            esac
+        done < "$stats_file"
+        rm -f "$stats_file"
+    fi
+    
+    echo "$total_failures,$step_mismatch,$token_mismatch,$logprob_mismatch,$first_reason"
+}
+
+# ---------- 遍历所有模型 ----------
+for model_path in "${model_array[@]}"; do
+    model_short=$(basename "$model_path")
+    export VLLM_TEST_MODEL="$model_path"
+
+    # ========== 根据模型决定 Custom Op 测试模式 ==========
+    # Qwen3-1.7B：测试两种模式（False 和 True）
+    # 其他模型：只测试 True
+    if [[ "$model_short" == "Qwen3-1.7B" ]]; then
+        # tp_array=("1" "${tp_array[@]}")
+        echo "  [Model-Specific] $model_short: Adding TP=1 to test list (original TP list: ${tp_array[*]})"
+        custom_op_modes=("False")  # "False"
+    else
+        custom_op_modes=("False")
+    fi
+
+    # ---------- 遍历 Custom Op 模式 ----------
+    for custom_op_value in "${custom_op_modes[@]}"; do
+        # 设置环境变量
+        export VLLM_TEST_CUSTOM_OP_ENABLED="$custom_op_value"
+        if [[ "$custom_op_value" == "True" ]]; then
+            custom_op_status="Enabled"
+        else
+            custom_op_status="Disabled"
+        fi
+        echo "  [Model-Specific] $model_short: Setting VLLM_TEST_CUSTOM_OP_ENABLED=$custom_op_value ($custom_op_status)"
+
+        for pc in "${prefix_cache_array[@]}"; do
+            for tp in "${tp_array[@]}"; do
+                for temp in "${temp_array[@]}"; do
+                    for mt in "${token_array[@]}"; do
+                        for mp in "${prompt_array[@]}"; do
+                            for plen in "${prompt_len_array[@]}"; do
+                                current=$((current + 1))
+
+                                # 动态计算 max_num_batched_tokens
+                                bt=$(calculate_batched_tokens "$mp")
+
+                                # 组合标识：包含 CustomOp 状态
+                                combo_id="Model${model_short}_TP${tp}_T${temp}_MT${mt}_MP${mp}_PLEN${plen}_B${bt}_C${pc}_CustomOp${custom_op_value}"
+                                echo ""
+                                echo "[$current/$total_combos] Running combo: $combo_id"
+                                echo "  Model: $model_short"
+                                echo "  Custom Op: $custom_op_status ($custom_op_value)"
+                                echo "  MaxNumBatchedTokens: $bt (auto-calculated: ${mp} * 1024)"
+
+                                # 设置其他环境变量
+                                export VLLM_TEST_TP_SIZE="$tp"
+                                export VLLM_TEST_TEMPERATURE="$temp"
+                                export VLLM_TEST_MAX_TOKENS="$mt"
+                                export VLLM_TEST_MAX_PROMPT_NUM="$mp"
+                                export VLLM_TEST_MAX_NUM_BATCHED_TOKENS="$bt"
+                                export VLLM_TEST_ENABLE_PREFIX_CACHING="$pc"
+                                export VLLM_TEST_SEED="12345"
+                                export VLLM_TEST_MAX_PROMPT_LEN="$plen"
+
+                                # ---------- 最多尝试 MAX_ATTEMPTS 次 ----------
+                                attempt=0
+                                combo_status="UNKNOWN"
+                                total_failures=0
+                                step_mismatch=0
+                                token_mismatch=0
+                                logprob_mismatch=0
+                                reason=""
+                                log_files=""
+
+                                # ---------- 最多尝试：连续成功3次 或 总尝试9次 ----------
+                                max_consecutive=1 # 3
+                                max_total_attempts=2
+                                consecutive_success=0
+                                total_attempts=0
+
+                                while [ $consecutive_success -lt $max_consecutive ] && [ $total_attempts -lt $max_total_attempts ]; do
+                                    total_attempts=$((total_attempts + 1))
+                                    run_log="$output_dir/${combo_id}_attempt${total_attempts}.log"
+
+                                    # 累积日志文件路径
+                                    if [ -z "$log_files" ]; then
+                                        log_files="$run_log"
+                                    else
+                                        log_files="${log_files};${run_log}"
+                                    fi
+
+                                    echo "  Attempt $total_attempts/$max_total_attempts (consecutive successes: $consecutive_success) ..."
+
+                                    # 运行 pytest（与原脚本相同）
+                                    set +e
+                                    pytest -v -s /mnt/share/x00886548/workspace/batch_inv_qwen35/manual/test_batch_invariant.py::test_logprobs_bitwise_batch_invariance_bs1_vs_bsN 2>&1 | tee "$run_log"
+                                    exit_code=${PIPESTATUS[0]}
+                                    set -e
+
+                                    # ---------- 解析本次运行结果（与原脚本相同）----------
+                                    run_status="UNKNOWN"
+                                    run_failures=0
+                                    run_step_mismatch=0
+                                    run_token_mismatch=0
+                                    run_logprob_mismatch=0
+                                    run_reason=""
+
+                                    if grep -q "Logits are not available on RequestOutput" "$run_log"; then
+                                        run_status="SKIP"
+                                        run_reason="Logprobs not available"
+                                    elif grep -q "BATCH INVARIANCE FAILURES:" "$run_log"; then
+                                        run_status="FAIL"
+                                        stats=$(parse_failure_stats)
+                                        IFS=',' read -r run_failures run_step_mismatch run_token_mismatch run_logprob_mismatch run_reason <<< "$stats"
+                                        if [ -z "$run_failures" ] || [ "$run_failures" = "0" ]; then
+                                            failures_line=$(grep "BATCH INVARIANCE FAILURES:" "$run_log")
+                                            run_failures=$(echo "$failures_line" | sed -E 's/.*BATCH INVARIANCE FAILURES: ([0-9]+)\/[0-9]+.*/\1/')
+                                            run_reason=$(grep -E "Reason:" "$run_log" | head -1 | sed 's/.*Reason: //')
+                                        fi
+                                    elif [ $exit_code -eq 0 ]; then
+                                        run_status="PASS"
+                                        run_failures=0
+                                        run_reason=""
+                                    else
+                                        run_status="ERROR"
+                                        run_failures=0
+                                        run_step_mismatch=0
+                                        run_token_mismatch=0
+                                        run_logprob_mismatch=0
+                                        run_reason="Pytest exit code $exit_code"
+                                    fi
+
+                                    # ---------- 根据状态处理 ----------
+                                    case "$run_status" in
+                                        PASS)
+                                            consecutive_success=$((consecutive_success + 1))
+                                            echo "  Attempt $total_attempts PASSED. Consecutive successes: $consecutive_success/$max_consecutive"
+                                            if [ $consecutive_success -eq $max_consecutive ]; then
+                                                combo_status="PASS"
+                                                reason=""
+                                                echo "  Achieved $max_consecutive consecutive PASS. Combo PASS."
+                                                break
+                                            else
+                                                echo "  Waiting $POST_RUN_WAIT_TIME seconds before next attempt..."
+                                                sleep $POST_RUN_WAIT_TIME
+                                                continue
+                                            fi
+                                            ;;
+                                        FAIL|SKIP)
+                                            echo "  Attempt $total_attempts ended with $run_status, stopping this combo."
+                                            combo_status="$run_status"
+                                            reason="$run_reason"
+                                            total_failures=$((total_failures + run_failures))
+                                            step_mismatch=$((step_mismatch + run_step_mismatch))
+                                            token_mismatch=$((token_mismatch + run_token_mismatch))
+                                            logprob_mismatch=$((logprob_mismatch + run_logprob_mismatch))
+                                            echo "  Waiting $POST_RUN_WAIT_TIME seconds for resource cleanup..."
+                                            sleep $POST_RUN_WAIT_TIME
+                                            break
+                                            ;;
+                                        ERROR)
+                                            echo "  Attempt $total_attempts ended with ERROR. Resetting consecutive success count."
+                                            consecutive_success=0
+                                            if [ $total_attempts -lt $max_total_attempts ]; then
+                                                echo "  Will retry after cleanup and wait..."
+                                                echo "  Killing pytest processes..."
+                                                pkill -u $USER -f "pytest.*/mnt/share/x00886548/workspace/batch_inv_qwen35/manual/test_batch_invariant.py" || true
+                                                sleep 5
+                                                echo "  Waiting $RETRY_WAIT_TIME seconds for system recovery..."
+                                                sleep $RETRY_WAIT_TIME
+                                                # 不执行 POST_RUN_WAIT_TIME，直接继续下一次循环
+                                                continue
+                                            else
+                                                echo "  Maximum total attempts ($max_total_attempts) reached, marking combo as ERROR."
+                                                combo_status="ERROR"
+                                                reason="$run_reason"
+                                                echo "  Waiting $POST_RUN_WAIT_TIME seconds for resource cleanup..."
+                                                sleep $POST_RUN_WAIT_TIME
+                                                break
+                                            fi
+                                            ;;
+                                        *)
+                                            # 未知状态，保守处理为 ERROR
+                                            echo "  Attempt $total_attempts ended with unknown status ($run_status), treating as ERROR. Resetting consecutive success count."
+                                            consecutive_success=0
+                                            if [ $total_attempts -lt $max_total_attempts ]; then
+                                                echo "  Will retry after cleanup..."
+                                                pkill -u $USER -f "pytest.*/mnt/share/x00886548/workspace/batch_inv_qwen35/manual/test_batch_invariant.py" || true
+                                                sleep 5
+                                                sleep $RETRY_WAIT_TIME
+                                                continue
+                                            else
+                                                combo_status="ERROR"
+                                                reason="$run_reason"
+                                                sleep $POST_RUN_WAIT_TIME
+                                                break
+                                            fi
+                                            ;;
+                                    esac
+                                done
+
+                                # 如果循环因达到总尝试上限而退出且状态未设置，则标记为 ERROR
+                                if [ -z "$combo_status" ]; then
+                                    combo_status="ERROR"
+                                    reason="Exceeded max total attempts ($max_total_attempts) without achieving $max_consecutive consecutive PASS."
+                                fi
+
+
+                                # ---------- 写入 CSV ----------
+                                echo "$model_short,$tp,$temp,$mt,$mp,$plen,$bt,$pc,$custom_op_value,$combo_status,$total_failures,$step_mismatch,$token_mismatch,$logprob_mismatch,\"$reason\",\"$log_files\"" >> "$summary_csv"
+                            done # plen
+                        done  # mp
+                    done  # mt
+                done  # temp
+            done  # tp
+        done  # pc
+    done  # custom_op_modes
+done  # model_path
+
+echo ""
+echo "========================================"
+echo "All tests finished. Summary CSV: $summary_csv"
+echo "========================================"
+
+# ---------- 生成 Markdown 表格（包含详细的失败统计和Custom Op状态）----------
+python3 << EOF
+import csv
+import os
+from datetime import datetime
+
+with open('$summary_csv', 'r') as f:
+    reader = csv.reader(f)
+    header = next(reader)
+    rows = list(reader)
+
+timestamp = '$timestamp'
+with open('$output_dir/summary.md', 'w', encoding='utf-8') as md:
+    md.write('# Batch Invariance Test Summary\n\n')
+    md.write(f'- **Run Time**: {timestamp}\n')
+    md.write(f'- **Seed**: 12345\n')
+    md.write(f'- **Max Attempts per Combo**: $MAX_ATTEMPTS\n')
+    md.write(f'- **Retry Wait Time (ERROR)**: $RETRY_WAIT_TIME seconds\n')
+    md.write(f'- **Post-Run Wait Time**: $POST_RUN_WAIT_TIME seconds\n')
+    md.write(f'- **MaxNumBatchedTokens Calculation**: MAX_PROMPT_NUMS × 1024\n\n')
+    
+    # 表头：去掉最后一列 LogFiles
+    display_header = header[:-1]
+    md.write('| ' + ' | '.join(display_header) + ' |\n')
+    md.write('|' + '|'.join(['---'] * len(display_header)) + '|\n')
+    
+    for r in rows:
+        display_row = r[:-1]  # 去掉 LogFiles
+        # 根据状态添加颜色标记
+        status = r[8]  # Status列
+        if status == 'PASS':
+            display_row[8] = '✅ PASS'
+        elif status == 'FAIL':
+            display_row[8] = '❌ FAIL'
+        elif status == 'SKIP':
+            display_row[8] = '⏭️ SKIP'
+        elif status == 'ERROR':
+            display_row[8] = '⚠️ ERROR'
+        
+        # Custom Op状态显示
+        custom_op = r[7]  # CustomOpEnabled列
+        display_row[7] = '✅ Enabled' if custom_op == 'True' else '❌ Disabled'
+        
+        md.write('| ' + ' | '.join(display_row) + ' |\n')
+
+# 生成汇总统计
+total_tests = len(rows)
+pass_count = sum(1 for r in rows if r[8].strip('✅❌⏭️⚠️ ') == 'PASS')
+fail_count = sum(1 for r in rows if r[8].strip('✅❌⏭️⚠️ ') == 'FAIL')
+skip_count = sum(1 for r in rows if r[8].strip('✅❌⏭️⚠️ ') == 'SKIP')
+error_count = sum(1 for r in rows if r[8].strip('✅❌⏭️⚠️ ') == 'ERROR')
+
+with open('$output_dir/summary.md', 'a', encoding='utf-8') as md:
+    md.write('\n## Overall Statistics\n\n')
+    md.write(f'- **Total Combinations**: {total_tests}\n')
+    md.write(f'- **Pass**: {pass_count}\n')
+    md.write(f'- **Fail**: {fail_count}\n')
+    md.write(f'- **Skip**: {skip_count}\n')
+    md.write(f'- **Error**: {error_count}\n')
+    
+    # 模型特定配置统计
+    md.write('\n## Model-Specific Configuration\n\n')
+    md.write('| Model | Custom Op Status |\n')
+    md.write('|-------|-----------------|\n')
+    
+    model_configs = {}
+    for r in rows:
+        model = r[0]
+        custom_op = 'Enabled' if r[7] == 'True' else 'Disabled'
+        model_configs[model] = custom_op
+    
+    for model, config in model_configs.items():
+        md.write(f'| {model} | {config} |\n')
+    
+    # 失败类型汇总
+    if fail_count > 0:
+        md.write('\n## Failure Type Summary\n\n')
+        total_step = sum(int(r[10]) for r in rows if r[8].strip('✅❌⏭️⚠️ ') == 'FAIL')
+        total_token = sum(int(r[11]) for r in rows if r[8].strip('✅❌⏭️⚠️ ') == 'FAIL')
+        total_logprob = sum(int(r[12]) for r in rows if r[8].strip('✅❌⏭️⚠️ ') == 'FAIL')
+        
+        md.write(f'- **Step Mismatch**: {total_step}\n')
+        md.write(f'- **Token Mismatch**: {total_token}\n')
+        md.write(f'- **Logprob Mismatch**: {total_logprob}\n')
+        
+        # 按模型统计失败类型
+        md.write('\n### Failure Types by Model\n\n')
+        md.write('| Model | Step Mismatch | Token Mismatch | Logprob Mismatch |\n')
+        md.write('|-------|---------------|----------------|------------------|\n')
+        
+        model_failures = {}
+        for r in rows:
+            if r[8].strip('✅❌⏭️⚠️ ') == 'FAIL':
+                model = r[0]
+                if model not in model_failures:
+                    model_failures[model] = {'step': 0, 'token': 0, 'logprob': 0}
+                model_failures[model]['step'] += int(r[10])
+                model_failures[model]['token'] += int(r[11])
+                model_failures[model]['logprob'] += int(r[12])
+        
+        for model, failures in model_failures.items():
+            md.write(f'| {model} | {failures["step"]} | {failures["token"]} | {failures["logprob"]} |\n')
+    
+    # 添加运行配置信息
+    md.write('\n## Test Configuration\n\n')
+    md.write(f'- **Max Attempts per Combo**: $MAX_ATTEMPTS\n')
+    md.write(f'- **Post-Run Wait Time**: $POST_RUN_WAIT_TIME seconds\n')
+    md.write(f'- **Retry Wait Time (ERROR)**: $RETRY_WAIT_TIME seconds\n')
+    md.write(f'- **MaxNumBatchedTokens**: Dynamically calculated as MAX_PROMPT_NUMS × 1024\n')
+EOF
+
+echo "Markdown summary: $output_dir/summary.md"
+echo "Detailed logs available in: $output_dir"
+
+# 打印模型特定配置汇总
+echo ""
+echo "========================================"
+echo "Model-Specific Configuration Summary:"
+echo "========================================"
+for model_path in "${model_array[@]}"; do
+    model_short=$(basename "$model_path")
+    if [[ "$model_short" == "Qwen3-1.7B" ]]; then
+        echo "  - $model_short: Testing False and True"
+    else
+        echo "  - $model_short: Testing True"
+    fi
+done
+echo "========================================"
+
+# 打印运行统计信息
+echo ""
+echo "========================================"
+echo "Run Statistics:"
+echo "========================================"
+echo "  Total Combos: $total_combos"
+echo "  Completed: $current/$total_combos"
+echo "  Max Attempts per Combo: $MAX_ATTEMPTS"
+echo "  Post-Run Wait: $POST_RUN_WAIT_TIME seconds/run"
+echo "  ERROR Retry: $RETRY_WAIT_TIME seconds"
+echo "========================================"
