@@ -1,16 +1,17 @@
-1. introduction.md：
-标题要从“简介”换成“MindSpeed Ops简介”，
-补充代码仓架构图
-去掉代码目录机构，放到README.md
-2. install_guide.md
-软件安装标题去掉MindSpeed-Ops，即仅保留“软件安装”
-产品硬件支持列表按照设备类型排序（A5->A3->A2->其它）（A3放到A2上面）
-安装前准备的表2去掉（安装指南如下表所示也去掉）
-3. quick_start.md
-标题仅保留“快速入门”
-表格里面的对钩切换格式
-表格的“详细文档”去掉
-4. 整体：
-所有“MindSpeed-Ops”都要把-变成空格，写成“MindSpeed Ops”
-所有markdown代码块的前面的```后面都加上语言类型，防止doc tool报错
-所有表格的“描述”类的文字都需要末尾加上中文句号
+OpenAI协议地址，chat格式：
+https://st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com/v1
+
+OpenAI协议地址，Responses格式(仅部分模型支持)：
+https://st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com/v1/responses
+Responses 格式作为Chat Completions API的演进版本，Responses API能够以更简洁的方式提供智能体原生功能；
+蓝区当前仅有部分模型提供了该格式的支持，常用AI工具也只有部分能支持（如codex支持，Trae不支持），请注意识别。
+
+Anthropic协议地址：
+https://st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com/compatible
+
+仅蓝区网络环境可使用（需断开XGate）
+
+2、模型id列表
+获取模型列表接口
+https://st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com/v1/models
+实测DSH内已可用：
