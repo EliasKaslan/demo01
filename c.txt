@@ -1,58 +1,91 @@
-#!/bin/bash
-set -euo pipefail
+# CANN
 
-#export VLLM_VERSION=0.27.1
-#export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
-export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
-export OMP_PROC_BIND=false
-export OMP_NUM_THREADS=100
-export TASK_QUEUE_ENABLE=1
-export HCCL_BUFFSIZE=1024
-export HCCL_OP_EXPANSION_MODE="AIV"
-# export ASCEND_RT_VISIBLE_DEVICES="0,1,2,3"
+从CMC或者昇腾官网下载cann包的：
 
-# export VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL=1
-# export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+1. toolkit
+2. nnal
+3. ops
 
-PROFILER_CONFIG='{
-    "profiler": "torch",
-    "torch_profiler_dir": "./profiling",
-    "torch_profiler_with_stack": false,
-    "delay_iterations": 3072,
-    "max_iterations": 20,
-    "ignore_frontend": true
-}'
+这三个run包，之后依次安装。注意，toolkit包安装后需要立即运行set_env.sh，已激活环境变量。
 
-MODEL_PATH="/data//LLM/mindSpeed_rl/kimi_k3"
+之后每一步安装都需要在toolkit和nnal的环境变量激活的情况下运行。
 
-# ==================== 构建启动命令 ====================
-CMD=(
-    vllm serve "${MODEL_PATH}"
-    --load-format "dummy"
-    --served-model-name kimi-k3
-    --port 20003
-    --allowed-local-media-path /
-    --trust-remote-code
-    --tensor-parallel-size 8
-    --data-parallel-size 1
-    --dtype bfloat16
-    --enable-prefix-caching
-    --enable-expert-parallel
-    --max-num-seqs 16
-    --max-model-len 40960
-    --max-num-batched-tokens 8192
-    --gpu-memory-utilization 0.9
-    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
-    --profiler-config "${PROFILER_CONFIG}"
-    --mm-processor-cache-gb 0
-    --additional-config '{"enable_cpu_binding":true,"enable_flashcomm1":true}'
-    --mm-encoder-tp-mode data
-    --limit-mm-per-prompt '{"vision_chunk":40}'
-    --enable-auto-tool-choice
-    --reasoning-parser kimi_k3
-    --tool-call-parser kimi_k3
-)
+```shell
+export cann_path=/mnt/share/x00886548/cann/cann_9_0_0_b160
+cd $cann_path
 
-# ==================== 执行 ====================
-echo "[INFO] 启动命令: ${CMD[*]}"
-"${CMD[@]}"
+# 清理之前安装信息，防止报错
+rm -rf /etc/Ascend/ascend_cann_install.info
+
+chmod -R 777 .
+./*toolkit* --install --install-path=$(pwd) -q
+source ./ascend-toolkit/set_env.sh
+
+./*nnal* --install --install-path=$(pwd) -q
+source ./nnal/atb/set_env.sh
+
+./*ops* --install --install-path=$(pwd) -q
+```
+
+# PTA
+
+CMC上获取开发B版本的torch_npu的whl包，pip本地安装即可。或者也可以pip install在线安装商发版本。商发版本安装方式：
+
+```auto
+pip3 install torch==2.10.0+cpu --index-url https://download.pytorch.org/whl/cpu
+pip3 install torch_npu==2.10.0.post4
+```
+
+# Triton
+
+CMC上获取开发B版本的triton-ascend的whl包，pip本地安装即可。或者也可以pip install在线安装商发版本。商发版本安装方式：
+
+```auto
+pip install triton-ascend==3.2.2 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi
+```
+
+# VLLM
+
+git下载vllm源码后，本地下载。
+
+需要export VLLM_TARGET_DEVICE=empty，不然会编译大量GPU相关内容，显著变慢。
+
+需要运行use_existing_torch.py，以使用我们上面安装好的torch等依赖。
+
+```javascript
+cd $workspace_xmz
+mkdir vllm_code
+cd vllm_code
+git config --global http.sslVerify false
+git clone https://github.com/vllm-project/vllm.git
+cd vllm
+git checkout 967c5c3
+export VLLM_TARGET_DEVICE=empty
+python3 use_existing_torch.py
+pip install -r requirements/common.txt
+pip install setuptools_rust setuptools_scm
+pip install -e . --no-build-isolation
+```
+
+# VLLM-Ascend
+
+git下载vllm_ascend源码后，本地下载。
+
+需要修改requirements.txt和pyproject.toml，把torch, torch_npu, triton_ascend的版本注释掉，以确保使用上面安装的torch等配套版本。
+
+```auto
+cd $workspace_xmz/vllm_code
+git clone https://github.com/vllm-project/vllm-ascend.git
+cd vllm-ascend/
+git checkout c9a3538
+# 下面两行把torch, torch_npu, triton_ascend的版本注释掉
+vim requirements.txt
+vim pyproject.toml
+pip install -r requirements.txt
+# batch不变性
+export VLLM_BATCH_INVARIANT=1
+export COMPILE_CUSTOM_KERNELS=1
+# 编译VLLM_ASCEND前清理之前的旧中间件
+rm -rf csrc/build build
+pip install -e . --no-build-isolation
+```
