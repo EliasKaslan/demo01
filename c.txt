@@ -1,26 +1,172 @@
-【计算装备团队发放AI账号通知】
-       姓名：徐铭哲
-       工号：x00886548
-       火山AI网关
-       对应API KEY ：6ae09a5f-7301-4f9c-88d7-17f7b0bba06c
-       wiki配置指导文档：https://wiki.huawei.com/domains/164642/wiki/339081/WIKI2026072411992198
-       蓝区AI工具账号使用须知：https://wiki.huawei.com/domains/164642/wiki/339081/WIKI2026070211707335
-       支撑人员 李娜 l30074365
-
-OpenAI协议地址，chat格式：
-https://st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com/v1
-
-OpenAI协议地址，Responses格式(仅部分模型支持)：
-https://st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com/v1/responses
-Responses 格式作为Chat Completions API的演进版本，Responses API能够以更简洁的方式提供智能体原生功能；
-蓝区当前仅有部分模型提供了该格式的支持，常用AI工具也只有部分能支持（如codex支持，Trae不支持），请注意识别。
-
-Anthropic协议地址：
-https://st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com/compatible
-
-仅蓝区网络环境可使用（需断开XGate）
-
-2、模型id列表
-获取模型列表接口
-https://st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com/v1/models
-实测DSH内已可用：
+{
+  "architectures": [
+    "KimiK3ForConditionalGeneration"
+  ],
+  "auto_map": {
+    "AutoConfig": "configuration_kimi_k3.KimiK3Config",
+    "AutoModel": "modeling_kimi_k3.KimiK3ForConditionalGeneration",
+    "AutoModelForCausalLM": "modeling_kimi_k3.KimiK3ForConditionalGeneration"
+  },
+  "bos_token_id": 163584,
+  "dtype": "bfloat16",
+  "eos_token_id": 163586,
+  "ignore_index": -100,
+  "image_placeholder": "<|kimi_image_placeholder|>",
+  "media_placeholder_token_id": 163605,
+  "model_type": "kimi_k3",
+  "pad_token_id": 163839,
+  "text_config": {
+    "_name_or_path": "",
+    "activation_situ_beta": 4.0,
+    "activation_situ_linear_beta": 25.0,
+    "add_cross_attention": false,
+    "architectures": [
+      "KimiLinearForCausalLM"
+    ],
+    "attn_res_block_size": 12,
+    "auto_map": {
+      "AutoConfig": "configuration_kimi_k3.KimiLinearConfig",
+      "AutoModel": "modeling_kimi_linear.KimiLinearModel",
+      "AutoModelForCausalLM": "modeling_kimi_linear.KimiLinearForCausalLM"
+    },
+    "bad_words_ids": null,
+    "begin_suppress_tokens": null,
+    "bos_token_id": 163584,
+    "chunk_size_feed_forward": 0,
+    "cross_attention_hidden_size": null,
+    "decoder_start_token_id": null,
+    "diversity_penalty": 0.0,
+    "do_sample": false,
+    "dtype": "bfloat16",
+    "early_stopping": false,
+    "encoder_no_repeat_ngram_size": 0,
+    "eos_token_id": 163586,
+    "exponential_decay_length_penalty": null,
+    "finetuning_task": null,
+    "first_k_dense_replace": 1,
+    "forced_bos_token_id": null,
+    "forced_eos_token_id": null,
+    "hidden_act": "situ",
+    "hidden_size": 7168,
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "initializer_range": 0.02,
+    "intermediate_size": 33792,
+    "is_decoder": false,
+    "is_encoder_decoder": false,
+    "kv_lora_rank": 512,
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "latent_moe_use_norm": true,
+    "length_penalty": 1.0,
+    "linear_attn_config": {
+      "full_attn_layers": [
+        4
+      ],
+      "gate_lower_bound": -5.0,
+      "head_dim": 128,
+      "kda_layers": [
+        1,
+        2,
+        3
+      ],
+      "num_heads": 96,
+      "short_conv_kernel_size": 4,
+      "use_full_rank_gate": true
+    },
+    "max_length": 20,
+    "max_position_embeddings": 1048576,
+    "min_length": 0,
+    "mla_use_nope": true,
+    "mla_use_output_gate": true,
+    "model_type": "kimi_linear",
+    "moe_intermediate_size": 3072,
+    "moe_layer_freq": 1,
+    "moe_renormalize": true,
+    "moe_router_activation_func": "sigmoid",
+    "no_repeat_ngram_size": 0,
+    "num_attention_heads": 96,
+    "num_beam_groups": 1,
+    "num_beams": 1,
+    "num_expert_group": 1,
+    "num_experts": 896,
+    "num_experts_per_token": 16,
+    "num_hidden_layers": 4,
+    "num_key_value_heads": 96,
+    "num_nextn_predict_layers": 0,
+    "num_return_sequences": 1,
+    "num_shared_experts": 2,
+    "output_attentions": false,
+    "output_hidden_states": false,
+    "output_scores": false,
+    "pad_token_id": 163839,
+    "prefix": null,
+    "problem_type": null,
+    "pruned_heads": {},
+    "q_lora_rank": 1536,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "remove_invalid_values": false,
+    "repetition_penalty": 1.0,
+    "return_dict": true,
+    "return_dict_in_generate": false,
+    "rms_norm_eps": 1e-05,
+    "routed_expert_hidden_size": 3584,
+    "routed_scaling_factor": 1.0,
+    "sep_token_id": null,
+    "suppress_tokens": null,
+    "task_specific_params": null,
+    "temperature": 1.0,
+    "tf_legacy_loss": false,
+    "tie_encoder_decoder": false,
+    "tie_word_embeddings": false,
+    "tokenizer_class": null,
+    "top_k": 50,
+    "top_p": 1.0,
+    "topk_group": 1,
+    "topk_method": "noaux_tc",
+    "torchscript": false,
+    "transformers_version": "4.56.2",
+    "typical_p": 1.0,
+    "use_bfloat16": false,
+    "use_cache": true,
+    "use_grouped_topk": true,
+    "v_head_dim": 128,
+    "vocab_size": 163840
+  },
+  "tie_word_embeddings": false,
+  "vision_config": {
+    "_attn_implementation": "flash_attention_2",
+    "activation_func": "gelu_pytorch_tanh",
+    "attn_bias": false,
+    "init_pos_emb_height": 64,
+    "init_pos_emb_time": 4,
+    "init_pos_emb_width": 64,
+    "linear_bias": false,
+    "merge_kernel_size": [
+      2,
+      2
+    ],
+    "merge_type": "sd2_tpool",
+    "mlp_type": "mlp2",
+    "mm_hidden_size": 1024,
+    "mm_projector_type": "patchmergerv2",
+    "norm_type": "rmsnorm",
+    "patch_embed_proj_bias": false,
+    "patch_size": 14,
+    "pos_emb_interpolation_mode": "bilinear",
+    "pos_emb_type": "divided_fixed",
+    "projector_hidden_act": "gelu",
+    "projector_ln_eps": 1e-05,
+    "qkv_hidden_size": 1536,
+    "text_hidden_size": 7168,
+    "vt_hidden_size": 1024,
+    "vt_intermediate_size": 4096,
+    "vt_num_attention_heads": 12,
+    "vt_num_hidden_layers": 27
+  }
+}
