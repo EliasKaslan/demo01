@@ -1,19 +1,434 @@
-# v1lm
-git clone https://github.com/vllm-project/vllm.git
-ed vllm
-git checkout 58d3918e3ea0a544ffedadad2ba84559e9c51d8f
-export TORCH_DEVICE_BACKEND_AUTOLOAD-0
-export VLLM_TARGET_DEVICE-empty
-pip install setuptools-rust
-python3 use_existing_torch.py
-pip install -r requirements/common.txt
-pip install -e . --no-build-isolation
-cd ..
-# vllm-ascend
-git clone https://github.com/vllm-project/vllm-ascend.git
-ed vllm-ascend
-git checkout 27a94764b5ead50ed3e42ab52a257c2173032750
-pip install -r requirements.txt --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple --trusted-host triton-ascend.osinfra.cn
-export COMPILE_CUSTOM_KERNELS=1
-pip install -e . --no-build-isolation --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple --trusted-host triton-ascend.osinfra.cn
-cd ..
+#!/bin/bash
+# ---------------------------------------------------------------------------
+# test_batch_inv.sh — batch invariance 全组合自动化测试驱动脚本
+#
+# 遍历 (Model × TP × Temperature × MaxTokens × MaxPromptNum × PromptLength
+# × EnablePrefixCaching) 的参数组合，逐组合调用 pytest 运行
+# test_batch_invariant.py::test_logprobs_bitwise_batch_invariance_bs1_vs_bsN，
+# 结果输出到带时间戳的目录，包含每次运行的详细日志及 CSV/Markdown 汇总。
+#
+# 重试与判定策略：
+#   - 每个组合最多尝试 max_total_attempts 次；
+#   - 连续 PASS 达到 max_consecutive 次即判定该组合 PASS；
+#   - 出现 FAIL/SKIP 立即终止该组合，状态记为 FAIL/SKIP；
+#   - 出现 ERROR（pytest 崩溃/超时等）：杀掉残留 pytest 进程，等待
+#     RETRY_WAIT_TIME 秒后重试；
+#   - 每次运行结束后（ERROR 重试路径除外）等待 POST_RUN_WAIT_TIME 秒释放资源。
+#
+# max_num_batched_tokens 动态计算为 MaxPromptNum × 4096。
+# 所有维度的取值列表均可通过环境变量覆盖（见"参数定义"一节）。
+# ---------------------------------------------------------------------------
+
+# ---------- 全局环境（batch invariance 运行所需）----------
+export VLLM_BATCH_INVARIANT=1
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+# Triton DSA 开关
+export VLLM_ASCEND_USE_TRITON_DSA_INDEXER=1
+export VLLM_ASCEND_USE_TRITON_DSA_ATTENTION=1
+
+set -euo pipefail
+
+# ---------- 参数定义（均可通过环境变量覆盖）----------
+
+# 被测 pytest 脚本与用例（默认保持原部署路径）
+TEST_SCRIPT=${VLLM_TEST_SCRIPT:-"/mnt/share/x00886548/workspace/batch_inv/test_batch_invariant.py"}
+TEST_CASE="test_logprobs_bitwise_batch_invariance_bs1_vs_bsN"
+
+# 各维度取值列表（逗号分隔）
+MODEL_LIST=${VLLM_TEST_MODEL_LIST:-"/data/LLM/mindSpeed_rl/Qwen3.5-35B-A3B"}  # 例: /home/data/Qwen3-1.7B,/home/data/Qwen3-30B-A3B
+TP_SIZES=${VLLM_TEST_TP_SIZES:-"4"}
+TEMPERATURES=${VLLM_TEST_TEMPERATURES:-"0.6"}
+MAX_TOKENS_LIST=${VLLM_TEST_MAX_TOKENS:-"2048"}      # 输出长度
+MAX_PROMPT_NUMS=${VLLM_TEST_MAX_PROMPT_NUMS:-"32"}
+ENABLE_PREFIX_CACHING_LIST=${VLLM_TEST_ENABLE_PREFIX_CACHING_LIST:-"False"}
+PROMPT_LENGTHS=${VLLM_TEST_PROMPT_LENGTHS:-"1000"} # 输入长度
+
+# 等待时间（秒）。注：正式跑长任务时可分别改回 1800 / 60。
+RETRY_WAIT_TIME=${VLLM_TEST_RETRY_WAIT_TIME:-15}      # ERROR 后等待系统恢复的时间
+POST_RUN_WAIT_TIME=${VLLM_TEST_POST_RUN_WAIT_TIME:-5} # 每次运行后资源释放等待时间
+
+# 重试策略
+max_consecutive=10     # 连续 PASS 达到该次数即判定组合 PASS（原值 3）
+max_total_attempts=10  # 每个组合的最大总尝试次数
+
+# 每个模型要测试的 Custom Op 模式列表。
+# 说明：历史上 Qwen3-1.7B 会额外测 True 模式，当前所有模型统一只测 False；
+# 如需恢复双模式测试，可在此按模型名（basename）扩展。
+custom_op_modes=("False")
+
+# ---------- 解析参数列表为数组 ----------
+IFS=',' read -ra model_array        <<< "$MODEL_LIST"
+IFS=',' read -ra tp_array           <<< "$TP_SIZES"
+IFS=',' read -ra temp_array         <<< "$TEMPERATURES"
+IFS=',' read -ra token_array        <<< "$MAX_TOKENS_LIST"
+IFS=',' read -ra prompt_array       <<< "$MAX_PROMPT_NUMS"
+IFS=',' read -ra prefix_cache_array <<< "$ENABLE_PREFIX_CACHING_LIST"
+IFS=',' read -ra prompt_len_array   <<< "$PROMPT_LENGTHS"
+
+# ---------- 创建输出目录 ----------
+timestamp=$(date +"%Y%m%d_%H%M%S")
+output_dir="batch_invariant_results_${timestamp}"
+mkdir -p "$output_dir"
+
+summary_csv="$output_dir/summary.csv"
+# CSV 表头（列名与下方 summary.md 生成逻辑耦合，修改需同步）
+echo "Model,TP,Temperature,MaxTokens,MaxPrompts,PromptLength,MaxNumBatchedTokens,EnablePrefixCaching,CustomOpEnabled,Status,TotalFailures,StepMismatch,TokenMismatch,LogprobMismatch,FirstFailureReason,LogFiles" > "$summary_csv"
+
+# 组合总数（custom_op_modes 当前恒为 1 种，不计入乘积）
+total_combos=$((
+    ${#model_array[@]} * ${#tp_array[@]} * ${#temp_array[@]} *
+    ${#token_array[@]} * ${#prompt_array[@]} * ${#prefix_cache_array[@]} *
+    ${#prompt_len_array[@]}
+))
+current=0
+
+echo "========================================"
+echo "Total combos: $total_combos"
+echo "Output dir: $output_dir"
+echo "Max attempts per combo: $max_total_attempts (consecutive PASS needed: $max_consecutive)"
+echo "Retry wait time (ERROR recovery): $RETRY_WAIT_TIME seconds"
+echo "Post-run wait time: $POST_RUN_WAIT_TIME seconds"
+echo "Triton DSA Indexer: ${VLLM_ASCEND_USE_TRITON_DSA_INDEXER}"
+echo "Triton DSA Attention: ${VLLM_ASCEND_USE_TRITON_DSA_ATTENTION}"
+echo "Test script: ${TEST_SCRIPT}::${TEST_CASE}"
+echo "========================================"
+
+# ---------- 函数定义 ----------
+
+# 计算 max_num_batched_tokens = MaxPromptNum × 4096
+calculate_batched_tokens() {
+    local max_prompts=$1
+    echo $((max_prompts * 4096))
+}
+
+# 读取并清理 pytest 侧写出的失败统计文件 batch_invariant_failure_stats.txt，
+# 输出 CSV 片段: TOTAL_FAILURES,STEP_MISMATCH,TOKEN_MISMATCH,LOGPROB_MISMATCH,FIRST_REASON
+parse_failure_stats() {
+    local stats_file="batch_invariant_failure_stats.txt"
+    local total_failures=0 step_mismatch=0 token_mismatch=0 logprob_mismatch=0 first_reason=""
+
+    if [ -f "$stats_file" ]; then
+        while IFS='=' read -r key value; do
+            case "$key" in
+                "TOTAL_FAILURES")      total_failures=$value ;;
+                "STEP_MISMATCH")       step_mismatch=$value ;;
+                "TOKEN_MISMATCH")      token_mismatch=$value ;;
+                "LOGPROB_MISMATCH")    logprob_mismatch=$value ;;
+                "FIRST_FAILURE_REASON") first_reason=$value ;;
+            esac
+        done < "$stats_file"
+        rm -f "$stats_file"
+    fi
+
+    echo "$total_failures,$step_mismatch,$token_mismatch,$logprob_mismatch,$first_reason"
+}
+
+# 杀掉上一轮可能残留的 pytest 进程
+kill_stale_pytest() {
+    pkill -u "$USER" -f "pytest.*${TEST_SCRIPT}" || true
+}
+
+# ---------- 遍历所有模型 ----------
+for model_path in "${model_array[@]}"; do
+    model_short=$(basename "$model_path")
+    export VLLM_TEST_MODEL="$model_path"
+
+    # ---------- 遍历 Custom Op 模式 ----------
+    for custom_op_value in "${custom_op_modes[@]}"; do
+        export VLLM_TEST_CUSTOM_OP_ENABLED="$custom_op_value"
+        if [[ "$custom_op_value" == "True" ]]; then
+            custom_op_status="Enabled"
+        else
+            custom_op_status="Disabled"
+        fi
+        echo "  [Model-Specific] $model_short: Setting VLLM_TEST_CUSTOM_OP_ENABLED=$custom_op_value ($custom_op_status)"
+
+        for pc in "${prefix_cache_array[@]}"; do
+            for tp in "${tp_array[@]}"; do
+                for temp in "${temp_array[@]}"; do
+                    for mt in "${token_array[@]}"; do
+                        for mp in "${prompt_array[@]}"; do
+                            for plen in "${prompt_len_array[@]}"; do
+                                current=$((current + 1))
+
+                                # 动态计算 max_num_batched_tokens
+                                bt=$(calculate_batched_tokens "$mp")
+
+                                # 组合标识（同时用作日志文件名前缀）
+                                combo_id="Model${model_short}_TP${tp}_T${temp}_MT${mt}_MP${mp}_PLEN${plen}_B${bt}_C${pc}_CustomOp${custom_op_value}"
+                                echo ""
+                                echo "[$current/$total_combos] Running combo: $combo_id"
+                                echo "  Model: $model_short"
+                                echo "  Custom Op: $custom_op_status ($custom_op_value)"
+                                echo "  MaxNumBatchedTokens: $bt (auto-calculated: ${mp} * 4096)"
+
+                                # 注入该组合的测试参数
+                                export VLLM_TEST_TP_SIZE="$tp"
+                                export VLLM_TEST_TEMPERATURE="$temp"
+                                export VLLM_TEST_MAX_TOKENS="$mt"
+                                export VLLM_TEST_MAX_PROMPT_NUM="$mp"
+                                export VLLM_TEST_MAX_NUM_BATCHED_TOKENS="$bt"
+                                export VLLM_TEST_ENABLE_PREFIX_CACHING="$pc"
+                                export VLLM_TEST_SEED="12345"
+                                export VLLM_TEST_MAX_PROMPT_LEN="$plen"
+
+                                # ---------- 重试循环 ----------
+                                combo_status="UNKNOWN"
+                                reason=""
+                                log_files=""
+                                total_failures=0
+                                step_mismatch=0
+                                token_mismatch=0
+                                logprob_mismatch=0
+                                consecutive_success=0
+                                total_attempts=0
+
+                                while [ "$consecutive_success" -lt "$max_consecutive" ] && [ "$total_attempts" -lt "$max_total_attempts" ]; do
+                                    total_attempts=$((total_attempts + 1))
+                                    run_log="$output_dir/${combo_id}_attempt${total_attempts}.log"
+
+                                    # 累积日志文件路径（分号分隔）
+                                    if [ -z "$log_files" ]; then
+                                        log_files="$run_log"
+                                    else
+                                        log_files="${log_files};${run_log}"
+                                    fi
+
+                                    echo "  Attempt $total_attempts/$max_total_attempts (consecutive successes: $consecutive_success) ..."
+
+                                    set +e
+                                    pytest -v -s "${TEST_SCRIPT}::${TEST_CASE}" 2>&1 | tee "$run_log"
+                                    exit_code=${PIPESTATUS[0]}
+                                    set -e
+
+                                    # ---------- 解析本次运行结果 ----------
+                                    run_status="UNKNOWN"
+                                    run_failures=0
+                                    run_step_mismatch=0
+                                    run_token_mismatch=0
+                                    run_logprob_mismatch=0
+                                    run_reason=""
+
+                                    if grep -q "Logits are not available on RequestOutput" "$run_log"; then
+                                        run_status="SKIP"
+                                        run_reason="Logprobs not available"
+                                    elif grep -q "BATCH INVARIANCE FAILURES:" "$run_log"; then
+                                        run_status="FAIL"
+                                        stats=$(parse_failure_stats)
+                                        IFS=',' read -r run_failures run_step_mismatch run_token_mismatch run_logprob_mismatch run_reason <<< "$stats"
+                                        # 统计文件缺失或计数为 0 时，从日志中兜底解析
+                                        if [ -z "$run_failures" ] || [ "$run_failures" = "0" ]; then
+                                            failures_line=$(grep "BATCH INVARIANCE FAILURES:" "$run_log")
+                                            run_failures=$(echo "$failures_line" | sed -E 's/.*BATCH INVARIANCE FAILURES: ([0-9]+)\/[0-9]+.*/\1/')
+                                            run_reason=$(grep -E "Reason:" "$run_log" | head -1 | sed 's/.*Reason: //')
+                                        fi
+                                    elif [ "$exit_code" -eq 0 ]; then
+                                        run_status="PASS"
+                                    else
+                                        run_status="ERROR"
+                                        run_reason="Pytest exit code $exit_code"
+                                    fi
+
+                                    # ---------- 根据状态处理 ----------
+                                    case "$run_status" in
+                                        PASS)
+                                            consecutive_success=$((consecutive_success + 1))
+                                            echo "  Attempt $total_attempts PASSED. Consecutive successes: $consecutive_success/$max_consecutive"
+                                            if [ "$consecutive_success" -eq "$max_consecutive" ]; then
+                                                combo_status="PASS"
+                                                reason=""
+                                                echo "  Achieved $max_consecutive consecutive PASS. Combo PASS."
+                                                break
+                                            fi
+                                            echo "  Waiting $POST_RUN_WAIT_TIME seconds before next attempt..."
+                                            sleep "$POST_RUN_WAIT_TIME"
+                                            ;;
+                                        FAIL|SKIP)
+                                            echo "  Attempt $total_attempts ended with $run_status, stopping this combo."
+                                            combo_status="$run_status"
+                                            reason="$run_reason"
+                                            total_failures=$((total_failures + run_failures))
+                                            step_mismatch=$((step_mismatch + run_step_mismatch))
+                                            token_mismatch=$((token_mismatch + run_token_mismatch))
+                                            logprob_mismatch=$((logprob_mismatch + run_logprob_mismatch))
+                                            echo "  Waiting $POST_RUN_WAIT_TIME seconds for resource cleanup..."
+                                            sleep "$POST_RUN_WAIT_TIME"
+                                            break
+                                            ;;
+                                        ERROR|*)
+                                            # ERROR 及未知状态统一按 ERROR 处理
+                                            if [ "$run_status" = "ERROR" ]; then
+                                                echo "  Attempt $total_attempts ended with ERROR."
+                                            else
+                                                echo "  Attempt $total_attempts ended with unknown status ($run_status), treating as ERROR."
+                                            fi
+                                            echo "  Resetting consecutive success count."
+                                            consecutive_success=0
+                                            if [ "$total_attempts" -lt "$max_total_attempts" ]; then
+                                                echo "  Will retry after cleanup and wait..."
+                                                kill_stale_pytest
+                                                sleep 5
+                                                echo "  Waiting $RETRY_WAIT_TIME seconds for system recovery..."
+                                                sleep "$RETRY_WAIT_TIME"
+                                                # ERROR 重试路径不走 POST_RUN_WAIT_TIME，直接进入下一次循环
+                                            else
+                                                echo "  Maximum total attempts ($max_total_attempts) reached, marking combo as ERROR."
+                                                combo_status="ERROR"
+                                                reason="$run_reason"
+                                                echo "  Waiting $POST_RUN_WAIT_TIME seconds for resource cleanup..."
+                                                sleep "$POST_RUN_WAIT_TIME"
+                                                break
+                                            fi
+                                            ;;
+                                    esac
+                                done
+
+                                # 循环结束仍未得到明确状态（如直接耗尽总尝试次数），兜底标记为 ERROR
+                                if [ "$combo_status" == "UNKNOWN" ]; then
+                                    combo_status="ERROR"
+                                    reason="Exceeded max total attempts ($max_total_attempts) without achieving $max_consecutive consecutive PASS."
+                                fi
+
+                                # ---------- 写入 CSV ----------
+                                echo "$model_short,$tp,$temp,$mt,$mp,$plen,$bt,$pc,$custom_op_value,$combo_status,$total_failures,$step_mismatch,$token_mismatch,$logprob_mismatch,\"$reason\",\"$log_files\"" >> "$summary_csv"
+                            done # plen
+                        done  # mp
+                    done  # mt
+                done  # temp
+            done  # tp
+        done  # pc
+    done  # custom_op_modes
+done  # model_path
+
+echo ""
+echo "========================================"
+echo "All tests finished. Summary CSV: $summary_csv"
+echo "========================================"
+
+# ---------- 生成 Markdown 汇总（按列名取数，避免列顺序错位）----------
+python3 << EOF
+import csv
+from collections import OrderedDict
+
+summary_csv = '$summary_csv'
+output_md = '$output_dir/summary.md'
+
+STATUS_BADGES = {
+    'PASS': '✅ PASS',
+    'FAIL': '❌ FAIL',
+    'SKIP': '⏭️ SKIP',
+    'ERROR': '⚠️ ERROR',
+}
+
+with open(summary_csv, 'r') as f:
+    reader = csv.DictReader(f)
+    rows = list(reader)
+
+# 表格展示列（不含最后的 LogFiles）
+display_cols = [c for c in reader.fieldnames if c != 'LogFiles']
+
+
+def to_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+with open(output_md, 'w', encoding='utf-8') as md:
+    md.write('# Batch Invariance Test Summary\n\n')
+    md.write('- **Run Time**: $timestamp\n')
+    md.write('- **Seed**: 12345\n')
+    md.write('- **Max Attempts per Combo**: $max_total_attempts\n')
+    md.write('- **Retry Wait Time (ERROR)**: $RETRY_WAIT_TIME seconds\n')
+    md.write('- **Post-Run Wait Time**: $POST_RUN_WAIT_TIME seconds\n')
+    md.write('- **MaxNumBatchedTokens Calculation**: MAX_PROMPT_NUMS × 4096\n\n')
+
+    # ---------- 明细表 ----------
+    md.write('| ' + ' | '.join(display_cols) + ' |\n')
+    md.write('|' + '|'.join(['---'] * len(display_cols)) + '|\n')
+    for r in rows:
+        cells = [r.get(c, '') for c in display_cols]
+        # 状态与 Custom Op 列加标记
+        status_idx = display_cols.index('Status')
+        custom_op_idx = display_cols.index('CustomOpEnabled')
+        cells[status_idx] = STATUS_BADGES.get(r.get('Status'), r.get('Status', ''))
+        cells[custom_op_idx] = '✅ Enabled' if r.get('CustomOpEnabled') == 'True' else '❌ Disabled'
+        md.write('| ' + ' | '.join(cells) + ' |\n')
+
+    # ---------- 总体统计 ----------
+    status_counts = {s: sum(1 for r in rows if r.get('Status') == s) for s in STATUS_BADGES}
+    md.write('\n## Overall Statistics\n\n')
+    md.write('- **Total Combinations**: ' + str(len(rows)) + '\n')
+    md.write('- **Pass**: ' + str(status_counts['PASS']) + '\n')
+    md.write('- **Fail**: ' + str(status_counts['FAIL']) + '\n')
+    md.write('- **Skip**: ' + str(status_counts['SKIP']) + '\n')
+    md.write('- **Error**: ' + str(status_counts['ERROR']) + '\n')
+
+    # ---------- 各模型的 Custom Op 配置 ----------
+    md.write('\n## Model-Specific Configuration\n\n')
+    md.write('| Model | Custom Op Status |\n')
+    md.write('|-------|-----------------|\n')
+    model_configs = OrderedDict()
+    for r in rows:
+        model_configs[r['Model']] = 'Enabled' if r['CustomOpEnabled'] == 'True' else 'Disabled'
+    for model, config in model_configs.items():
+        md.write('| ' + model + ' | ' + config + ' |\n')
+
+    # ---------- 失败类型汇总 ----------
+    failed_rows = [r for r in rows if r.get('Status') == 'FAIL']
+    if failed_rows:
+        md.write('\n## Failure Type Summary\n\n')
+        md.write('- **Step Mismatch**: ' + str(sum(to_int(r['StepMismatch']) for r in failed_rows)) + '\n')
+        md.write('- **Token Mismatch**: ' + str(sum(to_int(r['TokenMismatch']) for r in failed_rows)) + '\n')
+        md.write('- **Logprob Mismatch**: ' + str(sum(to_int(r['LogprobMismatch']) for r in failed_rows)) + '\n')
+
+        md.write('\n### Failure Types by Model\n\n')
+        md.write('| Model | Step Mismatch | Token Mismatch | Logprob Mismatch |\n')
+        md.write('|-------|---------------|----------------|------------------|\n')
+        model_failures = OrderedDict()
+        for r in failed_rows:
+            stats = model_failures.setdefault(r['Model'], {'step': 0, 'token': 0, 'logprob': 0})
+            stats['step'] += to_int(r['StepMismatch'])
+            stats['token'] += to_int(r['TokenMismatch'])
+            stats['logprob'] += to_int(r['LogprobMismatch'])
+        for model, s in model_failures.items():
+            md.write('| ' + model + ' | ' + str(s['step']) + ' | ' + str(s['token']) + ' | ' + str(s['logprob']) + ' |\n')
+
+    # ---------- 运行配置 ----------
+    md.write('\n## Test Configuration\n\n')
+    md.write('- **Max Attempts per Combo**: $max_total_attempts\n')
+    md.write('- **Post-Run Wait Time**: $POST_RUN_WAIT_TIME seconds\n')
+    md.write('- **Retry Wait Time (ERROR)**: $RETRY_WAIT_TIME seconds\n')
+    md.write('- **MaxNumBatchedTokens**: Dynamically calculated as MAX_PROMPT_NUMS × 4096\n')
+EOF
+
+echo "Markdown summary: $output_dir/summary.md"
+echo "Detailed logs available in: $output_dir"
+
+# ---------- 打印模型配置汇总 ----------
+echo ""
+echo "========================================"
+echo "Model-Specific Configuration Summary:"
+echo "========================================"
+for model_path in "${model_array[@]}"; do
+    model_short=$(basename "$model_path")
+    echo "  - $model_short: Testing CustomOp modes [${custom_op_modes[*]}]"
+done
+echo "========================================"
+
+# ---------- 打印运行统计信息 ----------
+echo ""
+echo "========================================"
+echo "Run Statistics:"
+echo "========================================"
+echo "  Total Combos: $total_combos"
+echo "  Completed: $current/$total_combos"
+echo "  Max Attempts per Combo: $max_total_attempts"
+echo "  Post-Run Wait: $POST_RUN_WAIT_TIME seconds/run"
+echo "  ERROR Retry: $RETRY_WAIT_TIME seconds"
+echo "========================================"
