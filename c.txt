@@ -1,91 +1,19 @@
-# CANN
-
-从CMC或者昇腾官网下载cann包的：
-
-1. toolkit
-2. nnal
-3. ops
-
-这三个run包，之后依次安装。注意，toolkit包安装后需要立即运行set_env.sh，已激活环境变量。
-
-之后每一步安装都需要在toolkit和nnal的环境变量激活的情况下运行。
-
-```shell
-export cann_path=/mnt/share/x00886548/cann/cann_9_0_0_b160
-cd $cann_path
-
-# 清理之前安装信息，防止报错
-rm -rf /etc/Ascend/ascend_cann_install.info
-
-chmod -R 777 .
-./*toolkit* --install --install-path=$(pwd) -q
-source ./ascend-toolkit/set_env.sh
-
-./*nnal* --install --install-path=$(pwd) -q
-source ./nnal/atb/set_env.sh
-
-./*ops* --install --install-path=$(pwd) -q
-```
-
-# PTA
-
-CMC上获取开发B版本的torch_npu的whl包，pip本地安装即可。或者也可以pip install在线安装商发版本。商发版本安装方式：
-
-```auto
-pip3 install torch==2.10.0+cpu --index-url https://download.pytorch.org/whl/cpu
-pip3 install torch_npu==2.10.0.post4
-```
-
-# Triton
-
-CMC上获取开发B版本的triton-ascend的whl包，pip本地安装即可。或者也可以pip install在线安装商发版本。商发版本安装方式：
-
-```auto
-pip install triton-ascend==3.2.2 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi
-```
-
-# VLLM
-
-git下载vllm源码后，本地下载。
-
-需要export VLLM_TARGET_DEVICE=empty，不然会编译大量GPU相关内容，显著变慢。
-
-需要运行use_existing_torch.py，以使用我们上面安装好的torch等依赖。
-
-```javascript
-cd $workspace_xmz
-mkdir vllm_code
-cd vllm_code
-git config --global http.sslVerify false
+# v1lm
 git clone https://github.com/vllm-project/vllm.git
-cd vllm
-git checkout 967c5c3
-export VLLM_TARGET_DEVICE=empty
+ed vllm
+git checkout 58d3918e3ea0a544ffedadad2ba84559e9c51d8f
+export TORCH_DEVICE_BACKEND_AUTOLOAD-0
+export VLLM_TARGET_DEVICE-empty
+pip install setuptools-rust
 python3 use_existing_torch.py
 pip install -r requirements/common.txt
-pip install setuptools_rust setuptools_scm
 pip install -e . --no-build-isolation
-```
-
-# VLLM-Ascend
-
-git下载vllm_ascend源码后，本地下载。
-
-需要修改requirements.txt和pyproject.toml，把torch, torch_npu, triton_ascend的版本注释掉，以确保使用上面安装的torch等配套版本。
-
-```auto
-cd $workspace_xmz/vllm_code
+cd ..
+# vllm-ascend
 git clone https://github.com/vllm-project/vllm-ascend.git
-cd vllm-ascend/
-git checkout c9a3538
-# 下面两行把torch, torch_npu, triton_ascend的版本注释掉
-vim requirements.txt
-vim pyproject.toml
-pip install -r requirements.txt
-# batch不变性
-export VLLM_BATCH_INVARIANT=1
+ed vllm-ascend
+git checkout 27a94764b5ead50ed3e42ab52a257c2173032750
+pip install -r requirements.txt --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple --trusted-host triton-ascend.osinfra.cn
 export COMPILE_CUSTOM_KERNELS=1
-# 编译VLLM_ASCEND前清理之前的旧中间件
-rm -rf csrc/build build
-pip install -e . --no-build-isolation
-```
+pip install -e . --no-build-isolation --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple --trusted-host triton-ascend.osinfra.cn
+cd ..
