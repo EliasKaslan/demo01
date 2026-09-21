@@ -1,283 +1,571 @@
-# vLLM-Ascend 适配 Kimi-K3 需求详细设计文档
 
-| 项目 | 内容 |
-| --- | --- |
-| 文档名称 | vLLM-Ascend 适配 Kimi-K3 模型需求详细设计文档 |
-| 分析对象 | vllm-ascend `releases/v0.26.0rc` 分支（本地检出：`D:\workspace\code\vllm-code\vllm-ascend_k3`） |
-| 关联模型 | Kimi-K3（moonshotai），本地减层 bf16 权重（`D:\workspace\Kimi-K3减层bf16权重`） |
-| 关联 vLLM 版本 | v0.26.0（commit `d02df748bf9efd99022f1a062597dc3cb3808485`） |
-| 文档状态 | 初稿 |
+## 4. 详细设计
 
----
+### 4.1 配置与模型注册
 
-## 1. 引言
+#### 4.1.1 插件注册链路
 
-### 1.1 编写目的
-
-本文档基于对 vllm-ascend 仓库中 Kimi-K3（下称 K3）适配代码的逐文件分析，说明：
-
-1. Kimi-K3 模型的结构特点及其对推理框架提出的新需求；
-2. vLLM-Ascend 插件如何在昇腾 NPU（Atlas 800 A2 / A3、Ascend 950）上适配并运行 K3，包括模型注册、配置、混合注意力（KDA + MLA）、MoE/SiTU、量化、多模态、前端解析、投机解码、PD 分离等全部适配点的设计与实现；
-3. 如何部署运行该模型：环境准备、编译安装、启动命令、功能/精度/性能验证方法。
-
-预期读者：推理框架开发工程师、昇腾适配工程师、部署与测试工程师。
-
-### 1.2 项目背景
-
-Kimi K3 是月之暗面（Moonshot AI）发布的开源权重原生多模态 Agentic 模型，总参数 2.8T、激活参数 104B，是首个开源的 3T 级模型。它引入了多项 vLLM 主线（v0.26.0）尚未内置的新架构要素：
-
-- **KDA（Kimi Delta Attention）线性注意力**：门控 Delta Rule 类线性注意力，取代大部分 softmax 注意力层；
-- **周期性 Gated MLA**：每隔若干层插入一层带输出门控、无 RoPE 的多头隐式注意力；
-- **AttnRes（Attention Residuals）**：跨层"块残差流"学习加权混合，替代普通单流残差；
-- **Stable LatentMoE**：896 专家 top-16 + 2 共享专家，专家在 3584 维隐空间内计算；
-- **SiTU-GLU 激活**：新的有界门控激活函数；
-- **原生 MXFP4/MXFP8 量化感知训练（QAT）**权重；
-- **MoonViT-V2 视觉编码器**（401M 参数）与 1M token 上下文；
-- **XTML 对话协议**：无 Jinja chat template，由 tokenizer 自带 Python 编码器（`encoding_k3.py`）渲染。
-
-上游 vLLM v0.26.0 仅内置了 K3 的文本前身 `KimiLinearForCausalLM`（`vllm/model_executor/models/kimi_linear.py`），**没有** `KimiK3ForCausalLM` / `KimiK3ForConditionalGeneration` 架构、没有 K3 的 XTML renderer/parser 栈；transformers 也未发布 K3 配置类。因此 vLLM-Ascend 以 **OOT（out-of-tree，插件带外注册）** 方式完成了 K3 的完整适配：主特性提交 `23cfbd5ba`（[Feature][v0.26.0rc] Support Kimi K3 on Ascend, #12950，+35410 行）一次性落地模型、算子、量化、多模态、前端与 KV 传输，后续提交（#13277、#13507、#13509、#13520、#13836、#13989 等）持续补充投机解码、性能融合与前端对齐。
-
-### 1.3 术语与缩略语
-
-| 术语 | 说明 |
-| --- | --- |
-| KDA | Kimi Delta Attention，K3 的线性注意力，gated delta rule 变体，含短卷积与循环状态 |
-| MLA | Multi-head Latent Attention，多头隐式注意力（DeepSeek 系列引入），K3 使用无 RoPE + 输出门控变体 |
-| AttnRes | Attention Residuals，K3 的块残差混合机制（`attn_res_block_size=12`） |
-| Stable LatentMoE | K3 的 MoE 框架：token 先投影到 3584 维隐空间再过专家，专家输出经 RMSNorm 后投影回 7168 维 |
-| SiTU | K3 的激活函数：`β·tanh(x/β)·sigmoid(x)`（gate 支路），up 支路可选 `β_lin·tanh(x/β_lin)` |
-| XTML | K3 的 XML 风格对话标记协议，用 `<|open|>/<|close|>/<|sep|>` 特殊 token 表达 think/response/tools/call 等通道 |
-| DSpark | vLLM-Ascend 的 draft-model 投机解码方案；K3 使用 MLA DSpark（独立稠密 MLA 草稿模型） |
-| MTP | Multi-Token Prediction，多 token 预测（K3 checkpoint 中 `num_nextn_predict_layers=0`，未启用） |
-| MLAPO | MLA Preprocess Only（decode 预处理融合算子，`mla_preprocess_only_decode`），将 Q 重建/权重 NZ 变换等融合为单算子 |
-| FIA | FlashInferAttention 风格的 MLA decode kernel 路径；A5 上支持 FIA split（长 block table 分片 + LSE 合并） |
-| PD 分离 | Prefill/Decode Disaggregation，P 节点算 prefill、D 节点算 decode，KV 经 Mooncake 传输 |
-| ACL Graph | 昇腾上等价于 CUDA Graph 的图执行模式（`cudagraph_mode: FULL_DECODE_ONLY`） |
-| AscendC | 昇腾自定义算子开发语言（csrc 目录下 op_host/op_kernel） |
-| aclnn | 昇腾算子调用接口（CANN NN 加速库调用协议） |
-| Triton-Ascend | 昇腾后端的 Triton（triton-ascend 包），用于写融合 kernel |
-| A2 / A3 / A5 | Atlas 800 A2（910B，soc 220-225）/ Atlas 800 A3（910C，soc 250-255）/ Ascend 950（soc 260，代码中枚举名 A5） |
-| GDN | Gated Delta Net，vLLM 中线性注意力的通用实现基座（KDA 复用其 mamba 类状态管理） |
-| QuaRot | 旋转量化技术；ModelSlim 对 K3 FP4 激活做旋转变换后再 INT4 推理 |
-| NZ / weightnz | 昇腾 FRACTAL_NZ 权重排布（矩阵乘加速格式） |
-
-### 1.4 参考资料
-
-1. vllm-ascend 仓库 `releases/v0.26.0rc` 分支源码（本地：`D:\workspace\code\vllm-code\vllm-ascend_k3`）；
-2. vllm-ascend 官方部署指南 `docs/source/tutorials/models/Kimi-K3.md`（`origin/releases/v0.23.0` 分支，K3 首发版本文档，已提取至本工作区 `_ref_Kimi-K3_deploy_guide.md`）；
-3. vLLM v0.26.0 源码（本地：`D:\workspace\code\vllm-code\vllm`，`vllm/model_executor/models/kimi_linear.py` 等）；
-4. Kimi-K3 模型卡（本地权重目录 `README.md`，含官方模型摘要与评测结果）；
-5. 本地权重 `D:\workspace\Kimi-K3减层bf16权重\config.json`、`modeling_kimi_k3.py`、`modeling_kimi_linear.py`、`encoding_k3.py`、`tokenization_kimi.py`；
-6. 本地环境搭建脚本 `D:\workspace\260909_vllm-ascend_k3\*.sh`（vLLM/vLLM-Ascend 源码编译与验证）；
-7. 本地 `D:\workspace\code\vllm-code\vllm-ascend`（`feat/situ-moe-mlp` 分支，含 SiTU 非量化 MoE 路径修复 `75c1fe22a`，与上游 `7f158640c` 对应）。
-
----
-
-## 2. 需求分析
-
-### 2.1 Kimi-K3 模型结构剖析
-
-#### 2.1.1 官方模型摘要（模型卡）
-
-| 维度 | 参数 |
-| --- | --- |
-| 总参数 / 激活参数 | 2.8T / 104B |
-| 层数 | 93（69 层 KDA + 24 层 Gated MLA，第 0 层为 dense，其余为 MoE） |
-| 隐层维度 / 注意力头数 | 7168 / 96 |
-| KDA 配置 | head_dim=128，short_conv_kernel_size=4，use_full_rank_gate=true，gate_lower_bound=-5.0 |
-| MLA 配置 | kv_lora_rank=512，q_lora_rank=1536，qk_nope_head_dim=128，qk_rope_head_dim=64（保留但不旋转，`mla_use_nope=true`），v_head_dim=128，`mla_use_output_gate=true` |
-| MoE | 896 路由专家 top-16 + 2 共享专家；Latent MoE 维度 3584，每专家中间维 3072；sigmoid 路由 + noaux_tc（无辅助损失，带 e_score_correction_bias），renormalize |
-| AttnRes | attn_res_block_size=12 |
-| 激活函数 | SiTU-GLU（hidden_act="situ"，activation_situ_beta=4.0，activation_situ_linear_beta=25.0） |
-| 词表 / 上下文 | 163840 / 1048576（1M） |
-| 视觉 | MoonViT-V2，27 层，hidden 1024，patch 14，sd2_tpool 2×2 合并，patchmergerv2 投影到 7168 |
-| 量化 | 原生 MXFP4 权重 / MXFP8 激活（QAT）；社区 ModelSlim W4A8 量化版 |
-| 模态 | 文本、图像（vllm-ascend 当前实现不支持视频输入） |
-
-#### 2.1.2 本地减层验证权重（bf16）
-
-`D:\workspace\Kimi-K3减层bf16权重` 为按层裁剪的功能验证版（非精度验证版）：
-
-- `num_hidden_layers=4`：layer0 = dense MLP（`first_k_dense_replace=1`），layer1~3 = KDA（`kda_layers=[1,2,3]`，1-based），layer4（即 idx=3）= MLA（`full_attn_layers=[4]`，1-based；`is_kda_layer` 判定 `(layer_idx+1) in kda_layers`）；
-- 专家规模保留 896/top-16/2 共享，MoE 结构与全量一致；
-- bf16 未量化 → 走 **非量化 MoE MLP 路径**，需要 `7f158640c`/本地 `75c1fe22a` 的 SiTU 修复（原代码在非量化路径对 SiTU 抛 `NotImplementedError`）；
-- 附带完整的 K3 官方 tokenizer/processor/modeling 代码（`tokenization_kimi.py`、`encoding_k3.py`、`kimi_k3_processor.py` 等），`--trust-remote-code` 加载。
-
-#### 2.1.3 KDA 递归公式（recurrent_kda README）
-
-每 token 状态更新（gated delta rule）：
+vLLM 平台插件入口 `vllm_ascend/__init__.py`：
 
 ```text
-S = exp(gate_t) · S                      # 状态衰减
-delta = beta_t · (v_t − S @ k_t)         # delta 修正
-S = S + outer(delta, k_t)                # 状态更新
-o_t = S @ (q_t · scale)                  # 输出
+register()          → vllm_ascend.platform.NPUPlatform（平台接管）
+register_model()    → register_kimi_k3_config()          # 配置注册（先于模型）
+                    → models.register_model()            # OOT 模型注册
+register_connector()/register_model_loader()/...         → 其余扩展点
+_ensure_global_patch() → adapt_patch(is_global_patch=True)  # engine-core 子进程内也生效的全局 patch
 ```
 
-其中 `gate = lower_bound · sigmoid(exp(A_log)·(g + dt_bias))`（safe_gate=True，lower_bound=-5.0），kernel 内做 q/k L2 归一化与 beta sigmoid。状态 S 为每头 `[K,V]=[128,128]` 矩阵（fp32），prefill 用 chunk 并行算法（`chunk_kda_fwd`，chunk_size∈{32,64,128}），decode 用逐步递归（`recurrent_kda`）。
+模型注册（`vllm_ascend/models/__init__.py`，经 `ModelRegistry.register_model`）：
 
-#### 2.1.4 SiTU 激活（vllm_ascend/ops/activation.py）
+| 架构名（checkpoint architectures） | 实现类 | 用途 |
+| --- | --- | --- |
+| `KimiK3ForCausalLM` | `vllm_ascend.models.kimi_k3:AscendKimiK3ForCausalLM` | 纯文本 |
+| `KimiK3ForConditionalGeneration` | `vllm_ascend.models.kimi_k3:AscendKimiK3ForConditionalGeneration` | 原生多模态（本模型卡架构） |
+| `K3DSparkModel` | `vllm_ascend.models.kimi_k3_dspark:K3DSparkForCausalLM` | MLA DSpark 草稿模型 |
+
+**两个架构名的分工**：`AscendKimiK3ForConditionalGeneration` 是多模态外壳（vision_tower + mm_projector + language_model）；其 `__init__` 通过 `init_vllm_registered_model(..., architectures=["KimiK3ForCausalLM"])` **强制**以 K3 名字解析语言模型——即使 text_config 里写的是 `architectures=["KimiLinearForCausalLM"]`，也命中 OOT 注册的 `AscendKimiK3ForCausalLM`；该名字同时服务纯文本直接加载与 DSpark/Eagle 草稿流程复用。`ModelRegistry.register_model` 以架构名为 key 存 `"<module>:<class>"` 惰性字符串（避免导入期初始化设备），OOT 注册与 vLLM 内置 `_MODELS` 走同一机制。
+
+**为什么 OOT**：① transformers/vLLM 上游均未收录 K3，插件携带 config+模型可独立于上游发版迭代；② 规避 checkpoint 远程代码执行（checkpoint 的 auto_map 虽指向仓内 modeling/configuration 代码，插件注册后 vLLM 直接用本地类，安全且可复现）；③ 实现深度绑定 Ascend OOT 算子栈（AscendMLA impl、KDA AscendC kernel、SiTU、AttnRes Triton kernel），经 `CustomOp/PluggableLayer.register_oot` 机制整体替换；④ text config 继承上游 `KimiLinearConfig`（model_type 复用 `kimi_linear`），仅增量添加 K3 字段，最大化复用 KimiLinear 生态。
+
+#### 4.1.2 配置类设计（`transformers_utils/configs/kimi_k3.py`）
+
+设计原则：**transformers 未发布 K3，配置类内置于插件，加载 K3 checkpoint 永不执行 checkpoint 仓的远程模型代码**（`trust_remote_code` 仅用于 tokenizer/processor）。
+
+- `KimiK3TextConfig(KimiLinearConfig)`（model_type=`kimi_linear`，复用上游 KimiLinear 配置基类）：新增 K3 扩展字段——`mla_use_output_gate`、`mla_use_rope`（K3 保留 64 维 q/k 位置切片于权重与 attention scale 中但**不旋转**）、`attn_res_block_size`、`latent_moe_use_norm`、`activation_situ_beta/linear_beta`、`routed_expert_hidden_size`、`topk_method`（默认 noaux_tc）；
+- `KimiK3VisionConfig`（model_type=`kimi_k3_vision`）：将 checkpoint 的 `vt_*` 字段别名为 vLLM 视觉层惯用名（`num_attention_heads`、`num_hidden_layers`、`intermediate_size`、`hidden_size`），使 vLLM 视觉层无需重写 checkpoint 元数据；
+- `KimiK3Config`（model_type=`kimi_k3`，sub_configs=text/vision）：顶层多模态配置；`hidden_size/vocab_size` 等属性代理到 text_config；**quantization_config 提升**——K3 checkpoint 将 `compressed-tensors` 量化配置嵌在 `text_config.quantization_config`，构造时按 model_type 白名单（compressed-tensors/modelslim）提升到顶层，使 vLLM 量化发现逻辑无需感知嵌套结构；
+- `K3DSparkConfig`（model_type=`k3_dspark`）：草稿模型契约，声明 `markov_rank`、`num_target_layers`、`target_hidden_size`、`rope_parameters` 等必备字段，`max_position_embeddings` 默认 32768；
+- 注册函数 `register_kimi_k3_config()`：同时写入 vLLM `_CONFIG_REGISTRY["kimi_k3"]` 与 `AutoConfig.register("kimi_k3", ...)`（`exist_ok=True` 幂等）；`register_k3_dspark_config()` 同理注册 `k3_dspark`。投机配置 patch 模块 import 时也会兜底注册（因该 patch 可能先于模型插件入口加载）。
+
+#### 4.1.3 Processor 适配（`transformers_utils/processors/kimi_k3.py`）
+
+`KimiK3Processor(ProcessorMixin)` 是面向 vLLM 的薄适配层：checkpoint 的图像处理器（`kimi_k3_processor.py`）期望 `{type:"image", image:...}` 媒体字典输入，而 vLLM 传入裸 PIL 图像；该 Processor 负责包装转换并把 tokenizer/image processor 输出合并为 BatchFeature。通过 `cached_get_image_processor` 获取 checkpoint 处理器，`__init__.py` 顶层导出。
+
+### 4.2 文本骨干详细设计（`models/kimi_k3.py`）
+
+#### 4.2.1 类结构与层型划分
 
 ```text
-gate' = β · tanh(gate/β) · sigmoid(gate)          # β = 4.0
-up'   = β_lin · tanh(up/β_lin)                    # β_lin = 25.0（可选）
-out   = gate' · up'
+AscendKimiK3ForCausalLM / AscendKimiK3ForConditionalGeneration
+ └── KimiK3TextModel (@support_torch_compile, EagleModelMixin)
+      └── KimiK3DecoderLayer × num_hidden_layers
+           ├── self_attn: KDA 层（上游类名 KimiGatedDeltaNetAttention，被 OOT 替换）
+           │              或 MLA 层（KimiK3MLAAttention）
+           ├── block_sparse_moe: KimiK3MoE   （layer_idx ≥ first_k_dense_replace 且 layer_idx % moe_layer_freq == 0）
+           │   或 mlp: KimiK3MLP             （dense 层）
+           ├── input_layernorm / post_attention_layernorm (RMSNorm)
+           └── AttnRes 组件: self_attention_res_{norm,proj} / mlp_res_{norm,proj}
 ```
 
-与 SiLU/SwiGLU 的区别：gate 支路用有界 soft-tanh 调制替代无界恒等映射，up 支路再做一次有界 tanh 压缩，抑制 MoE 大规模专家下的激活离群值（"Stable" LatentMoE 的稳定性来源之一）。
+层型判定（KimiK3DecoderLayer.__init__）：
 
-### 2.2 运行环境与硬件需求
+- **KDA 层**：`config.is_kda_layer(layer_idx)`，即 `(layer_idx+1) ∈ linear_attn_config.kda_layers`（config 1-based，层 0-based）。全量模型 69 层 KDA；减层模型 layer0/1/2。
+- **MLA 层**：非 KDA 层即 MLA。注意 `full_attn_layers` 在上游 config 里只被断言非空，**选择逻辑并不读取它**——层型完全由 kda_layers 补集决定（减层配置下两者一致：layer_idx 3 ↔ 1-based 4）。全量 24 层；减层模型 layer3。
+- **dense/MoE**：由 `first_k_dense_replace`（第 0 层 dense）与 `moe_layer_freq=1`（其余全 MoE）决定，与注意力类型正交；MoE 属性名刻意叫 `block_sparse_moe` 以匹配 checkpoint 权重名。dense MLP intermediate=33792。
+- 关键技巧：KDA 层按**上游注册类名** `KimiGatedDeltaNetAttention` 实例化，vLLM 的 PluggableLayer 机制在 NPU 上将其替换为 `AscendKimiGatedDeltaNetAttention`（`utils.py:register_ascend_customop` 注册表 `"KimiGatedDeltaNetAttention": AscendKimiGatedDeltaNetAttention`）——从而免费继承上游的参数布局/权重名/mamba cache 规格，只替换计算实现。MLA 的 `MultiHeadLatentAttentionWrapper` 与视觉 `MMEncoderAttention` 同理按上游名构造、OOT 重定向。
+- 减层 4 层合成结论：L0 = KDA + dense MLP；L1/L2 = KDA + MoE；L3 = MLA + MoE。
 
-| 层级 | 要求（v0.26.0rc 基线） |
+#### 4.2.2 AttnRes（块残差混合）机制
+
+每层维护两条流：`hidden_states`（当前前缀和 prefix_sum）与 `block_residual [tokens, n_blocks, hidden]`（块残差流集合）：
+
+1. 层入口：若已有块残差流，先做一次混合 `hidden = _apply_attention_residual(prefix_sum, block_residual, self_attention_res_proj, self_attention_res_norm)`；
+2. 若 `layer_idx % attn_res_block_size == 0`（每 12 层），把当前 prefix_sum 压入 block_residual（`torch.cat(..., dim=1)`）并置 prefix_sum=None（本层入口值成为新块锚点）；
+3. attention 输出累加进 prefix_sum（**块内主链仍是简单累加**）；MoE 前再做第二次混合（mlp_res_proj/norm）——该混合**总是执行**，B=0 时单流 softmax 权重恒为 1，等效 fp32 往返的恒等；
+4. 模型最后一层之后（last PP rank）还有一次 `output_attn_res_{proj,norm}` 混合 + 最终 RMSNorm。
+
+混合函数 `_apply_attention_residual`：对候选集合 `[block_residual…, prefix_sum]` 共 B+1 条流逐个 RMSNorm 后经标量投影（`ReplicatedLinear(hidden→1)`）打分，`dim=1` softmax 加权求和。Triton 可用时走融合 kernel `apply_attn_res`（`ops/triton/kimi_k3/attention_residual.py`，grid=NPU vector core 数、每 program 顺序处理一段 token，RMSNorm 权重与 [1,H] 投影权重预乘为单向量 w，fp32 内算 cat+norm+score+softmax+weighted-sum），否则回退 `npu_rms_norm(fp32)+matmul+softmax+加权求和` 的 PyTorch 组合。FlashComm 下混合结果经 `torch.ops.vllm.maybe_chunk_residual` 重分片为 TP-local。
+
+PP 语义：`block_residual` 作为 `IntermediateTensors["block_residual"]` 随 hidden_states 跨 PP stage 传递；`initial_block_count()` 计算 start_layer 之前应压入的块残差数量，保证非首 stage 的混合语义正确。
+
+#### 4.2.3 KimiK3MLAAttention（no-RoPE + 输出门控）
+
+构造校验：必须 `mla_use_nope=True 且 mla_use_rope=False`、`mla_use_output_gate=True`，否则抛错（K3 显式 no-RoPE 路径）。
+
+| 组件 | 形状/说明 |
 | --- | --- |
-| 硬件 | Atlas 800 A2（64G×8）/ Atlas 800 A3（64G×16）/ Ascend 950（A5，代码已支持、K3 文档主验证 A2/A3） |
-| 驱动/HDK | 与 CANN 版本配套 |
-| CANN | 9.0.1（A2 发布配套）或 9.1.0-beta.1（源码主线）；本地实测环境 CANN 9.1.0（`/mnt/share/x00886548/cann/cann_9_1_0`，toolkit + nnal/atb） |
-| Python | 3.10~3.12（本地 conda env `xmz_xq_kimi3`，Python 3.10） |
-| PyTorch | torch==2.10.0（CPU 版即可，NPU 能力由 torch-npu 提供）+ torchvision==0.25.0 + torchaudio==2.10.0 |
-| torch-npu | ==2.10.0.post2（requirements 锁定；本地曾用 2.10.0.post4） |
-| triton-ascend | ==3.2.1（requirements 锁定；本地曾用 3.2.2；Atlas 推理型 310P 不支持 triton，需卸载） |
-| vLLM | v0.26.0（`VLLM_TARGET_DEVICE=empty` 源码安装，插件模式接管 NPU 平台） |
-| 编译器 | gcc/g++ > 8，C++17；CMake ≥ 3.26（自定义算子编译） |
-| 显存 | 全量 W4A8：4×A3(16 卡) 起步（DP4/TP16/EP64）；1M 上下文需 ≥8×A3；A2 需 8 节点 DP8/TP8/EP64；减层 bf16 单机多卡即可 |
+| `fused_qkv_a_proj` | `DeepSeekV2FusedQkvAProjLinear(hidden→[q_lora_rank=1536, kv_lora_rank+qk_rope_head_dim=512+64])`，Q 低秩投影与 KV 压缩投影融合为一次矩阵乘 |
+| `q_a_layernorm` / `kv_a_layernorm` | RMSNorm(1536) / RMSNorm(512) |
+| `q_b_proj` | ColumnParallelLinear(1536 → 96×(128+64))，输出含**不旋转的 64 维位置切片** |
+| `kv_b_proj` | ColumnParallelLinear(512 → 96×(128+128))（k_nope + v） |
+| `g_proj` | ColumnParallelLinear(7168 → 96×128)，**输出门**（sigmoid 门控 attention 输出） |
+| `o_proj` | RowParallelLinear(96×128 → 7168) |
+| `scaling` | `(qk_nope_head_dim + qk_rope_head_dim) ** -0.5 = 192^-0.5`（**含 64 维 nope 切片的 scale**，与 checkpoint 训练一致） |
 
-### 2.3 功能需求清单
+对接 Ascend MLA backend：组装 `MLAModules(rotary_emb=None, ...)`（无旋转位置编码），并把 K3 特有字段**动态挂载**到该上游 dataclass（`g_proj`、`use_output_gate=True`、`use_mla_rope=False`）。落地链路：`MultiHeadLatentAttentionWrapper` 按上游名构造 → `PluggableLayer.__new__` 查 OOT 注册表 → 实际实例化 `AscendMultiHeadLatentAttention`（`ops/mla.py`，把 MLAModules 全部模块含动态挂载字段作为 extra kwargs 透传）→ `get_attn_backend(use_mla=True)` 命中 `AscendMLABackend`（名 `ASCEND_MLA`；DCP 时换 `AscendMlaDCPMetadataBuilder/Impl`）→ `AscendMLAImpl` 从 kwargs 读取 g_proj/use_output_gate/use_mla_rope（有门无 g_proj 直接 raise）。forward 经 `torch.ops.vllm.mla_forward`（`direct_register_custom_op` 注册的不透明算子，Dynamo 只见边界不见内部）进入 impl：prefill `npu_fused_infer_attention_score`（TND）+ chunked-context 二段合并，decode `npu_fused_infer_attention_score_v2`（PA）。TP 约束：`num_attention_heads % tp_size == 0`（96 头 → TP∈{1,2,3,4,6,8,12,16,...}）。
 
-| 编号 | 需求 | 说明 | 实现载体 |
+#### 4.2.4 KimiK3MoE（Stable LatentMoE）与 KimiK3MLP
+
+**Stable LatentMoE 数据流**（`KimiK3MoE`）：
+
+```text
+hidden(7168) ─┬─ gate: ReplicatedLinear(7168→896)（router，全宽隐状态打分，
+              │    携带 e_score_correction_bias 参数，noaux_tc）
+              └─ FusedMoE 执行链：
+                   routed_input_transform = routed_expert_down_proj (7168→3584, ReplicatedLinear)
+                   dispatch（在 3584 维隐空间 all-to-all/allgather，通信量减半）
+                   experts: 896 × [3584 →(gate_up 2×3072) SiTU-GLU →(down) 3584]，top-16
+                   combine（3584 维）
+                   routed_output_transform = _KimiRoutedOutputTransform:
+                       routed_expert_norm: RMSNorm(3584)（latent_moe_use_norm=true）
+                       routed_expert_up_proj (3584→7168)
+```
+
+- FusedMoE 构造参数：`hidden_size=3584`（隐空间宽度！）、`intermediate_size=3072`、`scoring_func="sigmoid"`、`renormalize=True`、`use_grouped_topk=True`、`num_expert_group=1`、`topk_group=1`（单组即分组逻辑平凡退化）、`routed_scaling_factor=1.0`、`n_shared_experts=2`、`activation=SituActivationConfig(beta=4.0, linear_beta=25.0)`、`e_score_correction_bias`（896 维可学习偏置，checkpoint 装载）；
+- `_KimiRoutedOutputTransform` 以**非持有引用**包装 norm/up_proj（类注解而非子模块注册）：Dynamo fullgraph 能追踪普通属性访问但不能追踪 `object.__getattribute__`，同时避免 up_proj 参数被重复注册；
+- **共享专家**：`KimiK3MLP(intermediate=3072×2=6144, reduce_results=False)`（2 个共享专家并成一个宽 MLP），作为 `shared_experts=` 传入 FusedMoE，与路由专家在同一执行框架内融合调度（共享专家 DP 与 FlashComm1 序列并行解耦，见 4.12）；上游 `apply_routed_input_transform` 保证 shared 分支吃原始 7168 维、routed 分支吃 3584 维 latent；
+- 路由专家权重量化仅对原生 ModelSlim（quant_config 名 `"ascend"`）生效（`_routed_latent_quant_config`）：latent down/up 投影随专家一起量化，其他量化方案保持 latent 投影为高精度；
+- **dense MLP**（`KimiK3MLP`，layer0 与共享专家复用）：`MergedColumnParallelLinear(gate_up) → act_fn → RowParallelLinear(down)`；`hidden_act="situ"` 时 act_fn 为 `AscendSituAndMul(beta, linear_beta)`（公式见 2.1.4），`"silu"` 时回退 `SiluAndMul`，其余抛错；KimiK3MoE 入口断言 `hidden_act=="situ"`（K3 路由专家必须 SiTU）。
+
+#### 4.2.5 权重加载设计（`AscendKimiK3ForCausalLM.load_weights`）
+
+- `stacked_params_mapping`（在 vLLM 默认映射前追加 K3 专属融合映射）：
+  - `(".fused_qkv", ".q_proj", "q") / k / v`：KDA QKV 融合参数（#13989），checkpoint 分片经标准 QKV loader 打包；
+  - `(".fused_qkv_a_proj", ".q_a_proj", "q_a") / (".kv_a_proj_with_mqa","kv_a")`：MLA 融合投影；
+- MoE 专家映射：`fused_moe_make_expert_params_mapping` 生成 w1(gate)/w2(down)/w3(up) 三条专家映射；`packed_modules_mapping` 同步声明 `experts.w1/w3/w2` 来源，供量化方案识别打包参数；
+- MTP 层跳过：`get_spec_layer_idx_from_weight_name`（**模型文件内本地定义**，非 vLLM 导入）按 `num_nextn_predict_layers` 识别 `layers.{N+i}` 权重并跳过（K3 当前为 0，但保证带 MTP 权重的完整 checkpoint 可被 base 模型安全加载）；
+- NoPE 跳过：rotary embedding 相关权重（inv_freq 等）不加载；
+- 健壮性细节：weights 支持 2/3 元组（第三元素 `loader_kwargs` 透传 weight_loader，服务 DSpark aux 等场景）；`is_pp_missing_parameter` 跳过非本 PP rank 参数；不在 params 的 `.bias` 名跳过；`maybe_remap_kv_scale_name` 处理 fp8 KV scale 重映射；无匹配时 `default_weight_loader` 兜底；返回 `loaded_params` 集合供 loader 校验缺权重；
+- 多模态壳层（ForConditionalGeneration）：`AutoWeightsLoader(self, skip_prefixes=["mm_projector.rot_proj."] if rot_proj is None)` + `WeightsMapper` 前缀重写 `language_model.layers.→language_model.model.layers.`、`mm_projector.proj.0/2→linear_1/2`；A3 ModelSlim 场景加载 `mm_projector.rot_proj`（QuaRot），其余 SoC 以 skip_prefixes 忽略；视觉塔对 compressed-tensors 配置强制忽略（保持 bf16）；`_move_module_to_device` 跳过含 meta 参数的模块以免破坏量化 loader 的延迟物化；
+- causal conv 权重后处理：KDA conv1d 权重在 `process_weights_after_loading` 生命周期内预打包为 `packed_conv_weights`（AscendC 算子要求 `[W, 3*C_local]` 单张量），并在 full/kernel-format checkpoint 重载后保持（见 4.3）。
+
+### 4.3 KDA 线性注意力详细设计（`ops/kimi_kda.py` + AscendC 算子）
+
+#### 4.3.1 OOT 替换与整体分工
+
+上游 vLLM 提供 `KimiGatedDeltaNetAttention`（`vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py`：q/k/v/b/f_a/f_b/g_a/g_b 投影、conv1d、A_log/dt_bias、mamba cache 规格、不透明算子 `torch.ops.vllm.kda_attention`）。vllm-ascend 以 `AscendKimiGatedDeltaNetAttention`（`ops/kimi_kda.py`，713 行）**同接口替换**：
+
+- prefill → AscendC `chunk_kda_fwd`（chunk 并行）；
+- decode/投机 → AscendC `recurrent_kda`（逐 token 递归）；
+- metadata → 复用 `AscendGDNAttentionBackend/Builder`（`ops/gdn_attn_builder.py`，与 Qwen GDN 共用）；
+- 状态管理 → 复用 vLLM mamba cache（conv state + recurrent state，见 4.3.5）。
+
+#### 4.3.2 层前向流程（forward）
+
+1. **序列并行 gather**：`torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, not is_vl_first_layer)`——KDA metadata 与循环状态描述完整序列，且 gate 投影不在 FlashComm SequenceColumnParallelOp 白名单内，故在所有投影前一次性 gather；多模态第 0 层输入已是全长（视觉 token 已并入），不 gather；
+2. **QKV 融合投影**（#13989）：构造期删除上游三个独立 `q_proj/k_proj/v_proj`（ColumnParallelLinear），替换为单个标准 `QKVParallelLinear(hidden, head_dim=128, 96, 96)`（模块名 `fused_qkv`，避免触发 linear 内部二次 gather）；前向 `q,k,v = fused_qkv(h).split([P,P,P], -1)`。MXFP8 量化路径收益：**3×DynamicMxQuant+3×QuantMatmul → 1+1**；checkpoint 的独立 q/k/v 分片经 stacked_params_mapping 走标准 QKV loader 打包，TP 头布局与序列并行 gather 行为不变；
+3. **beta**：`b_proj(h).float().sigmoid()`（Python 侧完成 sigmoid → 算子传 `use_beta_sigmoid_in_kernel=False`）；
+4. **raw gate**：低秩 `f_b_proj(f_a_proj(h))` → `[1,T,H,128]` per-head per-channel 原始衰减门；`A_log` 装载器替换为 `_load_a_log`（兼容 1-D/4-D checkpoint、按 TP 头分片）；
+5. **输出门**（K3 `use_full_rank_gate=true`）：删除上游低秩 g_a/g_b，换成全秩 `g_proj = ColumnParallelLinear(hidden, 128×96)`；
+6. **核心注意力**：经 `torch.ops.vllm.kda_attention(q,k,v,raw_gate,beta,out,prefix)` 回调 `_forward()`（见 4.3.3）；
+7. **norm+gate+输出投影**：`_apply_output_norm_gate()` 优先 Triton 融合算子 `apply_kda_rms_norm_sigmoid_gate(core_out, output_gate, o_norm.weight, eps)`（RMSNorm 与 sigmoid 输出门融合，#13509），无 Triton 回退上游 FusedRMSNormGated；随后 `[1,n,h,d]→[n,h*d]` 过 `o_proj`。
+
+#### 4.3.3 prefill/decode/投机分流（`_forward`）
+
+从 forward_context 取本层 `GDNAttentionMetadata`，截断 ACL Graph padding 后按三路分流：
+
+| 分支 | 条件 | 路径 |
+| --- | --- | --- |
+| 投机（spec） | `spec_sequence_masks is not None` | token 按 `spec_token_indx/non_spec_token_indx` 分组；spec 组 conv1d `run_mode=1`+`num_accepted_tokens`，随后 `_run_recurrent`（`spec_query_start_loc`、2-D `spec_state_indices [seq_num,max_step]`）；`_zero_padded_spec_output` 将 kernel 未覆盖的 padding 行清零，保证 FULL graph replay 输出尾部干净 |
+| 混合 batch | `num_prefills>0 且 num_decodes>0` | 前 `num_decode_tokens` 个 decode token 走 `_run_recurrent`；其余切掉 decode 前缀走 `_run_prefill`；输出 `torch.cat(dim=1)` 拼接 |
+| 纯 decode / 纯 prefill | — | 整体 `_run_recurrent` / `_run_prefill` |
+
+spec 与非 spec 结果用 `index_copy_` 按 token 索引散回 `[1, num_actual_tokens, H, D]`。
+
+**短卷积（kernel_size=4）**：QKV cat 成 `mixed_qkv`（3×C_local 通道）一次卷积。执行 `torch.ops._C_ascend.npu_causal_conv1d_custom(..., activation_mode=1, run_mode)`（绑定 aclnnCausalConv1d）：`activation_mode=1` 即核内 SiLU；`run_mode=0` prefill 整段 / `run_mode=1` decode-update；conv_state 按 `cache_indices` 原地更新，`initial_state_mode` 区分续算/新序列，投机路径带 `num_accepted_tokens` 回滚。conv 权重加载后打包为派生参数 `packed_conv_weights [W=4, 3*C_local]`（q|k|v 顺序 cat，`view(C,W).transpose(0,1)`），hook 在 `process_weights_after_loading` 保证重载后刷新。
+
+#### 4.3.4 prefill 细节（`_run_prefill`，chunk 并行）
+
+1. 前置校验：PCP>1 不支持；`_require_ascendc_prefill_ops()` 检查 `kda_gate_cumsum/chunk_kda_fwd` 算子已编译（否则提示重建 COMPILE_CUSTOM_KERNELS）；
+2. metadata 压缩：用 `prebuilt_metadata.cu_seqlens_kern`（剔除零长段的 host 元组）并以 `keep_meta` 掩码同步过滤 `state_indices/has_initial_state`；
+3. 初始状态：`recurrent_state[state_indices]`（V-first `[S,HV,V,K]`）→ Triton `clear_ssm_states`（无初始状态槽清零）→ `transpose(-1,-2)` 转 K-first `[S,HV,K,V]` fp32；
+4. `q,k = l2norm_fwd(q), l2norm_fwd(k)`（FLA Triton kernel；decode 路径 L2norm 在算子核内完成）；
+5. **gate cumsum**：`torch.ops._C_ascend.kda_gate_cumsum(raw_gate, chunk_size=64, A_log, dt_bias, cu_seqlens, use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, layout="BSND")`——raw gate→log gate 转换（safe gate 公式 `lower_bound·sigmoid(exp(A_log)·(g+dt_bias))`）与 chunk 内时间维 cumsum 全部在 AscendC 核内完成，输出 fp32 `gk`；
+6. **chunk 并行前向**：`torch.ops._C_ascend.chunk_kda_fwd(q,k,v,gk,beta, scale=128^-0.5, chunk_size=64, layout="BSND", initial_state, output_final_state=True, cu_seqlens, chunk_indices)` → `(o, final_state, ...)`；`final_state.transpose(-1,-2)` 散回 V-first cache。`_KDA_CHUNK_SIZE=64` 与算子默认一致。
+
+#### 4.3.5 decode 细节与状态池（`_run_recurrent`）
+
+```python
+torch.ops._C_ascend.recurrent_kda(q, k, v, raw_gate, beta, recurrent_state,
+    cu_seqlens(device), state_indices, A_log.reshape(-1), dt_bias, num_accepted_tokens,
+    scale=head_dim**-0.5, use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
+    use_beta_sigmoid_in_kernel=False, allow_neg_eigval=False,
+    safe_gate=True, lower_bound=-5.0)
+```
+
+单算子内完成：q/k 逐 token L2 归一化并乘 scale、raw→safe log gate、`S=exp(g)·S`、`S+=outer(β(v−S@k), k)`、`o=S@q`（README 公式）。K3 集成要点（README 明示）：
+
+- **容量型状态池** `[state_capacity, HV, V, K]`（`state_v_first=True`），按 packed `[T]` 或投机 `[seq_num,max_step]` 索引**原地更新**，未命中槽位不变——支撑 ACL Graph 整图捕获与 DSpark 回滚（`num_accepted_tokens`）；
+- `cu_seqlens` 为 device 张量，host 不读值（图捕获安全）；相邻差值 ≤8（投机宽度上限）；末项可小于 capacity，padding tail 不保证 → Python 侧 `_zero_padded_spec_output` 兜底；
+- **stride-aware**（#13836）：aclnn 入口保留非连续 state 的 storage/stride/offset，kernel 按真实 stride 直接读写（仅允许 slot/head 外层维有间隔，内部 2-D 状态矩阵行主序稠密）——投机解码按行视图更新单个状态时**免除整状态拷贝**；
+- 精度约束：q/k/v/out 仅 BF16；g/beta FP32/BF16/FP16（aclnn 预处理转 FP32 入核）；`K=128, V=128/256`；`HV % H == 0`，`H/HV ≤ 256`；layout 仅 BSND/TND。
+
+#### 4.3.6 mamba 状态 cache 组织（`ops/kimi_kda_state.py`）
+
+| 状态 | 形状（K3, tp=T） | dtype |
+| --- | --- | --- |
+| conv state | `(3×96×128/T, 4−1+num_spec)`（dim-first 时；否则转置） | mamba_cache_dtype（默认 bf16） |
+| recurrent state | `(96/T, 128, 128)`，语义 V-first `[HV,V,K]` | **fp32** |
+
+`num_spec` 为投机解码在 conv state 上追加的槽位（vLLM 0.23 通用 KDA helper 缺失，此处补齐，与 Qwen GDN 一致）。模型级接线：`get_mamba_state_shape_from_config/get_mamba_state_dtype_from_config/get_mamba_state_copy_func`（`MambaStateCopyFuncCalculator.kda_state_copy_func()`）；cache 池由 vLLM mamba cache manager 分配，槽位索引来自 metadata builder 的 `block_table_tensor[:,0]`（非 spec）、`prefill_state_indices`、`spec_state_indices_tensor`。运行时 `self.kv_cache = (conv_state, recurrent_state)`。
+
+#### 4.3.7 AscendC 自定义算子设计（csrc/attention/）
+
+四个 KDA 算子（chunk_kda_fwd / kda_gate_cumsum / kda_layout_swap12 来自天津大学 BSD-3 贡献；recurrent_kda 为 Huawei Apache-2.0）均注册 `ascend910b / ascend910_93 / ascend950` 三 SoC 配置、支持 aclnn（`aclnnSupport=support_aclnn`、`prebuildPattern=Opaque`），经 `csrc/torch_binding.cpp` 暴露为 `torch.ops._C_ascend.*`，并在 `torch_binding_meta.cpp` 注册 Meta 符号实现（torch.compile/ACL Graph 捕获必需）。
+
+**（1）chunk_kda_fwd —— prefill chunk 并行复合算子**
+
+- 原型：输入 `q/k/v`(FP16/BF16)、`gk`(FP32 已 cumsum log gate)、`beta`(FP32)、`initial_state`(FP32 可选)、`cu_seqlens/chunk_indices`(INT64, ValueDepend)、`stage_*` 中间输入(可选)；输出 `o, final_state, Aqk, Akk, w, u, qg, kg, v_new, h`；属性 `scale/chunk_size(64)/output_final_state/total_chunks/stage(0=单发,1/2/3=分阶段)`；
+- 绑定约束：layout∈{BSND,BNSD,TND,NTD}（TND 要求 H=1，多头 rank3 用 NTD）；chunk_size∈{32,64,128}；q/k/v 同 dtype FP16/BF16；initial_state FP32 `[seq_num,HV,K,V]`；varlen rank4 要求 B=1；`safe_gate=True`/`transpose_state_layout=True` 不支持（gate 转换由 kda_gate_cumsum 负责）；K3 用 `return_intermediate=False`（中间输出为 dummy，只消费 o 与 final_state）；
+- **aclnn 编排是复合流水线**（非单 kernel）：① `KdaLayoutSwap12` 把 BSND 转内部 BNSD（cube 友好）+ gk/beta cast FP32；② stage=1 kernel 算 `Aqk`(q·k 分数)、`Akk`(k·k 分数)、`qg/kg`(gate 加权 q/k)、`v_new`、`w_pre`，`Muls` 乘 scale；③ stage=3 kernel 完成 `(I−Akk)⁻¹` 类下三角求解，产出最终 `w/u`；④ 复用 GDN 的 `ChunkGatedDeltaRuleFwdH` 做跨 chunk 状态扫描，递推每 chunk 状态 `h [B,HV,NT,K,V]` 与 `final_state`；⑤ stage=2 kernel 用 qg/kg/v_new/h 计算输出 `o`；⑥ `KdaLayoutSwap12` 转回 BSND；
+- kernel 实现：基于 **CATLASS**（`Catlass::Gemm::MmadPingpong`）；`__CCE_AICORE__==310`（Ascend 950/arch35）用 `Catlass::Arch::Ascend950`，否则 `AtlasA2`；融合 score 计算与 64×64 三角求解（16×16 对角块、3 次 MCH 迭代，强制 IEEE FP32 cube 模式）；AIC/AIV 间 flag/事件同步；
+- tiling：至多 1024 条序列，varlen 分段信息（seqStart/seqEnd/seqChunkOffset）host 侧展开进 tiling 数据。
+
+**（2）kda_gate_cumsum —— raw gate→log gate + chunk 内累积和**
+
+- 原型：输入 `g`(FP32/FP16/BF16)、`a_log/dt_bias`(FP32 可选)、`cu_seqlens`(INT64 可选)；输出 `gk`(FP32)；属性 `chunk_size(64)/use_gate_in_kernel/safe_gate/lower_bound(-5.0)/layout("BSND")`；
+- 语义：按 (序列,head) 或 (batch,head,chunk) grid-stride；支持 BSND/BNSD/TND/NTD 四种寻址；`use_gate_in_kernel=True` 时核内先做 raw→log gate 转换（`safe_gate=True: gate=lower_bound·sigmoid(exp(A_log)·(g+dt_bias))`；`False: gate=−exp(A_log)·softplus(g+dt_bias)`），再做 chunk 内时间维累积和；varlen 按 cu_seqlens 分段、跨序列不累积；
+- 约束：K≤256；raw-gate 路径要求 safe_gate=True 且 lower_bound∈[−5,0)——与 K3 `gate_lower_bound=-5.0` 精确对应；
+- 定位：Triton `fused_kda_gate` + FLA `chunk_local_cumsum` 两算子的 AscendC 单算子替代，**prefill 专用**（decode 的 recurrent_kda 自带 gate 转换）。
+
+**（3）kda_layout_swap12 —— 布局交换工具算子**
+
+rank3 交换 dim0/dim1、rank≥4 交换 dim1/dim2（BSND↔BNSD）；可选 `dependency` 输入仅用于建立图内依赖边（表达"先写完 A 再读"的流水次序）。Python 侧不直接调用，是 chunk_kda_fwd aclnn 编排的内部搬运积木。
+
+**（4）recurrent_kda —— decode/投机单算子融合递归前向**
+
+- 原型：输入 `query/key/value`(BF16)、`gate/beta`(FP32/BF16/FP16)、`initial_state`(BF16/FP32，**IgnoreContiguous** 允许非连续视图)、`cu_seqlens/ssm_state_indices`(device INT32/INT64)、`A_log/dt_bias`(FP32)、`num_accepted_tokens`；输出 `attn_out`(BF16) + initial_state 原地更新别名 + final_state；属性含 `inplace_final_state(true)/state_v_first/use_qk_l2norm_in_kernel/use_gate_in_kernel/safe_gate/lower_bound` 等；`softsync.flag=true`；
+- Torch 适配层校验：q/k/v 必须 BF16、K=128 且 V∈{128,256}；**保留非连续 state 的 storage/offset/stride 原样传入 aclnn**；固定 `output_final_state=false, inplace_final_state=true, state_v_first=true`——只回写输入 cache、不物化第二份全状态张量；
+- kernel 双版本（按 `__CCE_AICORE__==310` 分派）：均为 AIV-only，任务粒度=(序列,V 分块,head)，K/V 16 对齐，MAX_MTP=8。通用版（910B/910_93）用 UB LocalTensor+Repeat 编程模型（MatVecMul/ReduceSumDispatch，含 K=128 AddFold 优化）；**arch35 版（Ascend 950）**改用 MicroAPI 向量寄存器编程（RegTensor/__VEC_SCOPE__/MaskReg，广播加载 DIST_BRC_B32，寄存器级 ReduceSum64/128，ProcessKQ 将 k/q 两条 matvec 融合为一次行扫描），grid-stride 适配 A5 的 32 vector core，数值语义与通用版一致；
+- **stride-aware 更新（#13836）解决的问题**：K3 状态池是多层/多槽共享大 storage，Python 传入的 recurrent-state 视图常带非零 storage offset 与带 padding 的外层 stride。旧实现 contiguous 化成临时张量再拷回——多一次全状态拷贝且可能写坏相邻槽位。新实现：op def 对 state 加 `IgnoreContiguous`；tiling processor 解析校验 4 维 stride（约束：内层 2 维必须稠密 `stride[3]==1 && stride[2]==denseRow`，仅 slot/head 外层维允许间隔）；kernel 按真实 stride 直接读写原视图；参数序全链（Torch/aclnn/tiling/kernel）对齐；回归测试验证"只有被选中槽位被更新、相邻 storage 不变"。
+
+**（5）支撑算子**：`causal_conv1d`（短卷积，activation_mode=1 核内 SiLU，run_mode 0=prefill/1=decode-update，另有 310P 变体）；`chunk_gated_delta_rule_fwd_h`（GDN 跨 chunk 状态扫描，被 chunk_kda_fwd 复用，K3 主提交同时增强了其 arch20/22/35 epilogue 与调度）；`mla_prolog_v3`（A5 MLA 前处理融合，见 4.4）。
+
+#### 4.3.8 Triton 融合算子设计（triton-ascend）
+
+| 算子 | 位置 | 功能 | K3 调用点 |
 | --- | --- | --- | --- |
-| FR-1 | K3 架构注册 | vLLM v0.26.0 无 KimiK3 架构，需 OOT 注册 `KimiK3ForCausalLM`/`KimiK3ForConditionalGeneration`，并注册 `kimi_k3`/`k3_dspark` 配置类到 transformers AutoConfig 与 vLLM _CONFIG_REGISTRY，不依赖 checkpoint 远程代码 | `vllm_ascend/models/__init__.py`、`transformers_utils/configs/kimi_k3.py`、`vllm_ascend/__init__.py:register_model()` |
-| FR-2 | 混合注意力骨干 | 按 `linear_attn_config.kda_layers/full_attn_layers` 逐层选择 KDA 或 MLA；KDA 走 mamba 类状态管理（HasInnerState/IsHybrid），MLA 走 Ascend MLA backend | `models/kimi_k3.py`、`ops/kimi_kda.py`、`attention/mla_v1.py` |
-| FR-3 | KDA NPU 算子 | chunk prefill / recurrent decode / gate cumsum / layout swap / fused norm-gate 等 AscendC + Triton 算子，支持 ACL Graph 与投机解码所需的状态池索引 | `csrc/attention/*kda*`、`ops/triton/kda/*`、`ops/kimi_kda.py` |
-| FR-4 | MLA no-RoPE + 输出门控 | 保留 64 维 q/k rope 切片但不旋转（scale 按全 192 维计算）、g_proj sigmoid 输出门；MLAPO/FIA-split 在 no-RoPE 下可用（含 A5） | `models/kimi_k3.py:KimiK3MLAAttention`、`attention/mla_v1.py`、`device/device_op.py` |
-| FR-5 | AttnRes 块残差 | 每 12 层压入一个块残差流；每层两次（attn 前、MoE 前）对 {块残差流…, 当前前缀和} 做 RMSNorm+线性打分+softmax 加权混合；Triton 融合 kernel 加速 | `models/kimi_k3.py:_apply_attention_residual`、`ops/triton/kimi_k3/attention_residual.py` |
-| FR-6 | Stable LatentMoE + SiTU | 896 专家 top-16、隐空间 3584 dispatch/combine、共享专家融合、sigmoid+noaux_tc 路由、SiTU 激活贯通 bf16/W8A8/W4A8/MXFP4 各路径 | `models/kimi_k3.py:KimiK3MoE`、`ops/fused_moe/*`、`ops/activation.py`、`csrc/moe/dequant_situ_quant`、`csrc/moe/situ_mx_quant` |
-| FR-7 | 量化支持 | 原生 MXFP4 权重/MXFP8 激活（compressed-tensors）、ModelSlim W4A8（含 QuaRot 旋转、weightnz）、BF16 未量化路径；量化配置发现（text_config 内嵌 quantization_config 提升到顶层） | `quantization/*`、`transformers_utils/configs/kimi_k3.py` |
-| FR-8 | 多模态 | MoonViT-V2 视觉塔（NaViT 动态分辨率、2D 可学习位置编码插值、sd2_tpool 合并、patchmergerv2 投影）、图像占位 token 展开、vision DP（--mm-encoder-tp-mode data） | `models/kimi_k3.py`（视觉部分 + MultiModalProcessor）、`transformers_utils/processors/kimi_k3.py` |
-| FR-9 | 混合 KV Cache | MLA 全注意力 KV 与 KDA conv/recurrent 状态异构共存；prefix caching 需 `mamba_cache_mode=align`；PP 间传递 block_residual | `core/kv_cache_interface.py`、`patch_mamba_config.py`、`ops/kimi_kda_state.py` |
-| FR-10 | XTML 前端 | kimi_k3 renderer（tokenizer Python 编码器渲染，thinking/thinking_effort/tool_choice 校验映射）、reasoning parser（think 通道流式解析）、tool parser（structural tag 约束解码）、tokenizer_mode 自动选择、PD prefill 旁路、Responses API 禁用 | `patch/platform/kimi_k3_*.py`、`patch_kimi_k3_*.py` |
-| FR-11 | 投机解码 | K3 MLA DSpark：独立稠密 MLA 草稿模型（k3_dspark config + K3DSparkForCausalLM），proposer/verify、ACL Graph 辅助状态捕获、KDA 状态按 accepted tokens 回滚 | `models/kimi_k3_dspark.py`、`spec_decode/dspark_proposer.py`、`llm_base_proposer.py`、`patch_speculative_config.py` |
-| FR-12 | PD 分离 | 混合缓存（MLA KV + KDA conv/recurrent state）跨节点传输布局、非等 TP 传输、memcache KV 池（AscendStore）、D 侧 FA-only prefix cache 命中修正 | `distributed/kv_transfer/*`、`patch_kv_cache_coordinator.py` |
-| FR-13 | 并行策略 | TP（注意力头整除约束）+ EP（专家并行，>512 专家 AllGather 回退）+ DP（含 headless 多节点 DP）+ PP（block_residual 随 IntermediateTensors 传递）+ FlashComm1 序列并行 + CPU 绑核 | `ops/fused_moe/*`、`utils.py:enable_sp/shared_expert_dp_enabled`、部署参数 |
-| FR-14 | 性能优化 | KDA QKV 融合量化 linear（3 次动态量化+矩阵乘 → 1 次）、fused norm-gate、attention-residual Triton 融合、stride-aware recurrent 状态原地更新（免整状态拷贝）、MLAPO no-RoPE、A5 FIA split | 提交 #13989/#13509/#13836/#13507 |
+| `kda_rms_norm_sigmoid_gate` | `ops/triton/kda/fused_norm_gate.py`（#13509 新增） | KDA 输出 `RMSNorm(x)·sigmoid(gate)` 单 kernel（FLA layer_norm_gated_fwd_kernel 移植，D≤512 块行版 BT=32 / D>512 单行版）；`direct_register_custom_op` 注册为不透明算子 `torch.ops.vllm.kda_rms_norm_sigmoid_gate`（PrivateUse1 + fake impl，图捕获友好） | `_apply_output_norm_gate()`（HAS_TRITON 时） |
+| 通用 fused norm-gate | `ops/triton/fused_norm_gate.py` | 通用 LayerNorm/RMSNorm+gate（swish/sigmoid、norm_before_gate 两序）；grid-stride 按 `get_vectorcore_num()` 封顶 launch；**UB 预算建模特化**：按 Ascend910 192KB UB、85% 安全系数计算 block 尺寸，K3 `norm_before_gate=False` 路径 gate tile 与 norm tile 同时存活 → `_FWD_MEMORY_MULTIPLIER=6.0`（FLA 原版 3.0） | RMSNormGated 等通用路径（工具函数，不注册 custom op） |
+| `apply_attn_res` | `ops/triton/kimi_k3/attention_residual.py`（#13509 新增） | AttnRes 混合单 kernel：权重预融合 `w=norm_w·proj_w`；两遍循环（①算 B+1 条流 score=Σ(RMSNorm(v)·w)，②softmax(减 max 数值稳定) 加权累加）；token 维按 vector core 数均分；`NB=next_pow2(B+1)` 的 branchless 选择规避非 2 幂 launch 维 | `_apply_attention_residual()`（device=npu 且非空时），用于两处层内混合 + 模型最终混合 + DSpark aux 物化；否则回退 eager（cat→norm→proj→softmax→加权和） |
+| `fused_kda_gate` | `ops/triton/kda/kda.py` | raw→log gate（SAFE_GATE/LOWER_BOUND/HAS_BIAS 编译期分支） | 仅 `gate_lower_bound=None` 的 prefill 分支；K3(-5.0) 下由 AscendC 核内完成 |
+| `l2norm_fwd` | FLA/`ops/triton/kda/l2norm.py` | prefill q/k L2 归一化 | `_run_prefill` |
+| `clear_ssm_states` | `ops/triton/fla/utils.py` | 按 has_initial_state 掩码清零初始状态槽 | `_run_prefill` 首 chunk |
 
-### 2.4 非功能需求
+`ops/triton/kda/` 下保留完整 FLA 风格 Triton KDA 套件（chunk_delta_h/solve_tril/cumsum/fused_recurrent_kda，后者亦支持 ssm_state_indices/num_accepted_tokens）：K3 主路径已被 AscendC 算子取代，Triton 版作为参考实现/回退与 310P 等场景保留。
 
-| 编号 | 需求 | 指标/说明 |
-| --- | --- | --- |
-| NFR-1 | 精度 | 官方验证：OCRBench、MMMU Pro Vision、ToolCall/KVVV（Thinking 模式，reasoning_effort=max，temperature=1.0）；DSpark 接受率冒烟 ~40%（16 专家裁剪权重） |
-| NFR-2 | 性能 | 部署指南基线：8K in/1K out 与 128K in（99% prefix 命中）/1K out（AISBench）；启用 chunked prefill、异步调度、prefix cache、ACL Graph FULL_DECODE_ONLY、FlashComm1、CPU 绑核 |
-| NFR-3 | 长上下文 | 131072（4×A3 混部）/ 262144（8×A2）/ 1048576（≥8×A3，DP8） |
-| NFR-4 | 硬件兼容 | A2/A3 已验证；A5（Ascend 950）代码路径就绪（arch35 kernel、no-RoPE MLAPO、FIA split）；310P 不支持 triton 路径 |
-| NFR-5 | 可维护性 | 所有对 vLLM 核心的 monkey-patch 在 `vllm_ascend/patch/__init__.py` 注释中登记 Why/How/上游 PR/Future Plan，上游合入后可移除 |
+#### 4.3.9 KDA metadata builder（`ops/gdn_attn_builder.py`）
 
-### 2.5 能力差距分析（为什么必须做这些适配）
+`AscendGDNAttentionMetadataBuilder.build()` 为 KDA/GDN 层构造 `GDNAttentionMetadata`（复用上游 dataclass + Ascend 扩展字段），由 `AscendGDNAttentionBackend.get_builder_cls()` 提供（与 Qwen GDN 共用后端）。
 
-| 差距 | 现状（vLLM v0.26.0 / transformers） | K3 需求 | 适配结论 |
-| --- | --- | --- | --- |
-| 模型架构缺失 | registry 只有 `KimiLinearForCausalLM`（文本、无 AttnRes/无输出门/无 LatentMoE 隐空间 dispatch） | 多模态 K3（视觉塔+投影器+占位符展开） | OOT 注册两个新架构，复用 KimiLinear 的 GDN 基座类名触发 PluggableLayer 替换 |
-| 配置类缺失 | transformers 不带 `kimi_k3`/`k3_dspark` model_type；checkpoint 用 auto_map 远程代码 | 不执行 checkpoint 远程代码也能加载（安全+稳定） | 插件内置 Config 类并注册到 `_CONFIG_REGISTRY` 与 `AutoConfig` |
-| KDA 算子缺失 | vLLM 有 GDN triton 路径（kimi_linear），NPU 上无 KDA 专用高性能算子 | chunk/recurrent KDA、gate cumsum、layout swap 均需 NPU 化并支持 ACL Graph/投机解码 | 新增 4 个 AscendC 算子（含 arch35 特化）+ Triton 融合 kernel，torch_binding 注册含 Meta 实现 |
-| MLA 差异 | 昇腾 MLA 路径假定有 RoPE（DeepSeek 系） | no-RoPE + 输出门控 + 12 头（A5 prolog 需 16 头） | mla_v1/device_op 增加 use_mla_rope 开关、g_proj 门控、A5 head padding |
-| MoE 激活缺失 | fused_moe 只支持 silu 等标准激活 | SiTU-GLU + 隐空间 dispatch（3584）+ 896 专家 | activation.py 新增 SituAndMul；FusedMoE 增加 routed_input/output_transform 挂点；非量化路径修复（7f158640c） |
-| 量化格式 | compressed-tensors/ModelSlim 已有框架 | K3 原生 MXFP4/MXFP8 + ModelSlim W4A8（QuaRot 旋转、weightnz、latent 投影量化） | w4a16_mxfp4/w4a8_mxfp4/modelslim_config/compressed_tensors_config 扩展映射 |
-| 前端协议 | vLLM 0.26 无 K3 XTML renderer/parser（上游 #50093/#50420/#50540/#50886 未进 pin 版本） | XTML think/response/tools 通道、reasoning_effort、无 Jinja 模板 | 全套 monkey-patch：renderer/parser/structural tag/media connector，行为对齐上游已合入实现 |
-| 投机解码 | DSpark 框架已有（DeepSeek V4/Qwen3），无 K3 草稿模型 | K3 MLA DSpark 草稿（markov_rank、非因果 draft attention、YaRN） | 新增 K3DSparkForCausalLM + proposer 扩展 + 辅助图捕获 |
-| 混合缓存 PD 传输 | Mooncake/AscendStore 只处理同构 KV | KDA conv/recurrent 状态 + MLA KV 异构、非等 TP | connector 增加 linear_attn_config 分支与 2M 对齐基址恢复 |
+**prefill/decode 划分**：
 
-### 2.6 约束与假设
+- `reorder_batch_threshold`：默认 1（query_len≤1 判 decode）；投机方法 dflash→`1+num_spec`、dspark→`num_spec`；
+- 无投机：`split_decodes_and_prefills` 得 num_decodes/num_prefills，`state_indices = block_table[:,0]`；
+- 有投机：`spec_sequence_masks_cpu` 标记 spec 序列，token 级 `spec_token_indx/non_spec_token_indx`（repeat_interleave + stable argsort），`spec_state_indices_tensor = block_table[:, :num_spec+1]`（每序列多步槽位）；非 spec decode 与 spec 共存时并入 prefill 统计（避免同 batch 混跑两套核）；
 
-1. vLLM 版本被 pin 在 v0.26.0（commit d02df748），所有 patch 以该版本为基线；上游后续合入 K3 前端后（PR #50093 等），插件 patch 需按 `patch/__init__.py` 登记逐项回收；
-2. K3 的 tokenizer/图像处理器契约由 checkpoint 目录内官方 Python 文件（`tokenization_kimi.py`、`encoding_k3.py`、`kimi_k3_processor.py` 等）提供，需 `--trust-remote-code`；TIKTOKEN_CACHE_DIR 建议预热缓存；
-3. TP 大小必须整除注意力头数（96），且影响 KDA 状态布局与专家放置；
-4. 视频输入不支持（当前仅图像）；Responses API 对 K3 显式禁用（仅 Chat Completions）；
-5. 自定义算子编译（COMPILE_CUSTOM_KERNELS=1）需 gcc>8/C++17，A3 构建需 git submodule（CANN 算子依赖库）；构建产物与 SoC 绑定（`check_ascend_device_type` 会校验运行时芯片与编译目标一致）。
+**chunked prefill 边界处理（K3 关键）**：
 
----
+1. `_treat_single_token_prefills_with_state_as_decodes`：chunked prefill 最后一个 chunk 只剩 1 token 且序列已有状态时重分类为 decode——使其 replay 与普通 decode 相同的固定图；
+2. `_fold_spec_sized_prefill_chunks_into_spec`：投机开启时，恰好 `num_spec+1` token 且有状态的 prefill chunk 与 spec decode 行形状一致，折叠进 spec 路径（`num_accepted_tokens=num_spec+1`），同样为整图 replay；
+3. `_build_non_spec_chunked_prefill_metadata`：产出 `GDNChunkedPrefillMetadata`——`cu_seqlens_host`（host 元组，供 AscendC `int[]` 属性）+ device 版；`chunk_indices_chunk64_host`（按 chunk_size=64 展平的 (seq_id, chunk_id) 对，chunk_kda_fwd 直接消费）；`num_decodes`（cu_seqlens 中长度恰为 1 的段数，供混合 batch 切分 decode 前缀）；`cu_seqlens_kern/keep_meta`（`_compact_empty_segments` 剔除 graph padding/DP idle 产生的零长段，keep_meta 同步过滤 state_indices/has_initial_state）；
+4. prefill 附属：`prefill_query_start_loc/prefill_cache_indices/prefill_state_indices/prefill_has_initial_state(=context_lens>0)`。
 
-## 3. 总体设计
+**conv1d metadata**：`GDNCausalConv1dMetadata(query_start_loc, cache_indices, initial_state_mode)` 挂 prefill/decode；spec 用 `GDNSpecCausalConv1dMetadata(..., num_accepted_tokens)`。
 
-### 3.1 适配架构总览
+**ACL Graph（FULL）支持**：非 spec decode 固定缓冲 padding（多余槽填 NULL_BLOCK_ID、query_start_loc 尾部重复末值构成零长序列）；无 spec 请求 replay 时重置 spec 分支输入（防 DP idle dummy 重放上一请求的 state indices 污染 mamba checkpoint）；spec padding 行 `num_accepted_tokens=1`。
 
-```text
-┌────────────────────────────────────────────────────────────────────────┐
-│                        OpenAI 兼容 API (vllm serve)                     │
-│  Chat Completions ── KimiK3Renderer(XTML, tokenizer Python encoder)     │
-│                  ── KimiK3Parser = KimiK3ReasoningParser + ToolParser    │
-│                     (structural tag 约束解码, thinking_effort 校验)       │
-├────────────────────────────────────────────────────────────────────────┤
-│                          vLLM v0.26.0 core (pin)                        │
-│  EngineCore/Scheduler/KVCacheManager  ModelRegistry(OOT注册)             │
-│  FusedMoE / MultiHeadLatentAttentionWrapper / GDN(mamba) 基座            │
-│  SpeculativeConfig(DSpark) / MultiModal Registry                         │
-├────────────────────────────────────────────────────────────────────────┤
-│                    vllm-ascend 插件 (v0.26.0rc + K3)                    │
-│  models/kimi_k3.py        ── AscendKimiK3ForCausalLM / ForConditionalGen │
-│  models/kimi_k3_dspark.py ── K3DSparkForCausalLM (MLA 草稿)              │
-│  transformers_utils/      ── KimiK3Config/TextConfig/VisionConfig        │
-│                               K3DSparkConfig / KimiK3Processor           │
-│  ops/kimi_kda.py          ── AscendKimiGatedDeltaNetAttention (OOT替换)   │
-│  ops/fused_moe/*          ── SiTU/LatentMoE/EP/共享专家DP                 │
-│  attention/mla_v1.py      ── no-RoPE MLA + 输出门控 + FIA split           │
-│  patch/platform/*         ── renderer/parser/media/spec-config patch      │
-│  distributed/kv_transfer  ── 混合缓存 PD 传输 (Mooncake/AscendStore)       │
-│  ops/triton/*             ── fused_norm_gate / attention_residual 融合    │
-├────────────────────────────────────────────────────────────────────────┤
-│              csrc 自定义算子 (AscendC, COMPILE_CUSTOM_KERNELS=1)          │
-│  chunk_kda_fwd | recurrent_kda | kda_gate_cumsum | kda_layout_swap12     │
-│  dequant_situ_quant | situ_mx_quant | chunk_gated_delta_rule_fwd_h        │
-│  (torch_binding.cpp 注册 + Meta 符号实现, 支持图捕获/编译)                  │
-├────────────────────────────────────────────────────────────────────────┤
-│      CANN 9.0.1/9.1.0 (toolkit + nnal/atb) + torch-npu + triton-ascend   │
-│      Atlas 800 A2 (910B) / A3 (910C) / Ascend 950 (arch35)               │
-└────────────────────────────────────────────────────────────────────────┘
+#### 4.3.10 全局 inputs_embeds 判定（`uses_kimi_k3_global_inputs_embeds`）
+
+```python
+enable_prompt_embeds → True
+非 VL 模型或无 multimodal_config → False
+否则 enable_mm_embeds 或 limit_per_prompt("image")>0 → True
 ```
 
-### 3.2 关键设计策略
+作用：静态判定本部署下 K3 第 0 层 decoder 是否收到**全局全长 inputs_embeds**（多模态 embedding 在 FlashComm token 分片建立之前构建完毕；第 0 层全长、其后各层 TP 分片）。消费点：KDA 层与 KimiK3DecoderLayer 的 `is_vl_first_layer`（init 期常量，使 Dynamo/torch.compile 将分支固化为编译期常量，不破坏整图捕获）→ 第 0 层跳过 all-gather、输出 buffer 取全尺寸、残差流经 `maybe_chunk_residual` 切回分片。
 
-1. **OOT 注册而非修改 vLLM**：K3 模型、配置、processor 全部通过 vLLM 插件机制（`ModelRegistry.register_model`、`_CONFIG_REGISTRY`、`AutoConfig.register`）注入，vLLM 本体零修改；对 vLLM 行为差异（前端、投机配置、KV 协调器）用集中登记的 monkey-patch（`patch/platform/*`）弥合，并标注上游 PR 与移除计划。
-2. **复用 GDN 基座 + PluggableLayer 替换**：KDA 层按上游注册类名 `KimiGatedDeltaNetAttention` 实例化，由 `register_ascend_customop` 将其替换为 `AscendKimiGatedDeltaNetAttention`（`ops/kimi_kda.py`），从而复用 vLLM 的 mamba 状态管理（cache 分配、copy func、prefix caching）而只重写计算路径。
-3. **chunk/recurrent 双路径 + 容量型状态池**：prefill 用 chunk 并行算子，decode 用递归算子；状态池按容量组织、以 device 端索引寻址（packed `[T]` 或投机 `[seq_num,max_step]`），host 不读设备值 → 兼容 ACL Graph 捕获与 DSpark 回滚（`num_accepted_tokens`）。
-4. **隐空间 MoE**：FusedMoE 挂 `routed_input_transform`（7168→3584 down_proj）与 `routed_output_transform`（norm+up_proj 3584→7168），使 dispatch/combine 通信量减半，专家在 3584 维隐空间计算（Stable LatentMoE 语义与 checkpoint 权重形状一致）。
-5. **算子融合优先，纯 PyTorch 兜底**：Triton 可用时走 fused norm-gate / attention-residual / SiTU 融合路径，不可用时回退 torch_npu 组合算子（`HAS_TRITON` 分支），保证 A2/A3/310P 兼容面。
-6. **量化路径分层**：原生 MXFP4（compressed-tensors）与 ModelSlim W4A8（QuaRot + weightnz + dequant_situ_quant 融合）分别映射；latent 投影仅在 ModelSlim（quant_config 名 "ascend"）下量化；视觉塔对 compressed-tensors 配置强制忽略（保持 bf16）。
-7. **前端对齐上游语义**：XTML 协议常量、reasoning/tool parser、renderer 行为以"上游已合入 PR"为准绳（#13520 复核 vLLM main d8f840071），未合入语义不提前实现，降低后续升级成本。
+### 4.4 MLA 全注意力详细设计（no-RoPE / 输出门控 / MLAPO / FIA split）
 
-### 3.3 代码组织与模块划分
+#### 4.4.1 no-RoPE 处理（`attention/mla_v1.py`）
 
-| 模块 | 路径 | 职责 |
+K3 MLA 的特殊性：checkpoint 保留 64 维 q/k "位置切片"（`qk_rope_head_dim=64`）且 attention scale 按总 head 维 192 计算（`192^-0.5`），但**不做任何旋转**（`mla_use_rope=False`）。适配设计：
+
+- **builder 侧**：`use_mla_rope = getattr(hf_text_config, "mla_use_rope", True)`；cos/sin 提供器二选一——`get_cos_and_sin_mla`（rope 模型查 rotary cache）或 `get_identity_cos_and_sin_mla`（**恒等缓冲：cos=全 1、sin=全 0**，`ops/rotary_embedding.py`）。恒等缓冲保持形状契约 `[max_num_batched_tokens,1,1,64]` 不变，使下游所有融合算子（FIA、prolog）无需感知 no-RoPE；
+- **impl 侧三处旁路**（AscendMLAImpl）：
+  1. `rope_single()`：no-RoPE 直接 `return x`——因为 `npu_interleave_rope` 即使 cos=1/sin=0 也会把维度重排成 interleave 序，而 K3 的 q_pe/k_pe 必须保持原始切片顺序；
+  2. `exec_kv_prefill/decode()`：no-RoPE 走 `_exec_kv_no_rope()`——split 出 `kv_c [T,1,512]` 与 `k_pe [T,1,64]` → `kv_a_layernorm` → `DeviceOperator.reshape_and_cache`（npu_scatter_pa_kv_cache）写分页 cache，**绕过 rope 专用融合算子 `npu_kv_rmsnorm_rope_cache`**；
+  3. q 路径不变：`mla_preprocess_prefill` 仍按 `[128, 64]` split 出 q_nope/q_pe，只是 q_pe 不过 rope；decode 的 `_q_proj_and_k_up_proj` 做 `q_nope @ W_UK_T`（吸收进 latent 空间）+ q_pe 原样；
+- **注意力执行与 DeepSeek 共用**：prefill `npu_fused_infer_attention_score`（TND，nope+pe 双通道 query_rope/key_rope）；chunked context 用 kv_cache_load + kv_b_proj 展开 + `npu_attention_update` LSE 合并；decode 走 FIA PA 路径；num_heads 非 2 幂时 pad（96→`num_heads_padded`）；
+- **输出门控（K3 特有）**：`use_output_gate=True` 时先 `gate = g_proj(maybe_all_gather(hidden_states))`（**必须先 gather token 再投影**，否则 TP 头分片错误拼接），attention 输出 `o_proj_input.mul_(sigmoid(gate))` 后过 o_proj；
+- 与标准 DeepSeek MLA 差异小结：(a) 无 rotary cache 查表/rope 权重转换，cos/sin 恒等；(b) rope_single 旁路防 interleave 重排；(c) KV 写 cache 用通用 reshape_and_cache；(d) 增加 sigmoid 输出门；(e) scale 公式不变（192^-0.5）。
+
+#### 4.4.2 MLAPO（MLA decode 前处理融合）与 A5 no-RoPE 支持（#13507）
+
+MLAPO 将 decode 阶段 `q_a 降投影→RMSNorm→q_b 升投影拆 nope/pe→ql_nope=q_nope@W_UK_T→kv_a 降投影→RMSNorm→(RoPE)→写 KV/KR paged cache(可选量化)` 整链融合为单算子，减少 decode 关键路径 kernel 数。开关 `VLLM_ASCEND_ENABLE_MLAPO`（默认 1）；非 A5 还要求 PD 分离 decode-only 实例，A5 只看配置。触发：`num_decode_tokens ≤ 1024 且 num_prefills == 0`。
+
+| 设备 | 路径 | K3 no-RoPE 支持 |
 | --- | --- | --- |
-| 模型实现 | `vllm_ascend/models/kimi_k3.py`（1736 行） | K3 文本骨干 + 视觉塔 + 多模态 processor + 权重加载 |
-| 投机草稿 | `vllm_ascend/models/kimi_k3_dspark.py`（573 行） | K3 MLA DSpark 草稿模型 |
-| 配置 | `vllm_ascend/transformers_utils/configs/kimi_k3.py` | KimiK3Config/TextConfig/VisionConfig/K3DSparkConfig + 注册 |
-| Processor | `vllm_ascend/transformers_utils/processors/kimi_k3.py` | 图像→checkpoint processor 的薄适配层 |
-| KDA 编排 | `vllm_ascend/ops/kimi_kda.py`（~700 行）、`kimi_kda_state.py` | Ascend OOT KDA 层实现 + 状态形状 |
-| GDN 元数据 | `vllm_ascend/ops/gdn_attn_builder.py` | KDA prefill/decode/chunked 元数据构建 |
-| MLA | `vllm_ascend/attention/mla_v1.py`、`device/device_op.py`、`ops/mla.py` | no-RoPE MLA、MLAPO、FIA split |
-| MoE | `vllm_ascend/ops/fused_moe/*`、`ops/activation.py` | SiTU、LatentMoE、EP/DP、量化 MoE 流水线 |
-| Triton 融合 | `vllm_ascend/ops/triton/kda/*`、`triton/kimi_k3/*`、`triton/fused_norm_gate.py` | norm-gate、attention-residual 融合 kernel |
-| AscendC 算子 | `csrc/attention/{chunk_kda_fwd,recurrent_kda,kda_gate_cumsum,kda_layout_swap12}`、`csrc/moe/{dequant_situ_quant,situ_mx_quant,chunk_gated_delta_rule_fwd_h}` | KDA/SiTU 自定义算子（含 arch35 特化） |
-| 算子绑定 | `csrc/torch_binding.cpp`、`torch_binding_meta.cpp` | torch.ops 注册 + Meta 符号实现（图捕获） |
-| 量化 | `vllm_ascend/quantization/{modelslim_config,compressed_tensors_config,methods/w4a16_mxfp4,methods/w4a8_mxfp4}.py` | K3 量化映射 |
-| 前端 patch | `vllm_ascend/patch/platform/{kimi_k3_parser,kimi_k3_reasoning_parser,kimi_k3_tool_parser,kimi_k3_structural_tag,kimi_k3_protocol,patch_kimi_k3_parsers,patch_kimi_k3_renderer,patch_media_connector}.py` | XTML 前端全栈 |
-| 投机 patch | `vllm_ascend/patch/platform/patch_speculative_config.py`、`spec_decode/{dspark_proposer,llm_base_proposer}.py` | DSpark 配置归一化与 proposer |
-| KV 传输 | `vllm_ascend/distributed/kv_transfer/*`、`patch_kv_cache_coordinator.py` | 混合缓存 PD 传输 |
-| 测试 | `tests/ut/models/test_kimi_k3*.py`、`tests/ut/ops/test_kimi_kda.py`、`tests/ut/patch/platform/test_patch_kimi_k3_*.py`、`tests/e2e/nightly/single_node/ops/*kimi_k3*` | UT + 单卡算子 e2e |
+| Base（910B 系，A2/A3） | fa-quant：`npu_dynamic_quant + npu_mla_prolog_v2`；W8A8：自研 `torch.ops._C_ascend.mla_preprocess`（NZ 权重 + `trans_rope_weight` 列重排） | 基类不区分 no-RoPE（K3 no-RoPE MLAPO 仅 A5） |
+| A5（Ascend 950，A5DeviceAdaptor） | 激活量化（native BF16 跳过；否则 `npu_dynamic_mx_quant`→FP8_E4M3+e8m0）→ prolog：rope 模型调 torch_npu `npu_mla_prolog_v3`；**no-RoPE 调自研 `torch.ops._C_ascend.npu_mla_prolog_v3`（cos/sin=None ⇒ 由参数空值推导禁用 RoPE）** | ✅ #13507 新增：`use_mla_rope` 透传；BF16 未量化权重支持（weight_quant_mode=0，仅 NZ 排布，无量化 scale；此前非量化层直接禁用 MLAPO）；**12→16 头 padding**（K3 TP8 每 rank 12 头，A5 prolog 要求 2 幂：`weight_uq_qr`/`W_UK_T` pad 到 16 头，prolog 后 `reorg_decode_q` 裁回 12） |
 
-### 3.4 关键提交清单（releases/v0.26.0rc）
+#### 4.4.3 A5 FIA split（实验特性）
 
-| 提交 | PR | 内容 |
-| --- | --- | --- |
-| `23cfbd5ba` | #12950 | **主特性**：K3 全量支持（模型/KDA 算子/量化 MoE/多模态/前端/KV 传输/FIA split/GQA DSpark 基础），+35410 行 |
-| `a2e0f489b` | #13277 | K3 **MLA DSpark** 投机解码（草稿模型、proposer、ACL Graph 辅助捕获、prefix cache/PD/QuaRot 兼容修复） |
-| `1dd9e54ac` | #13520 | K3 前端**对齐上游**（reasoning 流式增量扫描、随机 tool-call ID、named tool choice、tokenizer_mode 自动选择） |
-| `5d401ca73` | #13507 | A5 **no-RoPE MLAPO**（BF16 未量化权重 NZ prolog、12→16 头 padding） |
-| `d64087c06` | #13509 | **Triton 融合**：KDA fused norm-gate + K3 attention-residual |
-| `b4780581f` | #13989 | KDA **QKV 融合**为单个量化 linear（MXFP8 路径 3 次量化+matmul → 1 次） |
-| `15e1109a5` | #13836 | recurrent_kda **stride-aware** 状态原地更新（免整状态拷贝，支持非连续 cache 视图） |
-| `7f158640c` | — | **SiTU 非量化 MoE MLP 路径修复**（原抛 NotImplementedError；本地 `feat/situ-moe-mlp` 分支同源修复 `75c1fe22a`） |
-| `bc975f29e`/`842c8a9da` | #13467/#12850 | MLA preprocess **RoPE 开关**（no-RoPE 前置依赖） |
-| `504c4a92d` | #13422 | mla_prolog_v3 支持首轴非连续 kv/kr cache |
-| `fa1117abc` | #13733 | SiTU + 动态 EPLB + W4A8 量化映射 |
-| `3bb3c9bab`/`5cf0420ab`/`3c00e6fbd` | #12952/#13037/#13143 | K3 部署指南（A3/A2 拓扑，v0.23.0 分支文档） |
+`VLLM_ASCEND_MLA_FIA_SPLIT=1`（仅 A5）：把长 decode block table 按 `MLA_FIA_SPLIT_TARGET_BATCH=32` 切成 batch-major 分片并行跑 FIA，再用 `npu_attention_update` 合并（最多 16 路 Local LSE/Output 输入）。默认关闭，需精度/性能门槛验证后开启。另有 `mla_prolog_v3` 支持首轴非连续 kv/kr cache（#13422），消除 K3 混合 cache 布局下的额外拷贝。
+
+### 4.5 MoE（Stable LatentMoE）与 SiTU 激活详细设计
+
+#### 4.5.1 SiTU 激活的完整定义与设计动机
+
+参考实现（`ops/activation.py::situ_and_mul`，fp32 中间精度）：
+
+```python
+gate, up = x.to(float32).chunk(2, dim=-1)     # w13=[gate;up] 布局（activate_left=true）
+gate = beta * tanh(gate / beta) * sigmoid(gate)   # β=4.0：软截断门控
+if linear_beta is not None:
+    up = linear_beta * tanh(up / linear_beta)     # λ=25.0：up 支路软截断
+return (gate * up).to(x.dtype)
+```
+
+数学本质：**双支 tanh 软截断的 SwiGLU**——gate 支把 SiLU 的线性因子换成 `β·tanh(gate/β)`（小信号≈gate、大信号饱和 ±4），up 支再压到 ±25；β,λ→∞ 时严格退化为 SwiGLU。价值：输出幅值有界、动态范围收窄 → 压制 MoE 大规模专家下的激活 outlier，使 GMM1→GMM2 之间的 per-token int8（max/127 对称）或 MXFP8（E8M0 块）激活量化误差可控（"Stable" LatentMoE 的稳定性来源）。K3 常量 β=4.0/λ=25.0 固化在 `csrc/moe/kimi_k3_situ_quant_cases.json`。
+
+**SiTU 配置注入技巧**（`patch/platform/patch_fused_moe.py::_ascend_FusedMoE`）：上游 vLLM 只认内建激活名（并据此判断专家权重是否 gated）。拦截 FusedMoE 工厂——`activation` 为 `SituActivationConfig` 时，真实配置放入 `runner_args["runtime_activation"]`，传给上游的 activation 改成 `"silu"`（SiTU 与 SiLU 同为 [gate;up] gated 布局，形状语义一致）；AscendMoERunner 执行时用 `self._ascend_runtime_activation or self.activation` 覆盖。
+
+#### 4.5.2 SiTU 三条执行路径（`ops/fused_moe/moe_mlp.py::unified_apply_mlp` 分派）
+
+| 路径 | 触发 | 执行链 | 融合算子 |
+| --- | --- | --- | --- |
+| **bf16 未量化**（QuantType.NONE，本地减层权重场景） | `unquant_apply_mlp` | GMM1(bf16, 可 EPLB TensorList/通信融合) → `situ_and_mul` 参考实现 → GMM2(bf16) | 无（7f158640c 修复：原误抛 NotImplementedError"SiTU requires a fused quantization path"，现直接调参考实现——该路径激活后无量化步骤，无需融合；与 dense/共享专家 MLP 的 AscendSituAndMul 同一实现，数学一致） |
+| **W8A8/W4A8 int**（ModelSlim，A2/A3） | `quant_apply_mlp → _w4a8_situ_apply_mlp` | 输入量化（复用 dispatch 已量化 int8 或 npu_dynamic_quant）→ GMM1（int8×int4-packed，scale_bias 零点修正，输出 bf16）→ **`dequant_situ_quant`**（反量化→SiTU(fp32, 向量 Tanh/Exp 指令)→per-row 动态 int8 量化，一次读入一次写出）→ GMM2（per_token_scale） | `torch.ops._C_ascend.dequant_situ_quant`（INT32/BF16 入、INT8+FP32 scale 出；K3 专用 tiling 分支 DSQ_INT32_DYNAMIC=30000/DSQ_BF16_DYNAMIC=40000；仅 910b/910_93，**不支持 950**） |
+| **W4A8MXFP/W8A8MXFP**（原生 MXFP4，A5） | 同上 `use_mxfp_quant=True` | GMM1（MXFP4 NZ 权重+E8M0 scale，强制输出 bf16）→ **`situ_mx_quant`**（SiTU→OCP MX 动态量化：FP8_E4M3FN + E8M0 mxscale，32 元素块、`[ceil(H/64),2]` 成对交错布局，匹配 npu_grouped_matmul scale 排布）→ GMM2（fp8×fp4，e8m0 scale） | `torch.ops._C_ascend.situ_mx_quant`（**仅 ascend950/arch35**：Regbase 动静统一编译、AIV-only、MicroAPI 寄存器指令；tanh 双路径近似——|x|<0.6 九次多项式 FMA Horner、|x|≥0.6 用 `2·sigmoid(2x)−1` 分解） |
+
+**能力边界**（`quant_apply_mlp` 显式校验）：SiTU 不支持 W4A16MXFP（激活无量化可融合）；不支持 antiquant offset（laos W4A4）；FUSED_MC2/mega_moe/dispatch_ffn_combine 大融合算子只支持 swiglu 系激活 → SiTU 时回退通用 dispatch→mlp→combine；`grouped_matmul_swiglu_quant(_weight_nz)` 融合链同样绕开。
+
+#### 4.5.3 latent 空间与专家权重形状
+
+`routed_expert_hidden_size=3584`（latent 宽度，专家输入/输出维）与 `moe_intermediate_size=3072`（FFN 中间维）**不是同一维度的冲突**：
+
+- 每专家逻辑权重：gate(w1) `[3072,3584]`、up(w3) `[3072,3584]` → `w13_weight=[E_local,6144,3584]`；down(w2) `[3584,3072]` → `w2_weight=[E_local,3584,3072]`；
+- GMM1：K=3584、N=6144；GMM2：K=3072、N=3584；
+- 量化打包后：MXFP4 `w13 [E,6144,1792] uint8`（2×fp4 打包）+ scale `[E,6144,112] E8M0`；int4 ModelSlim w13 view 成 int32 `[E,6144,896]`；
+- TP 切 intermediate 维、EP 切专家维；`kimi_k3_situ_quant_cases.json` 佐证 routed 情形 tp_invariant=true（ep64 下本地 14 专家、M=65×14=910 行）；
+- latent 变换的**应用位置在上游 vLLM** `MoERunner.forward`：`apply_routed_input_transform`（得到 latent 3584 routed 输入 + 原始 7168 shared 输入）→ Ascend `shared_forward_impl` → combine 后 `apply_routed_output_transform`（norm+up_proj 回 7168）→ 与 shared 输出相加；vllm_ascend 仅在构造时透传两个 transform；
+- **路由在原始 7168 维上打分**（gate ReplicatedLinear 半精度/全精度运行，latent 压缩只作用于专家计算）。
+
+#### 4.5.4 noaux_tc 路由实现
+
+`topk_method="noaux_tc"` 只是配置字段（运行时无代码读取），行为由展开参数决定：`scoring_func="sigmoid"` + `renormalize=True` + `e_score_correction_bias`（896 维可学习偏置，checkpoint `gate.e_score_correction_bias` 装载，与上游 KimiLinear KimiMoE 同构）+ 单组（group=1/1，无分组偏置效果）+ `routed_scaling_factor=1.0`。
+
+执行位置是 **vllm_ascend 自研 `experts_selector.py::select_experts`**（非复用 vLLM）：`check_npu_moe_gating_top_k` 判定 K3 形态可融合 → `DeviceOperator.moe_gating_top_k(k=16, group_count=1, renorm=1, norm_type=1(sigmoid), bias_opt=e_score_correction_bias)`：
+
+- A2/A3：自研 AscendC 算子 `torch.ops._C_ascend.moe_gating_top_k`（without_group/generalized/e_k_fullload 三 kernel + hash 变体）。**自研动机**：`torch_npu.npu_moe_gating_top_k` 只支持 group_count=256 模式，无法覆盖 896 专家一般形态；
+- A5：走 `torch_npu.npu_moe_gating_top_k`（注意：固定传 renorm=0，仅 softmax 时 Python 侧补归一化——sigmoid+renormalize 组合依赖 torch_npu 内部处理，为已识别的复核点）；
+- torch.compile 全图下用 `torch.ops.vllm.select_experts` 保持可 trace；回退 `_native_select_experts`（sigmoid→+bias→topk→renorm→×scaling）。原生 grouped-topk 回退路径严格保持 noaux_tc 语义：**加 bias 的分数仅用于选 top-k id，路由权重回取原始无偏 sigmoid 分数（`original_weights.gather`）再归一化**。
+
+**896 专家的通信约束**：A2 上 `num_experts>512` 强制 `MoECommType.ALLGATHER` 回退（MC2/gating 融合链不支持 >512 专家）——即主提交的 "greater-than-512-expert AllGather fallback"；大 EP 部署建议 A3/A5。动态 EPLB：#13733 放开 SiTU+动态 EPLB 共存（`_w4a8_situ_apply_mlp` 支持 TensorList 沿 dim0 cat），并在 EPLB 适配器补 W4A8 权重名映射（w13/w2_weight_list + scale_list + scale_bias_list）。
+
+#### 4.5.5 共享专家与路由专家的并行/融合
+
+- 共享专家是**独立 `KimiK3MLP`**（checkpoint 中 2 个共享专家本就融合为一份 6144 宽 MLP），以 `shared_experts=` 传入 FusedMoE，由 AscendMoERunner 持有；输入为原始 7168 维（与路由 gate 同源），输出 `reduce_results=False` 延迟归约；
+- **双流事件级重叠**（`multistream_overlap_shared_expert`）：shared 在独立 NPU 流上运行——gate_up 量化+matmul 与 routed **dispatch 通信**重叠；SiTU+量化（dequant_situ_quant/situ_mx_quant）与 routed **GMM2** 重叠；down_proj 与 routed **combine** 重叠；FusedMoEEvents 事件同步；
+- 正确性护栏：多流开启时权重加载后跑 `_validate_shared_expert_consistency`（拆分执行 vs 一体执行最大误差阈值 0.01）；
+- shared 量化路径复用同一对 SiTU 融合算子（int：`npu_quant_matmul(int8×int8→int32)` + `dequant_situ_quant(int32 反量化模式)`；MXFP：`npu_quant_matmul(fp4)` + `situ_mx_quant` + `npu_quant_matmul(fp8×fp4)`）；
+- 共享专家 DP（`shared_expert_dp_enabled`）与 FlashComm1 解耦（4.12）：DP 时共享专家按 DP 复制（要求 enable_expert_tensor_parallel=False）；可选 `mix_placement` 把共享专家纳入 EPLB placement；
+- 汇合：上游 `apply_routed_output_transform` 后 `shared_output + fused_output`；Ascend 侧避免二次 all-reduce。
+
+### 4.6 量化适配详细设计
+
+#### 4.6.1 量化配置发现
+
+- K3 checkpoint 的 `quantization_config` 嵌在 `text_config` 内 → `KimiK3Config.__init__` 按 model_type 白名单（compressed-tensors/modelslim）**提升到顶层**（hf_overrides 亦可注入）；
+- 多模态壳层 `_maybe_ignore_quant_config`：compressed-tensors 时视觉塔/投影器不量化（返回 None）。
+
+#### 4.6.2 compressed-tensors（原生 MXFP4 QAT 权重）
+
+`quantization/compressed_tensors_config.py` 新增 packed-MXFP4 识别链路：
+
+- format `"mxfp4-pack-quantized"` + weight FLOAT 4bit + GROUP strategy + group_size=32 + static + 无 input_quant → `_detect_quant_type` 返回 **`W4A8_MXFP`**（W4 权重 + 运行时 MX 动态量化 FP8 激活）；
+- scheme 以 `use_weight_packed=True` 构造 → MoE 参数名 `w13_weight_packed/w2_weight_packed`（与 compressed-tensors checkpoint 张量名一致，配合 `_resolve_packed_expert_weight_name` 装载回退）；
+- `apply_vllm_mapper` 用模型 `hf_to_vllm_mapper` 重写 target_scheme_map 与 ignore 列表（K3 多模态前缀重映射）。
+
+#### 4.6.3 ModelSlim W4A8（Eco-Tech/Kimi-K3-w4a8，A3 验证权重）
+
+- `quantization/methods/w4a8_mxfp4.py::AscendW4A8MXFPDynamicFusedMoEMethod`：权重 `[E,2I,H/2] uint8`（fp4 打包）+ E8M0 scale；`process_weights_after_loading`：`npu_format_cast(29=FRACTAL_NZ)`（weight→NZ）→ transpose → scale 交错成对布局；
+- int4 路径（`w4a8.py`）：scale_bias 零点修正（`bias=8·Σ(w_high·scale)`）、per-channel int4 + GMM 内 swiglu 专用流水（`use_w4a8_per_channel_gmm_swiglu`）；
+- `modelslim_config.py` K3 特化：`linear_attn_config.use_full_rank_gate` 时 KDA 全秩门控投影（`.g_a_proj/.g_b_proj`）无量化权重描述则强制 `AscendUnquantizedLinearMethod`（全秩 gate 保持 BF16）；
+- latent 投影量化策略：仅 ModelSlim（quant_config 名 `"ascend"`）时 down/up_proj 随专家量化；compressed-tensors/未量化时保持 BF16；
+- **QuaRot**：ModelSlim 对 K3 FP4 激活旋转变换后 INT4 推理——文本 embedding 折叠旋转矩阵；视觉路径显式 `rot_proj`（A3 专属，4.7.1）；DSpark draft 的 `context_proj` 按 target-width 分块旋转基对齐（4.10.3）；
+- EPLB W4A8 映射：#13733 在 `EPLB_EXPERT_WEIGHT_NAMES` 新增 `(W4A8, False)` → TensorList 六件套权重名，使动态 EPLB 支持 W4A8 专家重排。
+
+#### 4.6.4 BF16 未量化路径
+
+本地减层权重场景：全部 linear 走 `UnquantizedLinearMethod`；MoE 走 `unquant_apply_mlp` + `situ_and_mul` 参考实现（需 7f158640c 修复）；A5 上 MLAPO 对 BF16 权重的支持（weight_quant_mode=0，NZ 排布无反量化 scale）由 #13507 补齐（此前非量化层直接禁用 MLAPO）。
+
+### 4.7 多模态（MoonViT-V2）详细设计
+
+#### 4.7.1 视觉塔（KimiK3VisionTower/Encoder/EncoderLayer）
+
+```text
+pixel_values [P,3,14,14] ── KimiK3VisionPatchEmbed
+    Conv2d(3→1024, k=14, s=14, bias=False)
+    + Learnable2DInterpPosEmbDivided_fixed(64×64 初始网格, 4 帧, bicubic 插值)
+      （复用上游 kimi_k25_vit 组件；config 中 bilinear 字段被官方参考实现忽略，此处保持 bicubic 与训练一致）
+── KimiK3VisionEncoder × 27 层（Rope2DPosEmbRepeated 2D RoPE 缓存，max 1024）
+    每层: pre-RMSNorm → wqkv(QKVParallelLinear 1024→1536) → apply_rope(2D)
+          → MMEncoderAttention(变长 cu_seqlens, head_dim=128, scale=128^-0.5, bf16)
+          → wo(RowParallel 1536→1024) → 残差
+          → post-RMSNorm → MLP(fc0 1024→4096, gelu_pytorch_tanh, fc1 4096→1024) → 残差
+    final_layernorm(RMSNorm)
+── KimiK3VisionTower: merge_type="sd2_tpool" → tpool_patch_merger(2×2 时间池化合并, 1024→4096)
+── KimiK3MultiModalProjector (mm_projector_type="patchmergerv2")
+    linear_1(4096→4096) + GELU(approximate="tanh") + linear_2(4096→7168) + RMSNorm(7168)
+    [仅 A3/ModelSlim] + rot_proj: 冻结旋转权重，右乘 QuaRot 旋转（FP4 激活→INT4 推理的旋转变换）
+```
+
+关键设计点：
+
+- **顶层装配**：`@MULTIMODAL_REGISTRY.register_processor(KimiK3MultiModalProcessor, info=KimiK3ProcessingInfo, dummy_inputs=KimiK3DummyInputsBuilder)`；接口栈 `SupportsMultiModal/SupportsPP/SupportsQuant/HasInnerState/IsHybrid/MixtureOfExperts/SupportsEagle3`；`supports_encoder_tp_data=True`；vision_tower/mm_projector 在 `self._mark_tower_model(vllm_config, "image")` 上下文内构建（使 profiling/权重工具将其识别为 encoder tower）；
+- **视觉 TP/DP**：`--mm-encoder-tp-mode data` 时 `is_vit_use_data_parallel(12 heads)` 生效（视觉头数不被 TP 整除时回退 DP），视觉层 `disable_tp=True` 并由 `run_dp_sharded_mrope_vision_model(rope_type="rope_2d")` 做数据并行分片；否则按 TP 切分（12 头需整除 TP）；
+- **视觉量化隔离**：若顶层 quant_config 为 CompressedTensorsConfig，视觉塔构造时传 None（checkpoint 的 compressed-tensors 配置嵌在 text_config，本就只描述文本骨干；提升逻辑也按 model_type 过滤）；文本侧 ModelSlim 量化不影响视觉；
+- **QuaRot rot_proj（A3 专属）**：ModelSlim 在 INT4 推理前旋转 K3 FP4 激活。文本 embedding 把旋转矩阵折叠进了输入投影，但视觉路径以 RMSNorm 结尾无法折叠，必须保留显式 `rot_proj`（`w_out = x @ (rot_proj^T · linear_2.weight)^T`）。仅 `AscendDeviceType.A3` 创建；其他 SoC 以 skip_prefixes 忽略 checkpoint 中的该张量；
+- **sd2_tpool 合并语义**：每图 (t,h,w) → reshape `(t, nh, kh=2, nw, kw=2, d)` → **时间维 mean 池化** → 空间重排 `(nh·nw, 4, 1024)`——每个输出 media token 由 4 个 patch 特征拼成后进 projector（4096 输入宽度来源）；
+- **数值契约细节**：encoder 层 pre/post RMSNorm 用 **torch 默认 eps**（released K3 参考实现有意保留，仅 projector RMSNorm 有显式 1e-5 契约）；位置嵌入硬编码 bicubic（官方参考实现从不消费 config 的 bilinear 字段）；
+- 前向支持 torch.compile 友好的元数据预计算（`prepare_encoder_metadata`：rope_freqs_cis/cu_seqlens(numpy cumsum)/max_seqlen/sequence_lengths）。
+
+#### 4.7.2 图像处理流水线（KimiK3ProcessingInfo/MultiModalProcessor/DummyInputsBuilder）
+
+- **NaViT 动态分辨率**（`navit_resize_image`，镜像 checkpoint 官方逻辑）：按 `in_patch_limit`（总 patch 上限）、`patch_limit_on_one_side`（单边上限）计算缩放因子 `scale=min(1, scale_by_total, scale_by_width, scale_by_height)`，再按 `merge_kernel_size×patch_size=28` 对齐补边；图像媒体 token 数 = `(H_pad/28)×(W_pad/28)`（每 2×2 合并块 1 token）；支持 `fixed_output_tokens` 固定 token 模式；超限抛错；
+- **最大图像尺寸穷举**（`get_max_image_size`）：在 patch 网格上穷举扫描所有合法 (w_p,h_p)，用 navit_resize 规则打分 `(num_tokens, num_patches)` 取最大者——给出 profiling/dummy 输入的最坏情况图像尺寸，保证显存上界正确；`KimiK3DummyInputsBuilder` 据此生成假图（dummy text = image_placeholder × n）；
+- **占位符展开**：prompt 中 `<|kimi_image_placeholder|>`（`get_placeholder_str`）被 `PromptReplacement` 替换为 `<|media_begin|>image {W}x{H}<|media_content|>{<|media_pad|>×num_tokens}<|media_end|>`（token 数由 checkpoint image processor 的 media_tokens_calculator 计算）；`media_placeholder_token_id=163605` 与 tokenizer 的 `<|media_pad|>` id **交叉校验**，不一致时以 tokenizer 为准并 warning 后写回 hf_config；`PromptUpdateDetails.select_token_id` 标记其中属于图像 embedding 的 token 段；
+- **mm 字段**：`pixel_values` 按 `grid_thws.prod(-1)` flat_from_sizes 展平（P 个 14×14 patch 行），`grid_thws` batched 且 keep_on_cpu；运行时 `_parse_and_validate_media_input` 做 list→cat、3/5-D reshape 成 `(np,3,ps,ps)`、cast 到 tower dtype、grid_thws 校验，产出 `KimiK3MediaPixelInputs`（TensorSchema）；
+- **dummy 输入**：profile 阶段按最大尺寸构造假图（`ImageDummyOptions` 可覆写），`--skip-mm-profiling` 可跳过；
+- **多模态与 FlashComm 的衔接**：视觉 embedding 合并发生在第 0 层之前，`uses_kimi_k3_global_inputs_embeds()` 标记使 KDA 第 0 层跳过序列并行 gather（`is_vl_first_layer`）；第 0 层输出经 `torch.ops.vllm.maybe_chunk_residual` 把全长残差流切回 token 分片（含 block_residual 的单例块轴锚定，保证 fake/meta 与运行时同为 3-D）；
+- **processor 链**：vLLM `_call_hf_processor` → `KimiK3Processor`（包装裸图为媒体字典；**prompt 展开有意留给模型的 prompt-update hook**，使缓存/非缓存 processor 路径共享一份实现）→ checkpoint `kimi_k3_processor.py`（smart resize/归一化/patch 化）；`_hf_processor_applies_updates=False`（占位符展开由 vLLM PromptUpdate 接管，防止双重展开）；框架按 `media_token_id` 将 per-image embedding scatter 进文本 embedding（SupportsMultiModal 标准 merge 流程）。
+
+### 4.8 KV Cache 与混合状态管理
+
+K3 是 vLLM "hybrid model"：MLA 层用分页 KV cache，KDA 层用 mamba 式循环状态。模型级契约：两个顶层类声明 `HasInnerState`（告知调度器存在 token 无关内部状态）+ `IsHybrid`，并实现三个 classmethod——`get_mamba_state_dtype_from_config`（`kda_state_dtype`：conv state 用 cache dtype、recurrent state 恒 fp32）、`get_mamba_state_shape_from_config`（`kimi_kda_state_shape`，见 4.3.6）、`get_mamba_state_copy_func`（`kda_state_copy_func`，供 align-mode mamba 前缀缓存做状态块拷贝）——使 hybrid KV cache manager 同时为 MLA 层分配 paged KV、为 KDA 层分配 mamba (conv+recurrent) 状态缓存。设计要点：
+
+1. **异构 cache 组**：`AscendMLAAttentionSpec`（继承 MLAAttentionSpec，增加 sparse SFA C8 等字段）承载 MLA 组；KDA 组由 vLLM MambaSpec 承载（page_size_bytes 对齐）。主提交将 `page_size_bytes` 重命名为 `real_page_size_bytes` 并扩展 `merge()` 透传全部字段（kv_quant_mode/page_size_padded/indexes_kv_by_block_stride/alignment/compress_ratio/model_version），使 MLA+Mamba 混合组在统一 block 尺寸下正确合并；
+2. **mamba_cache_mode**：vLLM CacheConfig 选项（none/all/align）。K3 在 **PD 分离与 prefix caching 场景必须 `align`**（只缓存每个调度步末 token 的状态，与 FA 块边界对齐）：`patch_mamba_config` 在 kv_transfer 启用时强制 align；AscendStore 混合线性注意力池硬性要求 align（pool_scheduler 断言）；`enable_prefix_caching + align` 组合有专门校验；
+3. **prefix cache 协调**：PD 分离下 D 侧从 P 侧收到 FA KV 块但 mamba 组无本地前缀命中，上游 `HybridKVCacheCoordinator.find_longest_cache_hit_per_group` 的跨组 min 归约会把 FA 命中长度坍缩为 0 → `patch_kv_cache_coordinator` 修正为以 FA 命中长度作为 `num_new_local_computed_tokens`，避免重复传输 D 侧已缓存的 FA 块（上游 PR #42524/#44243 合入后可移除）；
+4. **block size**：Ascend 不支持 vLLM 默认 mamba block size 16，`patch_mamba_config` 在 NPU 上置 128；
+5. **KDA 状态形状/拷贝**：见 4.3.6；`kda_state_copy_func` 提供 prefix cache 命中时的状态复制语义（conv+recurrent 两池）。
+
+### 4.9 前端详细设计（XTML renderer / parser 栈）
+
+#### 4.9.1 XTML 协议
+
+K3 不用 `<|think|>` 类单 token，而用"三段式"结构标记：**控制 token**（tiktoken 特殊 token 单 ID）`<|open|>`(163587)/`<|close|>`(163588)/`<|sep|>`(163589)/`<|end_of_msg|>`(163586)，标签名与属性值是普通 BPE 文本：
+
+```text
+消息:   <|open|>message role="user|system|assistant|tool" [name=…]<|sep|> 正文 <|close|>message<|sep|><|end_of_msg|>
+思考:   <|open|>think<|sep|> … <|close|>think<|sep|>            （thinking 模式结构性存在，即使为空）
+正文:   <|open|>response<|sep|> … <|close|>response<|sep|>
+工具:   <|open|>tools<|sep|>
+          <|open|>call tool="fn" index="i"<|sep|>
+            <|open|>argument key="k" type="string|number|boolean|null|object|array"<|sep|>值<|close|>argument<|sep|>…
+          <|close|>call<|sep|> …
+        <|close|>tools<|sep|>
+JSON:   <|open|>json type="object"<|sep|> … <|close|>json<|sep|>
+生成头: <|open|>message role="assistant"<|sep|> + <|open|>think<|sep|>（thinking）或 <|open|>response<|sep|>
+图像:   <|media_begin|>image WxH<|media_content|><|media_pad|>…<|media_end|>（替换 <|kimi_image_placeholder|>）
+```
+
+**为什么不发布 Jinja 模板**（renderer patch docstring + tokenizer 代码）：① K3 刻意以 tokenizer 自带 Python `encoding_k3.py` 实现 XTML；② 编码必须分段感知——结构段 `allowed_special="all"`、用户/工具文本 `disallowed_special=()`，保证用户输入中的 `<|open|>` 字样永远编成普通 BPE、**无法注入控制 token**（Jinja 单一字符串 + 统一 tokenize 无法表达）；③ typed 工具参数、tool 结果按 tool_call_id 重排、response_format schema deep_sort、thinking_effort/tool_choice 内部系统消息注入等均为 Python 逻辑。
+
+#### 4.9.2 KimiK3Renderer（`patch_kimi_k3_renderer.py`）
+
+- **注册**：`TokenizerRegistry.register("kimi_k3", "vllm.tokenizers.hf", "CachedHfTokenizer")`（复用标准 HF loader，trust_remote_code 加载 TikTokenTokenizer）+ `RENDERER_REGISTRY.register("kimi_k3", KimiK3Renderer)`；
+- **自动选择**：包装 `ModelConfig.__post_init__`——`tokenizer_mode=="auto"` 且架构为 `KimiK3ForConditionalGeneration` 时改写为 `"kimi_k3"`（v0.26.0rc 起无需手动 `--tokenizer-mode kimi_k3`；显式 mode 与其他架构不受影响）；
+- **渲染**：`parse_chat_messages(content_format="string", media_io_kwargs={"image":{"image_mode":None}})` → developer→system 归一 → `_normalize_k3_tool_messages`（为 tool 结果补 `tool`/`index` 元数据并按 tool_call_id 重排回 assistant 调用顺序，对应 XTML `role="tool" tool=… index=…` 契约）→ `tokenizer.apply_chat_template(tokenize=True, add_generation_prompt=True)` 直接进官方 Python 编码器（build_chat_segments + 分段编码），返回扁平 token id 列表 → `parse_dec_only_prompt`；
+- **kwargs 保护**：官方编码器是唯一真源——先弹出私有键 `_kimi_k3_prompt_tool_choice`，再强制删除 13 个可能被服务器级/请求级 Jinja 配置污染的键（chat_template/tokenize/return_dict/enable_thinking/reasoning_effort/image_prompts/max_length/padding/truncation 等）；
+- **请求级参数映射**（`prepare_kimi_k3_chat_template_kwargs`，经 `OnlineRenderer.render_chat` 与 `OpenAIServingChat._effective_chat_template_kwargs` 两个包装入口调用）：
+  - `reasoning_effort/response_format/tool_choice/tools` 出现在 chat_template_kwargs → 报错（必须走标准 OpenAI 字段）；
+  - `thinking`(bool) 与显式 `reasoning_effort` 一致性校验；`thinking_effort∈{low,high,max}` 且要求 thinking=true；
+  - 映射表：`minimal/low→low`、`medium/high→high`、`xhigh/max→max`、`none→thinking=False`；反向同步 request.reasoning_effort；
+  - `tool_choice` 默认：有 tools→auto，无→none；字符串 choice ∈{none,auto,required} 时写入私有 typed 键 `_kimi_k3_prompt_tool_choice="kimi_k3:<choice>"`（vLLM 0.23 起 ChatParams 默认值合并会把字面量 "auto" 当未设置，私有键可在合并中存活，渲染时解码还原）；
+  - 强制 `skip_special_tokens=False`、`spaces_between_special_tokens=False`（解码文本保留 XTML 控制标记供 parser 正则使用）；哨兵属性防重复处理。
+
+#### 4.9.3 Parser 栈（`patch_kimi_k3_parsers.py` + 4 个支撑模块）
+
+- **注册**：`ReasoningParserManager/ToolParserManager.register_module("kimi_k3", …)` → `--reasoning-parser kimi_k3`/`--tool-call-parser kimi_k3` 生效；
+- **ParserManager.get_parser 补丁**：pin 的 vLLM d02 缺上游 f5a7cce9b 的 K3 特例（只特判 Harmony/Mistral）→ 替换为 `_get_parser_with_kimi_k3`：当任一 parser 名为 kimi_k3 时动态构造 `class _KimiK3Parser(KimiK3Parser)` 挂上 reasoning/tool 类（只配 reasoning 或只配 tool 也能获得 K3 组合语义）；
+- **KimiK3Parser（DelegatingParser 组合，vendored 上游 f5a7cce9b）**：tool_choice=="none" 时仍剥离 tools 通道得到干净 content（流式同样剥离但清空 tool_calls）；reasoning-only 且 think 已结束时用 `strip_content_streaming` 对累计文本重剥 response/message 包裹，只发净增量；
+- **KimiK3ReasoningParser（think 通道，vendored adbf08d97 + #50886 回移）**：`adjust_request` 强制保留特殊 token；**token 级结束判定**（`_newest_marker` 从后向前找 think_close/think_open 最新出现者，不受解码文本歧义影响）；流式 `is_reasoning_end_streaming` 只扫"当前 delta + marker carry window"（O(delta) 而非 O(context)，#50886）；`extract_content_ids` 返回最后一个 think_close 之后的 token ids 并带流式缓存（同输入 full parse 复用）；文本级解析带**部分重叠扣留**（已生成 `<|clo` 之类半截标记不泄漏给用户）；请求带 tools 且 tool_choice≠none 时保留 tools 通道给 tool parser；
+- **KimiK3ToolParser（vendored ab98034d4 + #50420 回移）**：`_call_re/_arg_re` 解析 call/argument 标签（`k="v"` 属性、`&quot;/&amp;` 还原、按 type 属性还原值：string 原样/其余 json.loads 失败回退原文）；**tool-call id 用 vLLM 默认随机 ID**（弃用 `name:index` 构造，多轮唯一）；`supports_required_and_named=False`——required/named 走 structural tag 约束解码；named choice 且未带 structural_tag 时报错提示需 `VLLM_ENFORCE_STRICT_TOOL_CALLING`；流式按 call 标签完整闭合去重发出，response 通道文本增量发送 + 部分标记扣留；异常兜底返回原始输出；
+- **structural tag 约束解码（`kimi_k3_structural_tag.py`）**：`@register_vllm_structural_tag("kimi_k3")` 构造 xgrammar StructuralTag——整体 = 可选 response 前缀 + tools 通道 + 可选 MESSAGE_END；tool_choice：auto→Optional(tools)，named(forced)→**只留被点名函数的 tools 通道**（对齐 #50093：保留完整 tools 与原始 choice，由文法强制目标函数），required→全量 tools 且 at_least_one；call 标签 begin=`<|open|>call tool="NAME" index="`+[0-9]++`"<|sep|>`+参数块；参数块按 JSON Schema 生成 typed argument 文法（string+enum≤256→ConstString/Or；maxLength/minLength→定长正则 `(?:[^<]|<[^|]){min,max}`（原子模式阻止拼出 `<|` 控制标记）；否则 AnyText(excludes=["<|close|>"])；非 string→JSONSchemaFormat 内联 $defs）；
+- **OpenAIServingChat 包装**：
+  - **PD prefill 旁路（Ascend 特有，无上游 PR）**：`kv_transfer_params["do_remote_decode"]=True` 的请求，P 侧只产出一个"内部传输 token"，以 `parser=None` 调原实现，避免把不完整输出当 K3 响应解析；
+  - **token-aware 解析**（对齐 #50886/#50093）：pin 版 serving 调 `parser.parse` 不传 token ids → 包装器抓取每个 choice 的最终 `output.token_ids` 与引擎 finish_reason，注入 `parse_with_token_ids`（reasoning parser 的 `extract_content_ids` 依赖 token 级标记精确剥离 think 段）；
+  - **finish_reason 保真**：parser 把 finish_reason 改成 "tool_calls" 而引擎真实原因是 length 等时，用引擎值覆盖（full 直接覆盖；stream 对 SSE chunk 最小侵入 json 改写）；
+  - **required/named 时 content 恢复**：强制调用时 K3 仍可能输出 response 通道文本，parse 返回的 content 写回 message.content；
+  - **Responses API 禁用**：parser 为 KimiK3Parser 子类时 `/v1/responses` 直接返回错误（token-aware 行为仅在 Chat Completions 实现/验证，显式拒绝优于静默错解）。
+
+#### 4.9.4 media connector 补丁（`patch_media_connector.py`，#49159 回移）
+
+v0.26.0 切分早于上游 #49159：旧行为 `MediaConnector.fetch_image(image_url, image_mode="RGB")` 调用点参数优先，`media_io_kwargs["image"]["image_mode"]` 无法覆盖，且无 `image_mode=None`（保留原图模式）语义。K3 renderer 固定注入 `{"image":{"image_mode":None}}`（视觉预处理需要未经 RGB 强转的原始图像，如 RGBA/P 模式透明底填充）。补丁仅在 `vllm_version_is("0.26.0")` 安装（幂等哨兵）：`_make_image_io` 让 media_io_kwargs 覆盖调用点默认；`_convert_image_mode` 包装支持 None=原样返回；替换 fetch_image/async 与 fetch_video/async 四方法。上游全版本含 #49159 后移除。
+
+#### 4.9.5 与上游版本的关系（#13520 对齐原则）
+
+pin 的 vLLM v0.26.0（d02df748）**早于上游原生 K3 XTML parser 栈**，但已含 DSpark 基础设施。补丁策略：① vendored 上游已合入实现（parser f5a7cce9b、reasoning adbf08d97、tool ab98034d4）；② 行为回移（#50886 流式增量扫描、#50420 随机 tool-call ID、#50093 named choice、#49159 media）；③ 上游 #50540 是 Rust renderer，Ascend 直接用官方 Python encoder（行为已具备）不复制，仅补契约测试；④ tokenizer_mode 自动选择对齐上游默认；⑤ **未合入 PR（#50229/#50291/#50367/#50543/#50627/#50628）语义不提前实现**；⑥ Ascend 特有项（PD prefill 旁路、Responses 禁用）无上游对应。全部补丁在 `patch/__init__.py` 登记 Why/How/Related PR/Future Plan，待受支持 vLLM 版本含原生栈后整体移除。
+
+### 4.10 投机解码详细设计（K3 MLA DSpark，#13277）
+
+#### 4.10.1 DSpark 机制概述
+
+DSpark 是 pin 版 vLLM 已有的**半自回归块式 draft** 方法（`method="dspark"`，强制 `parallel_drafting=True`）：一次并行前向产出整块 N 个 draft token（DFlash 形态：context-KV 预写 + 非因果 query-block 前向），块内自回归依赖由低秩 **Markov head**（`markov_w1 V×r` embedding + `markov_w2 r×V` 投影）在采样阶段顺序注入。与 MTP（逐 token 串行跑 draft 层）的本质区别是"并行骨干 + 顺序 Markov 转移偏置"。`num_speculative_tokens` 不得低于 checkpoint 的 `dspark_block_size`（否则块/Markov 布局错误产出乱码）；K3 draft 块为 **7 token**。
+
+#### 4.10.2 K3DSparkForCausalLM（`models/kimi_k3_dspark.py`）
+
+- **draft 权重来源**：**独立 checkpoint**（model_type=`k3_dspark`、architectures=[`K3DSparkModel`]），非目标内嵌 spec 层（对比 DSV4 DSpark 内嵌于目标 checkpoint）；bf16（**强制 quant_config=None**：目标 w4a8 的 layer 描述不覆盖 draft，继承会破坏 process_weights_after_loading）；
+- **结构**：5 层稠密 decoder（`K3DSparkDecoderLayer`：MLA + SwiGLU MLP 7168→14336 + pre/post RMSNorm）；MLA 复刻目标几何（**576 元素 latent KV/token** = kv_lora 512 + qk_rope 64），但翻转两个目标约束：**draft 带 YaRN RoPE**（`use_mla_rope=True`，deepseek_yarn 路由 + mscale 缩放；目标 K3 是 NoPE）、**draft 无输出门**（无 g_proj）；
+- **与目标模型的关系**：不复用目标任何权重，只消费目标 **5 个 aux 层**（`num_target_layers=5`）的输出拼接 `[T, 5×7168]` 经 `context_proj`（ReplicatedLinear→hidden）+ `context_norm` 作为 draft 上下文（`combine_hidden_states`）；aux 层 id 由 draft checkpoint 自带（`eagle_aux_hidden_state_layer_ids`/`target_layer_ids`）；
+- **context KV 预写**：`precompute_and_store_context_kv` 对每层 draft 用 `fused_qkv_a_proj(context_states)` 取 kv 分片，经 `exec_kv_prefill`（融合 kv_a_layernorm + YaRN RoPE + paged-cache 写入）直写 draft latent KV cache——**context token 不做 attention**；`context_slot_mapping` 支持 per-layer 列表（hybrid manager 可能把 draft 层放进不同 cache group），None 跳过（profiling）；
+- **Markov head**：复用上游 `DSparkMarkovHead(vocab, vocab, markov_rank=256)` + markov_embed/bias；
+- **共享契约**：`has_own_embed_tokens=False`/`has_own_lm_head=False`/`draft_id_to_target_id=None`（全词表，id 即目标 id）→ embed/lm_head 别名目标模型；`checkpoint_skip_substrs=("confidence_head","embed_tokens","lm_head")`（训练用 confidence_head 推理不用；lm_head 不留占位模块避免瞬时分配 163k 词表）；draft 层名从目标层数（93）之后编号避免 static_forward_context 键冲突；`get_draft_attn_causal()` 全 False（**双向注意力验证**）。
+
+#### 4.10.3 propose / verify 流程
+
+1. **目标前向**：`use_aux_hidden_state_outputs=True` 时返回 `(hidden_states, aux_hidden_states)`，runner `torch.cat(dim=-1)` 得 `[T,5×7168]`，连同 next_token_ids、num_rejected_tokens_gpu 调 `drafter._propose`；
+2. **QuaRot 基对齐**：`_maybe_anti_rotate_fc`——QuaRot 目标下 draft 的 `context_proj` 按 target-width 分块乘旋转矩阵（5 个 aux 块与目标旋转基对齐）；
+3. **输入准备**：Triton kernel `copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid` 填充——context positions/slot_mapping 复制（扣除 rejected）、query 块 positions=last_pos+1+q、input_ids[0]=anchor(bonus) token、其余=PTD/mask token；重写 cad：`query_start_loc=arange×num_query_per_req`、`seq_lens=(seq_lens−num_rejected)+num_query_per_req`、`causal=False`；
+4. **一次双向 draft 前向** + **Markov 顺序修正**：`raw_logits=[B,N,V]`；`draft[:,0]=seed`；循环 `logits[:,idx] += markov_bias(markov_embed(draft[:,idx]))`、`draft[:,idx+1]=argmax`（并行骨干 + 低秩 Markov 转移偏置）；FlashComm 上下文临时禁用（markov_emb 不被通信切分）；
+5. **verify**：draft tokens 作为下一步 `scheduled_spec_decode_tokens` 由目标模型一次打分，`AscendRejectionSampler` greedy 接受/拒绝；`num_rejected_tokens_gpu` 反馈下一次 propose（被拒 token 的 draft KV 槽位由 slot mapping 重算自然覆写），经 side-stream D2H 延迟同步（首次 draft MLA attention 前）；FIA 精确 KV 长度 host 重建（optimistic 长度 + reject 镜像/event）；
+6. **draft 元数据**：`initialize_attn_backend` 为 draft 层建独立 AttentionGroup；**K3 关键修正**——MLA builder 的 `use_mla_rope` 默认取自目标 hf_text_config（NoPE）会把 draft cos/sin 建成恒等，而 draft context KV 已按真实 YaRN 旋转写入 → 静默位置错位；故 draft 组 builder 全部翻转为 `use_mla_rope=True`；`set_per_group_attn_metadata` 下发每组块表/槽位映射；
+7. **硬约束**：DSpark eager-only（`use_cuda_graph=False`）；**仅 greedy draft**（probabilistic 抛错）；禁 enable_reduce_sample（绕过 Markov 修正）；禁细粒度 lm_head TP。
+
+#### 4.10.4 配置归一化补丁（`patch_speculative_config.py`）
+
+上游 `SpeculativeConfig.__post_init__` 会把非 Qwen3/Gemma4 的 dspark config **就地改写为 `model_type="deepseek_v4"` + `architectures=["DSparkDraftModel"]`**——K3 draft 会被误路由到 DSV4 draft 模型。补丁 `_dspark_post_init` 在原 post_init 之后利用"具体 config 类仍是 `K3DSparkConfig`"的显式类型契约恢复 `model_type="k3_dspark"`、`architectures=["K3DSparkModel"]` 并 `update_arch_()`，命中插件注册的 `K3DSparkForCausalLM`；同时兜底 `ptd_token_id`（parallel drafting mask token）。补丁模块 import 时即注册 K3DSparkConfig（可能先于模型插件入口加载）。用户配置形态：
+
+```bash
+--speculative-config '{"method":"dspark","model":<k3_dspark_draft_path>,"num_speculative_tokens":7,"enforce_eager":true}'
+```
+
+#### 4.10.5 aux 捕获双模式与 KDA 状态回滚
+
+- **aux 捕获模式**（model_runner_v1 + kimi_k3.py）：目标模型暴露 `set_dspark_aux_capture_materialized` 钩子（仅 Kimi 目标有）——`materialized=True`（legacy Qwen3/GQA DSpark，用 K3 物化残差流训练）：在 aux 层**之前**捕获"下一层物化输入"，K3 需把 block_residual 经该层 `self_attention_res_proj/norm` 折叠（Triton apply_attn_res 复用）；`materialized=False`（**K3 MLA DSpark 默认**，raw MLA 流，上游 #13071 raw-boundary 行为）：在 aux 层**之后**捕获 hidden_states；
+- **KDA 状态回滚=按接受数重放**（线性注意力状态不可逆，无快照恢复）：conv state 长度预留 `num_spec` 槽位（4.3.6）；builder 产出 `spec_state_indices_tensor [seq_num,max_step]`/`num_accepted_tokens`；conv1d 与 recurrent_kda 均接收 `num_accepted_tokens`——kernel 用上一块实际接受数定位 conv 窗口/递归状态起点，被拒尾部下一步被覆写（等价回滚）；runner 维护 `num_accepted_tokens_cpu`（mamba align 模式下 preprocess_mamba 拷状态入新块后重置为 1）；
+- **图重放安全**：`_reset_spec_decode_graph_inputs`（无 spec replay 时 spec 分支置 no-op）；空闲 dummy 图运行零序列长度（跳过 GDN conv/KDA 状态更新）；全图重放前重置过期投机状态输入；修复 empty-Vnew 返回路径 KDA workspace event 泄漏；
+- **MLA/prefix cache 侧**：prefix cache 命中修剪跨全注意力组一致；P/D 下保留 producer 侧 Mamba prefix cache 命中；D 侧 FA 命中长度由 patch_kv_cache_coordinator 修正（4.8）。
+
+#### 4.10.6 实测记录（#13277）
+
+16 专家裁剪 W4A8 checkpoint + MLA DSpark draft，TP16、prefix cache、异步调度、FULL_DECODE_ONLY（capture size 16）：colocated 6/6 冒烟通过、接受率 39.85%；PD 分离 6/6 通过、Mooncake 实传输、接受率 41.70%、D 侧外部 prefix cache 3967/3973 命中。**范围外**：K3 GQA DSpark、四平面 cache 布局。
+
+### 4.11 PD 分离与 KV 传输（混合缓存）
+
+K3 的 PD 分离需同时传输两类异构状态（Mooncake P2P 与 AscendStore/memcache KV 池两条通路）：
+
+1. **KDA conv state 的非等 TP 传输**（mooncake_connector）：P/D 两侧 TP 允许不同，传输尺寸按对端 `remote_tp` 计算。K3 的 conv 宽度按 `linear_attn_config` 计算：`projection_width = num_heads×head_dim`（96×128），三段（q/k/v 打包）各 `projection_width/remote_tp`；旧 GDN 模型走 `linear_num_key_heads/linear_key_head_dim` 分支。仅支持 SD conv state 布局 `(state_len, dim)`，形状不符即抛错（快速失败）；
+2. **2M 对齐基址恢复**：混合层组可能只暴露"前导 Mamba padding 之后的 attention 视图"，分配器超额分配并在下一对齐地址切片 → `_recover_aligned_kv_tensor_base` 从 storage 元数据恢复 2MB 对齐原始基址并验证完整规划张量可容纳（否则断言失败），替代原先"基址必须 2M 对齐"的硬断言；
+3. **AscendStore/memcache 池**：K3 混合缓存进池要求 `mamba_cache_mode=align`；P 侧需 `MMC_LOCAL_CONFIG_PATH` 与 MetaService，D 侧仅 Mooncake；
+4. **recurrent state 归属**：KDA 循环状态归 D 侧（decode 独占演进），P 侧 prefill 末状态经传输通道移交（commit 描述"hybrid linear-attention cache ownership and transfer layout"）；
+5. **传输组元数据**：显式携带总 KV 头数（历史修复 #11886/#11887 同样适用于 K3 非等 TP 场景）。
+
+### 4.12 并行与分布式设计
+
+| 维度 | K3 适配点 |
+| --- | --- |
+| TP | 注意力头 96 必须整除 TP；KDA QKV/输出门 g_proj、MLA q_b/kv_b/g_proj/o_proj 均按头切分；`check_ascend_device_type` 保证编译/运行芯片一致 |
+| EP | `--enable-expert-parallel`；896 专家（>512）触发 AllGather 回退路径（主提交"supports the greater-than-512-expert AllGather fallback"）；动态 EPLB 支持 SiTU（#13733） |
+| DP | headless 多节点 DP（`--data-parallel-size-local 1 --headless --data-parallel-start-rank N`）；DP master 由 rank0 承担；MoE all-to-all 在 EP64/EP128 组内 |
+| PP | K3 支持 PP（SupportsPP）：`block_residual` 随 IntermediateTensors 跨 stage；`initial_block_count()` 恢复非首 stage 的 AttnRes 语义；embed/norm 按 first/last rank 条件创建（PPMissingLayer） |
+| FlashComm1 序列并行 | `enable_flashcomm1`（additional-config）；KDA 在所有投影前一次性 gather（gate 投影不在 SequenceColumnParallelOp 白名单）；多模态第 0 层特殊处理（4.7.2）；**共享专家 DP 与 FlashComm1 解耦**（主提交：`enable_sp` 不再因 shared_expert_dp 隐式开启，`shared_expert_dp_enabled` 仅由显式配置或 graph SP pass 决定） |
+| ACL Graph | `FULL_DECODE_ONLY` 模式；KDA 算子全链 device 端索引/cu_seqlens 不读 host（4.3.5）；Meta 符号实现注册；投机路径 padding 行清零（`_zero_padded_spec_output`）；A2 上 capture_sizes [1,2,4,8] |
+| 异步调度 | `--async-scheduling` 与 DSpark/ACL Graph 兼容（#13277 验证） |
+| EPLB | `MixtureOfExperts` 接口在 K3 上主要是**面向 vLLM 工具链的 MoE 标记**（kimi_k3.py 未填充 num_moe_layers/expert_weights，vLLM 原生 `is_mixture_of_experts()` 不命中）；实际专家元数据走 Ascend 自有通路——每个 `AscendMoERunner.__init__` 调 `VllmEplbAdaptor.register_layer(self)`（PPMissingLayer 是 nn.Identity 从不构造 runner，**天然 PP 安全**），adaptor 从注册表聚合 moe_layers/num_local_experts/ep_rank，并按量化类型从 `EPLB_EXPERT_WEIGHT_NAMES` 解析 w13/w2 及 scale 列表（W4A8 条目由 #13733 补齐）；SiTU+动态 EPLB 共存（TensorList cat，4.5.4） |
+| CPU 绑核 | `enable_cpu_binding`（additional-config，默认 true） |
 
 ---
