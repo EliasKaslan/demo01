@@ -1,261 +1,283 @@
-# 算子 Batch 不变性（Batch Invariance）——主题总结与验证指南
+# vLLM-Ascend 适配 Kimi-K3 需求详细设计文档
 
-> **检索范围**：公司内网 WIKI（wiki.huawei.com），关键词："算子的batch不变性"、"batch不变性 验证"、"算子一致性 训推一致"等，共筛选并通读相关页面 15+ 篇。
-> **文档目的**：汇总内网 WIKI 中与"算子的 batch 不变性"相关的知识（背景、根因、方案），并给出**从理论、实践两个层面验证算子是否满足 batch 不变性**的方法体系。
-> **说明**：本文内容均整理自内网 WIKI，关键结论附来源链接（见文末清单）。官方术语在不同页面中混用"batch不变性 / batch一致性 / batch invariant"，本文统一用"batch 不变性"。
-
----
-
-## 1. 主题概述
-
-### 1.1 什么是"算子的 batch 不变性"
-
-- **LLM/推理层面**：固定一条输入（prompt），放置到任意不同大小的 batch（由多条 prompt 构成）的任意位置处，LLM 处理该 batch 得到的输出结果中，对应该条给定输入的输出结果不变（**token_id 和对数概率一致**）。
-- **算子层面（更严格）**：算子不同的请求组合（对算子而言就是不同的 batch 组合）输入所产生的结果，与单个请求（单条）输入产生的结果相同。它比"位置一致"更严格——**输入 shape 不同（batch 数不同）时算子结果仍要一致**。
-- **数学表达（以 bmm 为例）**：`[2, m, k] @ [2, k, n] = [2, m, n]`，若第一个 batch 与第二个 batch 输入数据一致，要求输出也一致；且随着 batch 增加，每个 batch 内的输出不能变——相同输入、相同输出，不受批次组合影响。
-
-### 1.2 相关概念辨析（WIKI 中的一致性层级）
-
-| 概念 | 定义 | 对比 |
-|---|---|---|
-| 算子确定性（幂等性） | 相同输入（shape+值均相同）连续执行多次，结果一致 | 前提是**输入完全相同** |
-| 算子位置一致 | shape 相同、batch 内位置不同，结果一致 | 比确定性更严格 |
-| **算子 batch 不变性** | **输入 shape 不同（batch 组合不同）结果也要一致** | 比位置一致更严格；强一致性，代价是性能下降 |
-| 算子训推一致 | 训练推理结果一致（不同算子保持一致的累加序等） | 比 batch 不变性更严格 |
-
-### 1.3 为什么需要 batch 不变性
-
-1. **训推完全一致（RL 场景）**：如果两个完全一致的推理请求都无法得到 bitwise 相等的结果，就无法保障训推之间的 bitwise 一致性。vLLM 社区已支持 batch 不变性（No More Train-Inference Mismatch: Bitwise Consistent On-Policy RL with vLLM and TorchTitan）；开启后 KL 散度为 0，训推完全对齐；
-2. **推理问题定位、调试、评测**：确定性输出使问题更易定位，数据集精度评测得分无波动；
-3. **客户需求**（如字节）：推理结果可复现。
+| 项目 | 内容 |
+| --- | --- |
+| 文档名称 | vLLM-Ascend 适配 Kimi-K3 模型需求详细设计文档 |
+| 分析对象 | vllm-ascend `releases/v0.26.0rc` 分支（本地检出：`D:\workspace\code\vllm-code\vllm-ascend_k3`） |
+| 关联模型 | Kimi-K3（moonshotai），本地减层 bf16 权重（`D:\workspace\Kimi-K3减层bf16权重`） |
+| 关联 vLLM 版本 | v0.26.0（commit `d02df748bf9efd99022f1a062597dc3cb3808485`） |
+| 文档状态 | 初稿 |
 
 ---
 
-## 2. 根因分析（为什么算子的 batch 不变性会被破坏）
+## 1. 引言
 
-### 2.1 底层根因：浮点数非结合性
+### 1.1 编写目的
 
-浮点数精度有限（固定尾数位 + 舍入误差），**不满足结合律**：`(a+b)+c ≠ a+(b+c)`。例：BF16 下 `(256.0 + 1.0) + 1.0 = 256`，而 `256.0 + (1.0 + 1.0) = 258`。对阶→尾数相加→舍入→规格化的过程中，**求和顺序不同 → 阶段性保留的精度不同 → 结果不同**。
+本文档基于对 vllm-ascend 仓库中 Kimi-K3（下称 K3）适配代码的逐文件分析，说明：
 
-### 2.2 机制：动态 batch 下算子为性能动态切分归约轴
+1. Kimi-K3 模型的结构特点及其对推理框架提出的新需求；
+2. vLLM-Ascend 插件如何在昇腾 NPU（Atlas 800 A2 / A3、Ascend 950）上适配并运行 K3，包括模型注册、配置、混合注意力（KDA + MLA）、MoE/SiTU、量化、多模态、前端解析、投机解码、PD 分离等全部适配点的设计与实现；
+3. 如何部署运行该模型：环境准备、编译安装、启动命令、功能/精度/性能验证方法。
 
-尽管是同一请求、同一模型权重，推理过程中**动态批大小不同**，导致内核之间的并行计算策略（数据如何拆分、归约）随之改变，规约（reduce）的累加顺序变化，结果因此不同。典型受影响算子与切分点：
+预期读者：推理框架开发工程师、昇腾适配工程师、部署与测试工程师。
 
-| 算子 | 动态切分行为（原始场景） | 对 batch 不变性的影响 |
-|---|---|---|
-| matmul / bmm / mm | 根据 M/K/N shape 动态切分 K 轴（split-K，多核切 K 优化） | 同一份数据所在 batch（M 维度 = num_token）不同 → splitK 数不同 → K 轴累加序不同 |
-| attention / FIA | 动态切分 KV（split-KV、FlashDecode 特性） | Q·Kᵀ 不切 head_dim 时 S 不受影响，但 KV 被动态切分时结果不同 |
-| rmsnorm / reduce_sum / reduce_mean | 小 batch 场景将规约轴（尾轴）动态切分以打满多核（splitReduceDim） | 不同切分下行的累加求和顺序变化 |
-| softmax / log_softmax | 分核时综合 batch 与尾轴，不同 batch 对尾轴切分方式不同 | 指数和分母累加顺序不同 |
-| add_rms_norm / addrmsnorm | 多个路径（升降精度不同、不同模板） | 输入不同（PD 混调等）走不同模板，精度 cast 逻辑不同 |
-| hccl all_reduce / reduce_scatter | ring allreduce：各卡规约顺序不一致 | TP>2 规约累加不保序，每卡结果有差异 |
-| matmul+allreduce 融合算子 | TP 下融合 MatMul 与 AllReduce（enable_matmul_allreduce） | 破坏 batch 不变性，需关闭 |
+### 1.2 项目背景
 
-**同类对比实验数据**（matmul 评测）：
-- torch matmul（动态切分 K）：偏差 `2568.6406`（npu）
-- triton matmul 动态切分 K：偏差 `1876224.`（npu）
-- triton matmul **固定切分 K=64**：偏差 `0`
+Kimi K3 是月之暗面（Moonshot AI）发布的开源权重原生多模态 Agentic 模型，总参数 2.8T、激活参数 104B，是首个开源的 3T 级模型。它引入了多项 vLLM 主线（v0.26.0）尚未内置的新架构要素：
 
-### 2.3 不受影响的算子 / 并行维度
+- **KDA（Kimi Delta Attention）线性注意力**：门控 Delta Rule 类线性注意力，取代大部分 softmax 注意力层；
+- **周期性 Gated MLA**：每隔若干层插入一层带输出门控、无 RoPE 的多头隐式注意力；
+- **AttnRes（Attention Residuals）**：跨层"块残差流"学习加权混合，替代普通单流残差；
+- **Stable LatentMoE**：896 专家 top-16 + 2 共享专家，专家在 3584 维隐空间内计算；
+- **SiTU-GLU 激活**：新的有界门控激活函数；
+- **原生 MXFP4/MXFP8 量化感知训练（QAT）**权重；
+- **MoonViT-V2 视觉编码器**（401M 参数）与 1M token 上下文；
+- **XTML 对话协议**：无 Jinja chat template，由 tokenizer 自带 Python 编码器（`encoding_k3.py`）渲染。
 
-- **元素级（功能性）算子**：单个 tensor 元素的功能性处理（exp 等）不涉及规约，天然满足；
-- **规约类算子只要固定累加序**（不管 batch 怎么组合、位置怎么变，K 轴累加序不变）即可满足；
-- 并行策略分析：**DP**（改变 batch size，不影响）、**PP**（层分布不同卡，不影响）、**EP**（router 输入和算子确定，不影响）；**TP/SP/CP 会切到 reduce 轴**，需要确定性 + 位置一致 + batch 不变性算子配合；
-- **注意**：有些算子在 batch 不同时行为不同（走不同内部算子/不同模板），这不属于"规约不确定性"，而是**行为不一致**，必须结合具体实现分析，否则端到端验证中可能无法定位。
+上游 vLLM v0.26.0 仅内置了 K3 的文本前身 `KimiLinearForCausalLM`（`vllm/model_executor/models/kimi_linear.py`），**没有** `KimiK3ForCausalLM` / `KimiK3ForConditionalGeneration` 架构、没有 K3 的 XTML renderer/parser 栈；transformers 也未发布 K3 配置类。因此 vLLM-Ascend 以 **OOT（out-of-tree，插件带外注册）** 方式完成了 K3 的完整适配：主特性提交 `23cfbd5ba`（[Feature][v0.26.0rc] Support Kimi K3 on Ascend, #12950，+35410 行）一次性落地模型、算子、量化、多模态、前端与 KV 传输，后续提交（#13277、#13507、#13509、#13520、#13836、#13989 等）持续补充投机解码、性能融合与前端对齐。
 
-### 2.4 框架服务化能力叠加的影响（易混淆源）
+### 1.3 术语与缩略语
 
-| 服务化能力 | 影响 | 达成一致的组合条件 |
-|---|---|---|
-| TP（张量并行） | 切 matmul 的 reduce 轴，用 All-Reduce/Reduce-Scatter | 确定性 + batch 内一致 |
-| SP（序列并行） | 切 kv_seqlen，FA 算子的 reduce 轴 | 确定性 + 位置一致 + batch 不变性算子 |
-| CP（上下文并行） | 切 prompt token，破坏 batch 一致性 | 确定性 + batch 不变性算子 |
-| CPU 负载调度 | 请求到达时间影响调度，两次运行组成 batch 不同 | 确定性 + 关闭错峰分核 + batch 一致性算子替换 |
-| PD 混调 | 纯P / PD混调 / 纯D 走不同算子（不同累加序） | 相同算子路径 + 确定性 + 位置一致 + batch 不变性 |
-| prefix cache | RadixTree 复用 KV，不同 batch 组合下命中不同 | 需算法保证命中的结果一致（待分析） |
+| 术语 | 说明 |
+| --- | --- |
+| KDA | Kimi Delta Attention，K3 的线性注意力，gated delta rule 变体，含短卷积与循环状态 |
+| MLA | Multi-head Latent Attention，多头隐式注意力（DeepSeek 系列引入），K3 使用无 RoPE + 输出门控变体 |
+| AttnRes | Attention Residuals，K3 的块残差混合机制（`attn_res_block_size=12`） |
+| Stable LatentMoE | K3 的 MoE 框架：token 先投影到 3584 维隐空间再过专家，专家输出经 RMSNorm 后投影回 7168 维 |
+| SiTU | K3 的激活函数：`β·tanh(x/β)·sigmoid(x)`（gate 支路），up 支路可选 `β_lin·tanh(x/β_lin)` |
+| XTML | K3 的 XML 风格对话标记协议，用 `<|open|>/<|close|>/<|sep|>` 特殊 token 表达 think/response/tools/call 等通道 |
+| DSpark | vLLM-Ascend 的 draft-model 投机解码方案；K3 使用 MLA DSpark（独立稠密 MLA 草稿模型） |
+| MTP | Multi-Token Prediction，多 token 预测（K3 checkpoint 中 `num_nextn_predict_layers=0`，未启用） |
+| MLAPO | MLA Preprocess Only（decode 预处理融合算子，`mla_preprocess_only_decode`），将 Q 重建/权重 NZ 变换等融合为单算子 |
+| FIA | FlashInferAttention 风格的 MLA decode kernel 路径；A5 上支持 FIA split（长 block table 分片 + LSE 合并） |
+| PD 分离 | Prefill/Decode Disaggregation，P 节点算 prefill、D 节点算 decode，KV 经 Mooncake 传输 |
+| ACL Graph | 昇腾上等价于 CUDA Graph 的图执行模式（`cudagraph_mode: FULL_DECODE_ONLY`） |
+| AscendC | 昇腾自定义算子开发语言（csrc 目录下 op_host/op_kernel） |
+| aclnn | 昇腾算子调用接口（CANN NN 加速库调用协议） |
+| Triton-Ascend | 昇腾后端的 Triton（triton-ascend 包），用于写融合 kernel |
+| A2 / A3 / A5 | Atlas 800 A2（910B，soc 220-225）/ Atlas 800 A3（910C，soc 250-255）/ Ascend 950（soc 260，代码中枚举名 A5） |
+| GDN | Gated Delta Net，vLLM 中线性注意力的通用实现基座（KDA 复用其 mamba 类状态管理） |
+| QuaRot | 旋转量化技术；ModelSlim 对 K3 FP4 激活做旋转变换后再 INT4 推理 |
+| NZ / weightnz | 昇腾 FRACTAL_NZ 权重排布（矩阵乘加速格式） |
 
-### 2.5 业界方案
+### 1.4 参考资料
 
-- **Thinking Machines Lab**：`batch_invariant_ops`（Triton 实现的 batch-invariant 算子集），针对 LLM 推理不同 batch 输出不一致问题；文章 [Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/) 指出根因不是"并发 + 浮点结合律"本身，而是 **Kernel 缺乏批次不变性**：batch size 改变时 Kernel 为追求性能动态改变归约策略（归约顺序、Tensor Core 指令等）。
-- **微软 LLM-42**（不改算子内核的调度层方案）：受投机解码启发，"解码-验证-回滚"（DVR）协议 + 分组验证 + 选择性确定性，把确定性从 kernel 层提升到调度层（本文档不展开，详见 WIKI 讨论页）。
-
----
-
-## 3. 理论验证：如何从理论上验证算子满足 batch 不变性
-
-> 理论验证的目标：**在写测试之前，通过分析算子实现判断其是否可能破坏 batch 不变性，并圈定需要覆盖的测试维度**。WIKI 的经验是："算子侧评估的算子可能不全面（理论分析较多），替换后整网端到端不一定满足"，因此理论分析要结合 profiling 与实验交叉确认。
-
-### 3.1 检查清单（按优先级）
-
-1. **算子归类**：该算子是否有规约（reduce）操作？
-   - 无规约（元素级，如 exp、scale、gather 按行独立处理）→ 理论天然满足（仍需确认无跨行依赖、写隔离、padding 处理）；
-   - 有规约（sum/mean、matmul、attention、norm、softmax、通信 allreduce 等）→ 进入第 2 步。
-
-2. **规约轴切分策略是否随输入 shape（batch 大小、M/seqlen 大小）变化**：
-   - 检查 tiling 是否动态：matmul 的 split-K（DoSingleCoreSplitKTiling / DoDeterministicMultiCoreSplitKTiling 等）、reduce_sum 的 reduce 轴多核切分、attention 的 split-KV / FlashDecode、softmax 的尾轴切分；
-   - 若切分随 batch 变化 → **不满足**（除非固定切分，如"固定切分 K 为 64"或"始终只选用一种 K 累加方式"）；
-   - 若不同 batch 下采用完全相同的切分与累加序 → 理论满足，仍需数值实验确认舍入路径一致。
-
-3. **K 轴（归约轴）累加序不变性**：
-   - bmm：多 batch 载入、bm 合轴**不改变** k 轴累加序 → 不影响 batch 不变性；
-   - mm（M 已 bm 合轴）：影响 K 累加序的特性均可能影响 batch 不变性；
-   - 经验法则（WIKI）：**batch 不同（bmm）或 m 不同（mm）时，K 的处理切分逻辑必须一样**；不能一个走切 k、一个不走切 k；前后都走确定性切 k 理论上也有 batch 不变性。batch 一致性模板可从 **K 的累加方式**上划分，始终只用一种 K 累加方式。
-
-4. **行为分支一致性**（比规约更隐蔽）：
-   - 不同 batch/阶段（纯 P、PD 混调、纯 D）是否走**不同的内部算子**或**不同的 kernel 模板**（如 addrmsnorm 不同输入走不同模板、精度 cast 逻辑不一致；FIA 在 PD 混调下内部算子与纯 P/D 不一致）；
-   - 存在分支差异 → 即使单分支满足也不满足整体 batch 不变性。
-
-5. **通信算子（TP 场景）**：
-   - allreduce/reduce_scatter 的**规约顺序**是否固定（ring 算法各卡规约序不一致）；
-   - 检查 `HCCL_DETERMINISTIC=strict`（满足确定性 + batch 不变性）是否为该硬件/版本支持。
-
-6. **数值与精度路径**：
-   - 同一算子在不同 batch 下是否发生升降精度变化、是否出现 padding/去 padding 的路径差异；
-   - 关注极端 shape 与数值范围（大 K、大 H、极小/极大值）下的舍入路径。
-
-7. **辅助 kernel 与框架侧路径**（v2 runner 中大量 Triton 辅助 kernel，虽非规约算子但也影响端到端结果面）：
-   - row → 请求状态的**映射稳定**（idx_mapping 双射，不同 batch row 不写同一 req_state_idx）；
-   - **padding / 无效 row** 不读旧值、不写有效状态（slot_mapping、block_table 需写 PAD，不能残留 stale 值）；
-   - 同一请求的 position、seq_len、block table、slot mapping 在 BS=1 与 BS=N 下完全一致；
-   - 采样 **seed 与请求进度绑定**，不随 batch row 或调度顺序变化（gumbel/temperature kernel 的 expanded_idx_mapping 不能错位）；
-   - staged write 目标区间不重叠（写隔离）。
-
-### 3.2 理论分析辅助手段
-
-- **profilings 采集**：采集目标模型（如 Qwen3 30B）推理时涉及的全部算子（计算 + 通信）profilings，清单式核对哪些算子涉及规约、哪些批不变性算子被实际执行（确认替换生效）；
-- **triton batch 不变性算子分析工具**（见 Batch不变性_适配分析页）：用工具分析涉及规约的算子；
-- **代码走查**：核查 tiling 函数（split-K 等）、kernel 选择分支、模板选择条件。
+1. vllm-ascend 仓库 `releases/v0.26.0rc` 分支源码（本地：`D:\workspace\code\vllm-code\vllm-ascend_k3`）；
+2. vllm-ascend 官方部署指南 `docs/source/tutorials/models/Kimi-K3.md`（`origin/releases/v0.23.0` 分支，K3 首发版本文档，已提取至本工作区 `_ref_Kimi-K3_deploy_guide.md`）；
+3. vLLM v0.26.0 源码（本地：`D:\workspace\code\vllm-code\vllm`，`vllm/model_executor/models/kimi_linear.py` 等）；
+4. Kimi-K3 模型卡（本地权重目录 `README.md`，含官方模型摘要与评测结果）；
+5. 本地权重 `D:\workspace\Kimi-K3减层bf16权重\config.json`、`modeling_kimi_k3.py`、`modeling_kimi_linear.py`、`encoding_k3.py`、`tokenization_kimi.py`；
+6. 本地环境搭建脚本 `D:\workspace\260909_vllm-ascend_k3\*.sh`（vLLM/vLLM-Ascend 源码编译与验证）；
+7. 本地 `D:\workspace\code\vllm-code\vllm-ascend`（`feat/situ-moe-mlp` 分支，含 SiTU 非量化 MoE 路径修复 `75c1fe22a`，与上游 `7f158640c` 对应）。
 
 ---
 
-## 4. 实践验证：如何从实验上验证算子满足 batch 不变性
+## 2. 需求分析
 
-> 实践验证分三个层级：**单算子级 → 特征实验级（shape/组合矩阵）→ 端到端级**。WIKI 中的核心口径是"**固定一条输入，对比其在单条处理 vs 不同 batch 组合处理下的输出是否完全一致（二进制一致）**"。
+### 2.1 Kimi-K3 模型结构剖析
 
-### 4.1 单算子级验证（以 l2norm 为例，WIKI 实测模板）
+#### 2.1.1 官方模型摘要（模型卡）
 
-参考页面：[batch不变性（l2norm 检验）](https://wiki.huawei.com/domains/171013/wiki/355964/WIKI2026032710566878)，代码仓：`Ascend/MindSpeed mindspeed/lite/ops/triton`。
+| 维度 | 参数 |
+| --- | --- |
+| 总参数 / 激活参数 | 2.8T / 104B |
+| 层数 | 93（69 层 KDA + 24 层 Gated MLA，第 0 层为 dense，其余为 MoE） |
+| 隐层维度 / 注意力头数 | 7168 / 96 |
+| KDA 配置 | head_dim=128，short_conv_kernel_size=4，use_full_rank_gate=true，gate_lower_bound=-5.0 |
+| MLA 配置 | kv_lora_rank=512，q_lora_rank=1536，qk_nope_head_dim=128，qk_rope_head_dim=64（保留但不旋转，`mla_use_nope=true`），v_head_dim=128，`mla_use_output_gate=true` |
+| MoE | 896 路由专家 top-16 + 2 共享专家；Latent MoE 维度 3584，每专家中间维 3072；sigmoid 路由 + noaux_tc（无辅助损失，带 e_score_correction_bias），renormalize |
+| AttnRes | attn_res_block_size=12 |
+| 激活函数 | SiTU-GLU（hidden_act="situ"，activation_situ_beta=4.0，activation_situ_linear_beta=25.0） |
+| 词表 / 上下文 | 163840 / 1048576（1M） |
+| 视觉 | MoonViT-V2，27 层，hidden 1024，patch 14，sd2_tpool 2×2 合并，patchmergerv2 投影到 7168 |
+| 量化 | 原生 MXFP4 权重 / MXFP8 激活（QAT）；社区 ModelSlim W4A8 量化版 |
+| 模态 | 文本、图像（vllm-ascend 当前实现不支持视频输入） |
 
-- **定长前向**：`test_l2norm_fwd.py`，数据来自**随机生成**；
-- **定长反向**：`test_l2norm_bwd.py`，数据来自**随机生成**；
-- **变长前向**：`test_l2norm_fwd_varlen.py`，数据来自 **dump 数据**（真实推理现场）；
-- **变长反向**：`test_l2norm_bwd_varlen.py`，数据来自 **dump 数据**；
-- **shape 覆盖矩阵**：对 `(B, T, H, D)`、`D=128`、`B={2, 4, 32}`、`T={100, 300, 1000, 8000, 32000}`、`H={2, 4, 8, 32}` 全组合验证——**不同 B 下相同 `(T,H,D)` 子结果必须一致**；
-- 经验：最大 shape 下存在风险点；变长 bwd 曾验证不通过，**用 `cdiv` 替代 `//` 后通过**——说明实现细节（取整方式）也会破坏不变性。
+#### 2.1.2 本地减层验证权重（bf16）
 
-**单算子验证的通用做法**：对同一输入数据，分别以"单条"和"打包进 B={2,4,8,...} 的 batch 的各个位置"两种方式调用算子（或同一 batch 内复制相同数据于不同位置），比较对应位置输出是否 bitwise 一致；多组随机种子重复。
+`D:\workspace\Kimi-K3减层bf16权重` 为按层裁剪的功能验证版（非精度验证版）：
 
-### 4.2 特征实验级验证（matmul / bmm，WIKI 实测模板）
+- `num_hidden_layers=4`：layer0 = dense MLP（`first_k_dense_replace=1`），layer1~3 = KDA（`kda_layers=[1,2,3]`，1-based），layer4（即 idx=3）= MLA（`full_attn_layers=[4]`，1-based；`is_kda_layer` 判定 `(layer_idx+1) in kda_layers`）；
+- 专家规模保留 896/top-16/2 共享，MoE 结构与全量一致；
+- bf16 未量化 → 走 **非量化 MoE MLP 路径**，需要 `7f158640c`/本地 `75c1fe22a` 的 SiTU 修复（原代码在非量化路径对 SiTU 抛 `NotImplementedError`）；
+- 附带完整的 K3 官方 tokenizer/processor/modeling 代码（`tokenization_kimi.py`、`encoding_k3.py`、`kimi_k3_processor.py` 等），`--trust-remote-code` 加载。
 
-参考页面：[RL batch不变性](https://wiki.huawei.com/domains/79152/wiki/131081/WIKI202510308808711)、[【BMM】实现batch一致性](https://wiki.huawei.com/domains/68949/wiki/232736/WIKI2026021110141755)。
+#### 2.1.3 KDA 递归公式（recurrent_kda README）
 
-**实验 1：bm 合轴一致性（batch 内各行一致）**
-- 构造 A 矩阵每个 batch 的输入一样，对比输出矩阵 `(16, 1, 1024)` 中每个输出 batch 是否完全一样；并与合轴后的 `(16, 7168) @ (1024, 7168)` 输出对比（16 份是否一致）→ batchmatmul 一致性可保证，mm 中 16 份一致。
+每 token 状态更新（gated delta rule）：
 
-**实验 2：m 大小不一样（mm 场景）**
-- A 矩阵 16 份相同，分别以 `(16*1, 7168)` 和 `(16*15, 7168)` 与 `(1024, 7168)` 相乘，对比 16 份结果；**多次运行随机种子不同，输出一致**。
+```text
+S = exp(gate_t) · S                      # 状态衰减
+delta = beta_t · (v_t − S @ k_t)         # delta 修正
+S = S + outer(delta, k_t)                # 状态更新
+o_t = S @ (q_t · scale)                  # 输出
+```
 
-**实验 3：前后 batch 数不一致（最关键的 batch 不变性实验）**
-- mm：`(3×16, 7168) @ (1024, 7168)` vs `(20×16, 7168) @ (1024, 7168)`，第一 case 的第 2 组与第二 case 的第 13 组输入完全一样，比较对应位置输出 → **结果不完全一致（均走 MatMulV2）**；
-- bmm：`(3, 16, 7168) @ (1024, 7168)` vs `(20, 16, 7168) @ (1024, 7168)`，对应 batch 比较，换多次随机种子 → **全部通过（均走 BMMV2）**；
-- 结论：**batch 不同或 m 不同时，K 的处理切分逻辑必须一致**；方案是路由到"一致性 kernel list"（K 累加方式相同的 kernel，如 BMMV3/MMV3，或固定切 K、for-batch 循环调用确定性 kernel）。
+其中 `gate = lower_bound · sigmoid(exp(A_log)·(g + dt_bias))`（safe_gate=True，lower_bound=-5.0），kernel 内做 q/k L2 归一化与 beta sigmoid。状态 S 为每头 `[K,V]=[128,128]` 矩阵（fp32），prefill 用 chunk 并行算法（`chunk_kda_fwd`，chunk_size∈{32,64,128}），decode 用逐步递归（`recurrent_kda`）。
 
-**实验 4：baseK 实验（验证 Kernel 内部参数不影响结果）**
-- baseK 32→16（减半）、baseM/N 与 baseK 同比例调整（64/128/64）等，前后**二进制结果一致** → 该 kernel 的内部切分参数不破坏不变性。
+#### 2.1.4 SiTU 激活（vllm_ascend/ops/activation.py）
 
-**验收标准（BMM 需求）**：**单 batch 组合成多 batch 场景，结果二进制一致**；精度标杆"双标杆"。
+```text
+gate' = β · tanh(gate/β) · sigmoid(gate)          # β = 4.0
+up'   = β_lin · tanh(up/β_lin)                    # β_lin = 25.0（可选）
+out   = gate' · up'
+```
 
-### 4.3 端到端级验证（vllm-ascend 实测模板）
+与 SiLU/SwiGLU 的区别：gate 支路用有界 soft-tanh 调制替代无界恒等映射，up 支路再做一次有界 tanh 压缩，抑制 MoE 大规模专家下的激活离群值（"Stable" LatentMoE 的稳定性来源之一）。
 
-参考页面：[【需求详设】batch不变性](https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026060611373620)、[RL推理满足batch不变性](https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026081512310528)、[batch不变性e2e验证](https://wiki.huawei.com/domains/64729/wiki/204290/WIKI202512119382989)。
+### 2.2 运行环境与硬件需求
 
-**用例 A：动态 batch + 动态位置（needle 测试）**
-`test_v1_generation_is_deterministic_across_batch_sizes_with_needle`
-1. 阶段1：单独输入 needle_prompt 生成**基线**输出；
-2. 阶段2：将 needle 随机混入不同大小 batch 的**随机位置**，多轮混合批次试验；
-3. 阶段3：提取 needle 位置的输出，**逐 token 与基线比对**（token_id / logprobs）。
-判定：全部匹配 → 通过；任一不匹配 → 打印差异、记录失败。
+| 层级 | 要求（v0.26.0rc 基线） |
+| --- | --- |
+| 硬件 | Atlas 800 A2（64G×8）/ Atlas 800 A3（64G×16）/ Ascend 950（A5，代码已支持、K3 文档主验证 A2/A3） |
+| 驱动/HDK | 与 CANN 版本配套 |
+| CANN | 9.0.1（A2 发布配套）或 9.1.0-beta.1（源码主线）；本地实测环境 CANN 9.1.0（`/mnt/share/x00886548/cann/cann_9_1_0`，toolkit + nnal/atb） |
+| Python | 3.10~3.12（本地 conda env `xmz_xq_kimi3`，Python 3.10） |
+| PyTorch | torch==2.10.0（CPU 版即可，NPU 能力由 torch-npu 提供）+ torchvision==0.25.0 + torchaudio==2.10.0 |
+| torch-npu | ==2.10.0.post2（requirements 锁定；本地曾用 2.10.0.post4） |
+| triton-ascend | ==3.2.1（requirements 锁定；本地曾用 3.2.2；Atlas 推理型 310P 不支持 triton，需卸载） |
+| vLLM | v0.26.0（`VLLM_TARGET_DEVICE=empty` 源码安装，插件模式接管 NPU 平台） |
+| 编译器 | gcc/g++ > 8，C++17；CMake ≥ 3.26（自定义算子编译） |
+| 显存 | 全量 W4A8：4×A3(16 卡) 起步（DP4/TP16/EP64）；1M 上下文需 ≥8×A3；A2 需 8 节点 DP8/TP8/EP64；减层 bf16 单机多卡即可 |
 
-**用例 B：BS=1 逐个生成 vs BS=N 批量生成**
-`test_logprobs_bitwise_batch_invariance_bs1_vs_bsN`
-1. BS=1 逐个生成，收集每步 logprobs 与 token_ids；
-2. BS=N 批量生成，收集每步 logprobs 与 token_ids；
-3. 逐 Prompt 逐 Token 比对（bitwise），汇总失败详情。
+### 2.3 功能需求清单
 
-**用例 C：数据集评测稳定性**
-- 打开 batch 不变性开关后，同一数据集（如 math500）**多轮评分完全一致不波动**（实测 10 轮均 95.4；基线在 94.6~95.8 波动）；
-- 对比输出不仅看评分，还需**逐样本对比推理结果完全一致**。
+| 编号 | 需求 | 说明 | 实现载体 |
+| --- | --- | --- | --- |
+| FR-1 | K3 架构注册 | vLLM v0.26.0 无 KimiK3 架构，需 OOT 注册 `KimiK3ForCausalLM`/`KimiK3ForConditionalGeneration`，并注册 `kimi_k3`/`k3_dspark` 配置类到 transformers AutoConfig 与 vLLM _CONFIG_REGISTRY，不依赖 checkpoint 远程代码 | `vllm_ascend/models/__init__.py`、`transformers_utils/configs/kimi_k3.py`、`vllm_ascend/__init__.py:register_model()` |
+| FR-2 | 混合注意力骨干 | 按 `linear_attn_config.kda_layers/full_attn_layers` 逐层选择 KDA 或 MLA；KDA 走 mamba 类状态管理（HasInnerState/IsHybrid），MLA 走 Ascend MLA backend | `models/kimi_k3.py`、`ops/kimi_kda.py`、`attention/mla_v1.py` |
+| FR-3 | KDA NPU 算子 | chunk prefill / recurrent decode / gate cumsum / layout swap / fused norm-gate 等 AscendC + Triton 算子，支持 ACL Graph 与投机解码所需的状态池索引 | `csrc/attention/*kda*`、`ops/triton/kda/*`、`ops/kimi_kda.py` |
+| FR-4 | MLA no-RoPE + 输出门控 | 保留 64 维 q/k rope 切片但不旋转（scale 按全 192 维计算）、g_proj sigmoid 输出门；MLAPO/FIA-split 在 no-RoPE 下可用（含 A5） | `models/kimi_k3.py:KimiK3MLAAttention`、`attention/mla_v1.py`、`device/device_op.py` |
+| FR-5 | AttnRes 块残差 | 每 12 层压入一个块残差流；每层两次（attn 前、MoE 前）对 {块残差流…, 当前前缀和} 做 RMSNorm+线性打分+softmax 加权混合；Triton 融合 kernel 加速 | `models/kimi_k3.py:_apply_attention_residual`、`ops/triton/kimi_k3/attention_residual.py` |
+| FR-6 | Stable LatentMoE + SiTU | 896 专家 top-16、隐空间 3584 dispatch/combine、共享专家融合、sigmoid+noaux_tc 路由、SiTU 激活贯通 bf16/W8A8/W4A8/MXFP4 各路径 | `models/kimi_k3.py:KimiK3MoE`、`ops/fused_moe/*`、`ops/activation.py`、`csrc/moe/dequant_situ_quant`、`csrc/moe/situ_mx_quant` |
+| FR-7 | 量化支持 | 原生 MXFP4 权重/MXFP8 激活（compressed-tensors）、ModelSlim W4A8（含 QuaRot 旋转、weightnz）、BF16 未量化路径；量化配置发现（text_config 内嵌 quantization_config 提升到顶层） | `quantization/*`、`transformers_utils/configs/kimi_k3.py` |
+| FR-8 | 多模态 | MoonViT-V2 视觉塔（NaViT 动态分辨率、2D 可学习位置编码插值、sd2_tpool 合并、patchmergerv2 投影）、图像占位 token 展开、vision DP（--mm-encoder-tp-mode data） | `models/kimi_k3.py`（视觉部分 + MultiModalProcessor）、`transformers_utils/processors/kimi_k3.py` |
+| FR-9 | 混合 KV Cache | MLA 全注意力 KV 与 KDA conv/recurrent 状态异构共存；prefix caching 需 `mamba_cache_mode=align`；PP 间传递 block_residual | `core/kv_cache_interface.py`、`patch_mamba_config.py`、`ops/kimi_kda_state.py` |
+| FR-10 | XTML 前端 | kimi_k3 renderer（tokenizer Python 编码器渲染，thinking/thinking_effort/tool_choice 校验映射）、reasoning parser（think 通道流式解析）、tool parser（structural tag 约束解码）、tokenizer_mode 自动选择、PD prefill 旁路、Responses API 禁用 | `patch/platform/kimi_k3_*.py`、`patch_kimi_k3_*.py` |
+| FR-11 | 投机解码 | K3 MLA DSpark：独立稠密 MLA 草稿模型（k3_dspark config + K3DSparkForCausalLM），proposer/verify、ACL Graph 辅助状态捕获、KDA 状态按 accepted tokens 回滚 | `models/kimi_k3_dspark.py`、`spec_decode/dspark_proposer.py`、`llm_base_proposer.py`、`patch_speculative_config.py` |
+| FR-12 | PD 分离 | 混合缓存（MLA KV + KDA conv/recurrent state）跨节点传输布局、非等 TP 传输、memcache KV 池（AscendStore）、D 侧 FA-only prefix cache 命中修正 | `distributed/kv_transfer/*`、`patch_kv_cache_coordinator.py` |
+| FR-13 | 并行策略 | TP（注意力头整除约束）+ EP（专家并行，>512 专家 AllGather 回退）+ DP（含 headless 多节点 DP）+ PP（block_residual 随 IntermediateTensors 传递）+ FlashComm1 序列并行 + CPU 绑核 | `ops/fused_moe/*`、`utils.py:enable_sp/shared_expert_dp_enabled`、部署参数 |
+| FR-14 | 性能优化 | KDA QKV 融合量化 linear（3 次动态量化+矩阵乘 → 1 次）、fused norm-gate、attention-residual Triton 融合、stride-aware recurrent 状态原地更新（免整状态拷贝）、MLAPO no-RoPE、A5 FIA split | 提交 #13989/#13509/#13836/#13507 |
 
-**端到端实验流程（流程图节选）**：设置随机种子 → 创建两个 LLM 引擎（bs=1 和 bs=N）→ 生成基准输出（bs=1 单独运行 needle）→ 多次试验（随机批次、needle 随机位置、bs=N 生成、提取 needle 输出、与基准比较）→ 统计结果判定。
+### 2.4 非功能需求
 
-**验证配置与约束（vllm-ascend 实测）**：
-- 模型：Qwen3 系列；设备 A2/A3（A5 需算子包支持）；
-- `export VLLM_BATCH_INVARIANT=1`；`eager=true`（不支持图模式）；`enable_prefix_caching=false`；
-- `enable_chunked_prefill=False`、`block_size=128`、`async_scheduling=False`（按版本要求）；
-- TP 可泛化 2/4（8 亦可），输入/输出 < 2k 常规、2k→20k 需特定 TP；并行 < 64；温度 0 或 0.6；
-- 推荐组合：TP=8、tmp=0、输入 512、输出 512、并行 32、重复 10 次。
+| 编号 | 需求 | 指标/说明 |
+| --- | --- | --- |
+| NFR-1 | 精度 | 官方验证：OCRBench、MMMU Pro Vision、ToolCall/KVVV（Thinking 模式，reasoning_effort=max，temperature=1.0）；DSpark 接受率冒烟 ~40%（16 专家裁剪权重） |
+| NFR-2 | 性能 | 部署指南基线：8K in/1K out 与 128K in（99% prefix 命中）/1K out（AISBench）；启用 chunked prefill、异步调度、prefix cache、ACL Graph FULL_DECODE_ONLY、FlashComm1、CPU 绑核 |
+| NFR-3 | 长上下文 | 131072（4×A3 混部）/ 262144（8×A2）/ 1048576（≥8×A3，DP8） |
+| NFR-4 | 硬件兼容 | A2/A3 已验证；A5（Ascend 950）代码路径就绪（arch35 kernel、no-RoPE MLAPO、FIA split）；310P 不支持 triton 路径 |
+| NFR-5 | 可维护性 | 所有对 vLLM 核心的 monkey-patch 在 `vllm_ascend/patch/__init__.py` 注释中登记 Why/How/上游 PR/Future Plan，上游合入后可移除 |
 
-**切换开关的对照验证（确认开关真起作用）**：
-- 不打开 batch 不变性开关 → 推理结果因动态 batch 影响而不一致（可稳定复现失败：MAX_TOKENS=35、BATCH_SIZE=144 时 100 组每组 5 次全失败）；
-- 打开开关 → 结果不受动态 batch 影响、保持一致；
-- 替换中间态检查：不替换 matmul 和 attention 一定失败；仅替换其一也失败；全部替换后才通过。
+### 2.5 能力差距分析（为什么必须做这些适配）
 
-### 4.4 验证时的常见问题与定位手法（WIKI 踩坑实录）
+| 差距 | 现状（vLLM v0.26.0 / transformers） | K3 需求 | 适配结论 |
+| --- | --- | --- | --- |
+| 模型架构缺失 | registry 只有 `KimiLinearForCausalLM`（文本、无 AttnRes/无输出门/无 LatentMoE 隐空间 dispatch） | 多模态 K3（视觉塔+投影器+占位符展开） | OOT 注册两个新架构，复用 KimiLinear 的 GDN 基座类名触发 PluggableLayer 替换 |
+| 配置类缺失 | transformers 不带 `kimi_k3`/`k3_dspark` model_type；checkpoint 用 auto_map 远程代码 | 不执行 checkpoint 远程代码也能加载（安全+稳定） | 插件内置 Config 类并注册到 `_CONFIG_REGISTRY` 与 `AutoConfig` |
+| KDA 算子缺失 | vLLM 有 GDN triton 路径（kimi_linear），NPU 上无 KDA 专用高性能算子 | chunk/recurrent KDA、gate cumsum、layout swap 均需 NPU 化并支持 ACL Graph/投机解码 | 新增 4 个 AscendC 算子（含 arch35 特化）+ Triton 融合 kernel，torch_binding 注册含 Meta 实现 |
+| MLA 差异 | 昇腾 MLA 路径假定有 RoPE（DeepSeek 系） | no-RoPE + 输出门控 + 12 头（A5 prolog 需 16 头） | mla_v1/device_op 增加 use_mla_rope 开关、g_proj 门控、A5 head padding |
+| MoE 激活缺失 | fused_moe 只支持 silu 等标准激活 | SiTU-GLU + 隐空间 dispatch（3584）+ 896 专家 | activation.py 新增 SituAndMul；FusedMoE 增加 routed_input/output_transform 挂点；非量化路径修复（7f158640c） |
+| 量化格式 | compressed-tensors/ModelSlim 已有框架 | K3 原生 MXFP4/MXFP8 + ModelSlim W4A8（QuaRot 旋转、weightnz、latent 投影量化） | w4a16_mxfp4/w4a8_mxfp4/modelslim_config/compressed_tensors_config 扩展映射 |
+| 前端协议 | vLLM 0.26 无 K3 XTML renderer/parser（上游 #50093/#50420/#50540/#50886 未进 pin 版本） | XTML think/response/tools 通道、reasoning_effort、无 Jinja 模板 | 全套 monkey-patch：renderer/parser/structural tag/media connector，行为对齐上游已合入实现 |
+| 投机解码 | DSpark 框架已有（DeepSeek V4/Qwen3），无 K3 草稿模型 | K3 MLA DSpark 草稿（markov_rank、非因果 draft attention、YaRN） | 新增 K3DSparkForCausalLM + proposer 扩展 + 辅助图捕获 |
+| 混合缓存 PD 传输 | Mooncake/AscendStore 只处理同构 KV | KDA conv/recurrent 状态 + MLA KV 异构、非等 TP | connector 增加 linear_attn_config 分支与 2M 对齐基址恢复 |
 
-| 现象 | 定位方法 |
-|---|---|
-| 端到端偶现不满足（如 50 轮出现 1 轮） | ① 在 GPU 上跑同测试确认 vllm 社区侧是否满足；② 采集 profiling 核对待替换算子是否已替换；③ 构造模型场景的单算子用例（如 TP allreduce）；WIKI 案例：softmax/addrmsnorm 理论满足、实际不满足 |
-| 长输出场景首 token 对不齐 | 与调度相关：chunk_prefill 使能时 P/D 分开给 FIA，不使能时合并——FIA 在 PD 混调下不支持 batch 不变性；关闭 chunk_prefill 可对齐 |
-| 评分波动但功能测试通过 | 对比两次推理输出是否逐样本一致（不只是评分）；用 msprobe 精度 slice/dump 工具比对 bs=1 与 bs=N 的统计数据 |
-| BS=N 场景采集不到数据 | 请求被**驱逐**后重新调度，prefill 长度 = 原 prompt + 已生成 token 长度，FIA 处理不一致 → 调整 TP/BS 场景重测 |
-| 耗时异常 | CPU 等待 NPU、matmul 耗时异常（`weight.t()` 内存非连续导致 triton 性能差 → 需 .contiguous() 或算子侧处理） |
-| 算子替换不生效/找不到 | 检查算子包与 CANN 版本匹配（A5 需 9.1.0.B082+ 才支持 HCCL_DETERMINISTIC=strict）、`pip show batch_invariant_ops`、`torch.ops.batch_invariant_ops.*` 可注册访问、.json 路径加载 |
+### 2.6 约束与假设
 
-### 4.5 使能方式与生效检查（vllm-ascend 落地）
-
-1. 安装 batch 不变性算子包（run 包 + whl 包：`cann-ops-batch_invariant-*`、`batch_invariant-torch_ops_extension`），或 7 月 4 日后 `VLLM_BATCH_INVARIANT=1 pip install -v -e . ...` 内置安装；
-2. 使能：`export VLLM_BATCH_INVARIANT=1`；
-3. 框架自动完成（`init_batch_invariance()`）：
-   - 环境覆盖：`HCCL_DETERMINISTIC=strict`、`LCCL_DETERMINISTIC=1`、`torch.use_deterministic_algorithms(True, warn_only=True)`、关闭 `weight_nz_mode`、关闭 `enable_matmul_allreduce`、`enable_async_exponential=False`；
-   - 算子替换（注册 aten 算子到 batch-invariant 实现）：`addmm/bmm/softmax/_softmax/mm/matmul/sum/linear`、`npu_fused_infer_attention_score`、`add_rms_norm`、`reduce_sum`；优先级 AscendC（batch_invariant_ops）> Triton fallback；
-4. 生效检查：`test_batch_inv.sh` / `test_batch_invariant.py` 反复比较不同 batch size 下相同 prompt 的推理结果。
-
-### 4.6 验收标准汇总
-
-1. 功能验证脚本测试用例**全部通过**（needle 测试 + bs1 vs bsN 逐 token bitwise 对齐）；
-2. 数据集评测满足要求、**评分不波动**，且逐样本输出完全一致；
-3. 单算子验收：**单 batch 组合成多 batch，结果二进制一致**；
-4. 性能劣化可接受（实测端到端劣化约 5%；吞吐劣化 3.4%~4.6%，随并发增大劣化略增）——batch 不变性本质是"固定归约策略换确定性"，需与性能权衡。
-
----
-
-## 5. WIKI 相关页面清单（来源）
-
-| # | 标题 | 链接 | 核心内容 |
-|---|---|---|---|
-| 1 | RL batch不变性 | https://wiki.huawei.com/domains/79152/wiki/131081/WIKI202510308808711 | 定义、bmm/mm 影响因素、batch 一致性实验（bm合轴/m 不同/batch 数不同、baseK） |
-| 2 | Batch不变性（64729） | https://wiki.huawei.com/domains/64729/wiki/204290/WIKI202512019236074 | 入口页，链接到算子一致性讨论 |
-| 3 | 算子一致性（确定性、batch一致性、训推一致） | https://wiki.huawei.com/domains/68949/wiki/232736/WIKI202601289966155 | 概念体系、服务化能力影响、LLM-42 论文解读 |
-| 4 | 【BMM】实现batch一致性 | https://wiki.huawei.com/domains/68949/wiki/232736/WIKI2026021110141755 | BMMV3BatchInvariant 方案、验收标准（二进制一致） |
-| 5 | batch不变性（171013，l2norm 检验） | https://wiki.huawei.com/domains/171013/wiki/355964/WIKI2026032710566878 | 单算子验证模板：定长/变长、fwd/bwd、shape 矩阵、cdiv 修复 |
-| 6 | Batch 不变性（152732） | https://wiki.huawei.com/domains/152732/wiki/325378/WIKI2026062911655366 | 浮点数非结合性入门、rmsnorm/matmul/attention |
-| 7 | 【需求详设】batch不变性 | https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026060611373620 | 需求背景、方案原理（matmul 评测数据）、整体方案、验证流程、测试结果、环境变量 |
-| 8 | Batch不变性算子替换验证 | https://wiki.huawei.com/domains/85423/wiki/146593/WIKI2026060211321063 | Qwen3 30B A3B / 1.7B 精度、速度、算子替换结果 |
-| 9 | 【临时方案】vllm-ascend安装batch不变性ascendc算子 | https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026060311335073 | 算子包下载安装（run/whl）、开关控制、A2/A3/A5 验证 |
-| 10 | batch不变性e2e验证 | https://wiki.huawei.com/domains/64729/wiki/204290/WIKI202512119382989 | e2e 测试流程、显存/耗时/精度踩坑、验证代码流程 |
-| 11 | Qwen3 系列 batch不变性算子分析 | https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026063011664604 | profiling 采集（TP=4、温度0.6、计算/通信算子） |
-| 12 | 跳伞活动-Batch不变性验证 | https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026062311558552 | A3/A5 环境搭建、离线单推与验证脚本、A5 踩坑记录 |
-| 13 | attention batch 不变性 | https://wiki.huawei.com/domains/124182/wiki/290311/WIKI202512059321656 | FA 分块规约原理、特征方向/序列方向、cache 与当前 token 分开规约破坏不变性 |
-| 14 | RL推理满足batch不变性 | https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026081512310528 | 完整原理（split-K/splitReduce/splitKV/allreduce）、算子实现方案、调测案例（A3 偶现、A5 math500/2k推20k）、性能数据、模型支持 |
-| 15 | Batch不变性_适配分析 | https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026073112099926 | v2 runner 使能流程、10 个 Triton kernel 看护清单与 batch invariance 关系分析 |
-| 16 | RL batch不变性（跳伞） | 见 #12 | 同 #12 |
+1. vLLM 版本被 pin 在 v0.26.0（commit d02df748），所有 patch 以该版本为基线；上游后续合入 K3 前端后（PR #50093 等），插件 patch 需按 `patch/__init__.py` 登记逐项回收；
+2. K3 的 tokenizer/图像处理器契约由 checkpoint 目录内官方 Python 文件（`tokenization_kimi.py`、`encoding_k3.py`、`kimi_k3_processor.py` 等）提供，需 `--trust-remote-code`；TIKTOKEN_CACHE_DIR 建议预热缓存；
+3. TP 大小必须整除注意力头数（96），且影响 KDA 状态布局与专家放置；
+4. 视频输入不支持（当前仅图像）；Responses API 对 K3 显式禁用（仅 Chat Completions）；
+5. 自定义算子编译（COMPILE_CUSTOM_KERNELS=1）需 gcc>8/C++17，A3 构建需 git submodule（CANN 算子依赖库）；构建产物与 SoC 绑定（`check_ascend_device_type` 会校验运行时芯片与编译目标一致）。
 
 ---
 
-## 6. 一页速记（TL;DR）
+## 3. 总体设计
 
-- **定义**：同一输入放在任何 batch 大小/位置，输出（token_id + logprobs）完全不变；对算子：不同 batch 组合的输入，结果与单条一致（比确定性、位置一致更严格）。
-- **根因**：浮点数非结合性 + 算子为性能随 batch 动态切分归约轴（matmul split-K、attention split-KV、reduce split、allreduce 规约序）。
-- **理论验证**：① 是否规约类算子；② tiling 是否随 batch 变；③ K 轴累加序是否恒定；④ 行为分支是否一致（PD 混调、模板选择）；⑤ 通信规约顺序；⑥ 辅助 kernel 的映射/padding/seed 稳定、写隔离。
-- **实践验证**：单算子（l2norm：定长/变长 × fwd/bwd × shape 矩阵）；特征实验（bm 合轴、m 不同、前后 batch 数不同、baseK、二进制一致）；端到端（needle 随机位置对齐、bs1 vs bsN 逐 token bitwise 对齐、数据集多轮评分不波动）；开关对照（关开关必失败、全替换才通过）。
-- **使能**：`VLLM_BATCH_INVARIANT=1` + batch 不变性算子包（AscendC + Triton fallback）+ HCCL_DETERMINISTIC=strict 等；约束：eager、关 prefix caching、关 chunk_prefill 等；代价：端到端性能劣化约 5%。
+### 3.1 适配架构总览
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│                        OpenAI 兼容 API (vllm serve)                     │
+│  Chat Completions ── KimiK3Renderer(XTML, tokenizer Python encoder)     │
+│                  ── KimiK3Parser = KimiK3ReasoningParser + ToolParser    │
+│                     (structural tag 约束解码, thinking_effort 校验)       │
+├────────────────────────────────────────────────────────────────────────┤
+│                          vLLM v0.26.0 core (pin)                        │
+│  EngineCore/Scheduler/KVCacheManager  ModelRegistry(OOT注册)             │
+│  FusedMoE / MultiHeadLatentAttentionWrapper / GDN(mamba) 基座            │
+│  SpeculativeConfig(DSpark) / MultiModal Registry                         │
+├────────────────────────────────────────────────────────────────────────┤
+│                    vllm-ascend 插件 (v0.26.0rc + K3)                    │
+│  models/kimi_k3.py        ── AscendKimiK3ForCausalLM / ForConditionalGen │
+│  models/kimi_k3_dspark.py ── K3DSparkForCausalLM (MLA 草稿)              │
+│  transformers_utils/      ── KimiK3Config/TextConfig/VisionConfig        │
+│                               K3DSparkConfig / KimiK3Processor           │
+│  ops/kimi_kda.py          ── AscendKimiGatedDeltaNetAttention (OOT替换)   │
+│  ops/fused_moe/*          ── SiTU/LatentMoE/EP/共享专家DP                 │
+│  attention/mla_v1.py      ── no-RoPE MLA + 输出门控 + FIA split           │
+│  patch/platform/*         ── renderer/parser/media/spec-config patch      │
+│  distributed/kv_transfer  ── 混合缓存 PD 传输 (Mooncake/AscendStore)       │
+│  ops/triton/*             ── fused_norm_gate / attention_residual 融合    │
+├────────────────────────────────────────────────────────────────────────┤
+│              csrc 自定义算子 (AscendC, COMPILE_CUSTOM_KERNELS=1)          │
+│  chunk_kda_fwd | recurrent_kda | kda_gate_cumsum | kda_layout_swap12     │
+│  dequant_situ_quant | situ_mx_quant | chunk_gated_delta_rule_fwd_h        │
+│  (torch_binding.cpp 注册 + Meta 符号实现, 支持图捕获/编译)                  │
+├────────────────────────────────────────────────────────────────────────┤
+│      CANN 9.0.1/9.1.0 (toolkit + nnal/atb) + torch-npu + triton-ascend   │
+│      Atlas 800 A2 (910B) / A3 (910C) / Ascend 950 (arch35)               │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 关键设计策略
+
+1. **OOT 注册而非修改 vLLM**：K3 模型、配置、processor 全部通过 vLLM 插件机制（`ModelRegistry.register_model`、`_CONFIG_REGISTRY`、`AutoConfig.register`）注入，vLLM 本体零修改；对 vLLM 行为差异（前端、投机配置、KV 协调器）用集中登记的 monkey-patch（`patch/platform/*`）弥合，并标注上游 PR 与移除计划。
+2. **复用 GDN 基座 + PluggableLayer 替换**：KDA 层按上游注册类名 `KimiGatedDeltaNetAttention` 实例化，由 `register_ascend_customop` 将其替换为 `AscendKimiGatedDeltaNetAttention`（`ops/kimi_kda.py`），从而复用 vLLM 的 mamba 状态管理（cache 分配、copy func、prefix caching）而只重写计算路径。
+3. **chunk/recurrent 双路径 + 容量型状态池**：prefill 用 chunk 并行算子，decode 用递归算子；状态池按容量组织、以 device 端索引寻址（packed `[T]` 或投机 `[seq_num,max_step]`），host 不读设备值 → 兼容 ACL Graph 捕获与 DSpark 回滚（`num_accepted_tokens`）。
+4. **隐空间 MoE**：FusedMoE 挂 `routed_input_transform`（7168→3584 down_proj）与 `routed_output_transform`（norm+up_proj 3584→7168），使 dispatch/combine 通信量减半，专家在 3584 维隐空间计算（Stable LatentMoE 语义与 checkpoint 权重形状一致）。
+5. **算子融合优先，纯 PyTorch 兜底**：Triton 可用时走 fused norm-gate / attention-residual / SiTU 融合路径，不可用时回退 torch_npu 组合算子（`HAS_TRITON` 分支），保证 A2/A3/310P 兼容面。
+6. **量化路径分层**：原生 MXFP4（compressed-tensors）与 ModelSlim W4A8（QuaRot + weightnz + dequant_situ_quant 融合）分别映射；latent 投影仅在 ModelSlim（quant_config 名 "ascend"）下量化；视觉塔对 compressed-tensors 配置强制忽略（保持 bf16）。
+7. **前端对齐上游语义**：XTML 协议常量、reasoning/tool parser、renderer 行为以"上游已合入 PR"为准绳（#13520 复核 vLLM main d8f840071），未合入语义不提前实现，降低后续升级成本。
+
+### 3.3 代码组织与模块划分
+
+| 模块 | 路径 | 职责 |
+| --- | --- | --- |
+| 模型实现 | `vllm_ascend/models/kimi_k3.py`（1736 行） | K3 文本骨干 + 视觉塔 + 多模态 processor + 权重加载 |
+| 投机草稿 | `vllm_ascend/models/kimi_k3_dspark.py`（573 行） | K3 MLA DSpark 草稿模型 |
+| 配置 | `vllm_ascend/transformers_utils/configs/kimi_k3.py` | KimiK3Config/TextConfig/VisionConfig/K3DSparkConfig + 注册 |
+| Processor | `vllm_ascend/transformers_utils/processors/kimi_k3.py` | 图像→checkpoint processor 的薄适配层 |
+| KDA 编排 | `vllm_ascend/ops/kimi_kda.py`（~700 行）、`kimi_kda_state.py` | Ascend OOT KDA 层实现 + 状态形状 |
+| GDN 元数据 | `vllm_ascend/ops/gdn_attn_builder.py` | KDA prefill/decode/chunked 元数据构建 |
+| MLA | `vllm_ascend/attention/mla_v1.py`、`device/device_op.py`、`ops/mla.py` | no-RoPE MLA、MLAPO、FIA split |
+| MoE | `vllm_ascend/ops/fused_moe/*`、`ops/activation.py` | SiTU、LatentMoE、EP/DP、量化 MoE 流水线 |
+| Triton 融合 | `vllm_ascend/ops/triton/kda/*`、`triton/kimi_k3/*`、`triton/fused_norm_gate.py` | norm-gate、attention-residual 融合 kernel |
+| AscendC 算子 | `csrc/attention/{chunk_kda_fwd,recurrent_kda,kda_gate_cumsum,kda_layout_swap12}`、`csrc/moe/{dequant_situ_quant,situ_mx_quant,chunk_gated_delta_rule_fwd_h}` | KDA/SiTU 自定义算子（含 arch35 特化） |
+| 算子绑定 | `csrc/torch_binding.cpp`、`torch_binding_meta.cpp` | torch.ops 注册 + Meta 符号实现（图捕获） |
+| 量化 | `vllm_ascend/quantization/{modelslim_config,compressed_tensors_config,methods/w4a16_mxfp4,methods/w4a8_mxfp4}.py` | K3 量化映射 |
+| 前端 patch | `vllm_ascend/patch/platform/{kimi_k3_parser,kimi_k3_reasoning_parser,kimi_k3_tool_parser,kimi_k3_structural_tag,kimi_k3_protocol,patch_kimi_k3_parsers,patch_kimi_k3_renderer,patch_media_connector}.py` | XTML 前端全栈 |
+| 投机 patch | `vllm_ascend/patch/platform/patch_speculative_config.py`、`spec_decode/{dspark_proposer,llm_base_proposer}.py` | DSpark 配置归一化与 proposer |
+| KV 传输 | `vllm_ascend/distributed/kv_transfer/*`、`patch_kv_cache_coordinator.py` | 混合缓存 PD 传输 |
+| 测试 | `tests/ut/models/test_kimi_k3*.py`、`tests/ut/ops/test_kimi_kda.py`、`tests/ut/patch/platform/test_patch_kimi_k3_*.py`、`tests/e2e/nightly/single_node/ops/*kimi_k3*` | UT + 单卡算子 e2e |
+
+### 3.4 关键提交清单（releases/v0.26.0rc）
+
+| 提交 | PR | 内容 |
+| --- | --- | --- |
+| `23cfbd5ba` | #12950 | **主特性**：K3 全量支持（模型/KDA 算子/量化 MoE/多模态/前端/KV 传输/FIA split/GQA DSpark 基础），+35410 行 |
+| `a2e0f489b` | #13277 | K3 **MLA DSpark** 投机解码（草稿模型、proposer、ACL Graph 辅助捕获、prefix cache/PD/QuaRot 兼容修复） |
+| `1dd9e54ac` | #13520 | K3 前端**对齐上游**（reasoning 流式增量扫描、随机 tool-call ID、named tool choice、tokenizer_mode 自动选择） |
+| `5d401ca73` | #13507 | A5 **no-RoPE MLAPO**（BF16 未量化权重 NZ prolog、12→16 头 padding） |
+| `d64087c06` | #13509 | **Triton 融合**：KDA fused norm-gate + K3 attention-residual |
+| `b4780581f` | #13989 | KDA **QKV 融合**为单个量化 linear（MXFP8 路径 3 次量化+matmul → 1 次） |
+| `15e1109a5` | #13836 | recurrent_kda **stride-aware** 状态原地更新（免整状态拷贝，支持非连续 cache 视图） |
+| `7f158640c` | — | **SiTU 非量化 MoE MLP 路径修复**（原抛 NotImplementedError；本地 `feat/situ-moe-mlp` 分支同源修复 `75c1fe22a`） |
+| `bc975f29e`/`842c8a9da` | #13467/#12850 | MLA preprocess **RoPE 开关**（no-RoPE 前置依赖） |
+| `504c4a92d` | #13422 | mla_prolog_v3 支持首轴非连续 kv/kr cache |
+| `fa1117abc` | #13733 | SiTU + 动态 EPLB + W4A8 量化映射 |
+| `3bb3c9bab`/`5cf0420ab`/`3c00e6fbd` | #12952/#13037/#13143 | K3 部署指南（A3/A2 拓扑，v0.23.0 分支文档） |
+
+---
