@@ -1,1 +1,16 @@
-https://gitcode.com/Ascend/docs/blob/master/common/Writing_Template/16_XX%E4%BA%A7%E5%93%81%20%E7%89%88%E6%9C%AC%E8%AF%B4%E6%98%8E%E4%B9%A6.md
+# 永久生效，重启容器不用重新source
+echo "source /mnt/share/x00886548/miniconda3/etc/profile.d/conda.sh" >> /etc/profile
+
+# 写入conda配置，指定envs、pkgs目录到挂载盘
+cat > ~/.condarc <<EOF
+envs_dirs:
+  - /mnt/share/vllm/conda_envs
+pkgs_dirs:
+  - /mnt/share/vllm/conda_pkgs
+show_channel_urls: true
+default_channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r
+EOF
+
+source /mnt/share/x00886548/miniconda3/etc/profile.d/conda.sh
