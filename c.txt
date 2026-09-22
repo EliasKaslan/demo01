@@ -1,120 +1,48 @@
-从里面找找，0.27的镜像。我之后要用来跑Kimi-K3。你只需要帮我找到下载链接即可
-14:29
-
-
-17 次工具调用 · 2 条消息
-查完了。先说一个关键前提：vllm-ascend 的 0.27 还没有正式发布 tag（GitHub 上最新 tag 只到 v0.26.0rc2），0.27 只有 releases/v0.27.1rc 分支构建出来的 nightly 镜像。所以镜像名必须带 nightly-releases- 前缀。
-
-0.27 的镜像（A3，你的机器）
-官方 registry 是 quay.io：
-
-bash
-复制
-# Ubuntu 底包（8.15 GB，arm64，构建于 2026-09-07）
-docker pull quay.io/ascend/vllm-ascend:nightly-releases-v0.27.1rc-a3
-# digest: sha256:d2f33eafe1c0ab3acd9e97e6f37d3504bbb8dfc216e752c61fdd3bef3ed4b422
-
-# openEuler 底包（10.08 GB，arm64，构建于 2026-09-21，更新）
-docker pull quay.io/ascend/vllm-ascend:nightly-releases-v0.27.1rc-a3-openeuler
-# digest: sha256:9ec4bfac6da6b22774a8232eb045171f6b534e2924cd9d82560b36d1272b40a9
-⚠️ 坑：quay.io/ascend/vllm-ascend:v0.27.1rc-a3（不带 nightly-releases-）不存在，直接 pull 会报 manifest unknown —— 因为 0.27 没出正式版，docs 里的 {{ vllm_ascend_version }}-a3 模板只对已发布版本成立。
-
-0.27 这一线的全部 tag（filter_tag_name=like:v0.27 全量）：
-
-tag	硬件	底包	架构	大小	构建时间
-nightly-releases-v0.27.1rc-a3	A3	Ubuntu	arm64	8.15 GB	09-07
-nightly-releases-v0.27.1rc-a3-openeuler	A3	openEuler	arm64	10.08 GB	09-21
-nightly-releases-v0.27.1rc-a5 / -a5-openeuler	A5	Ubuntu / openEuler	arm64	7.88 / 10.73 GB	09-08 / 09-21
-nightly-releases-v0.27.1rc-310p / -310p-openeuler	310P	Ubuntu / openEuler	amd64+arm64	~9.4 / 9.8 GB	09-10
-nightly-releases-v0.27.1rc-openeuler	A2（默认）	openEuler	amd64	8.84 GB	09-22
-但你要跑 Kimi-K3，教程指定的是另一个 tag
-仓库里已经有 Kimi-K3 的专门教程 docs/source/tutorials/models/Kimi-K3.md，开头写着 "based on vLLM-Ascend main with vLLM 0.27.1"，第 4.1 节给的镜像不是 0.27.1rc 分支镜像，而是 main 分支镜像：
-
-bash
-复制
-docker pull quay.io/ascend/vllm-ascend:nightly-main-a3
-# 多架构 manifest list，2026-09-21 构建
-# digest: sha256:1a0892eab272f4251f143b36eb7391859c3f94a28e415f08e3dc45e89fcc0b99
-它同样是 vLLM 0.27.1 栈，但比 0.27.1rc 分支镜像新两周。如果你就是照官方教程跑 Kimi-K3（4×Atlas 800 A3，DP4/TP16/EP64，W4A8 全量 1.49 TB），建议直接用它；想钉在 0.27.1rc 发布分支上就用上面的 nightly-releases-v0.27.1rc-a3。
-
-国内拉取更快的镜像站
-Docker Hub 的 ascendai/vllm-ascend 有同名 tag（digest 与 quay 完全一致）：
-
-bash
-复制
-docker pull ascendai/vllm-ascend:nightly-releases-v0.27.1rc-a3
-docker pull ascendai/vllm-ascend:nightly-main-a3
-镜像列表页：quay.io/repository/ascend/vllm-ascend?tab=tags ｜ hub.docker.com/r/ascendai/vllm-ascend/tags
-
-另外顺带说明：quay 上还有 kimi-k3、kimi-k3-a3、kimi-k3-a3-openeuler 这几个专用 tag，但它们构建于 2026-07-27，比 0.27 栈早一个多月，应是早期预览镜像，跑 0.27 不建议用。
-
-拉到后按教程第 4.1 节验证一下版本：python -m pip show vllm vllm-ascend。
-
-
-
-
-
-
-用量 772K tok
-
-用时 2分01秒
-14:31
-这些链接的来源是？你是怎么找到的？
-14:32
-
-
-4 次工具调用 · 1 条消息
-全部来自公开接口和仓库原始文件，没有一条是我猜的链接。只有一处我当时是推断的（tag 命名规则），刚才顺手把它也证实了。 下面按「结论 ← 来源」逐条交代。
-
-1. 溯源表
-我的结论	来源（我实际请求的 URL）	返回了什么
-0.27 的镜像 tag 是 nightly-releases-v0.27.1rc-*，含 digest/大小/日期	quay.io/api/v1/repository/ascend/vllm-ascend/tag/?limit=100&page=1&onlyActiveTags=true	真实 tag 列表 JSON，7 个含 v0.27 的 tag
-0.27 全部变体（a3/a5/310p/openeuler）	同上，加 &filter_tag_name=like:v0.27	精确 7 条，全带 nightly-releases- 前缀
-v0.27.1rc-a3 不存在	同上 like:v0.27 的全量枚举	子串匹配下没有任何不带前缀的 v0.27* tag
-nightly-releases-v0.27.1rc（A2 Ubuntu）也不存在	.../tag/?specificTag=nightly-releases-v0.27.1rc&onlyActiveTags=false	{"tags": []}
-0.27 没有正式发布版	api.github.com/repos/vllm-project/vllm-ascend/tags?per_page=100	最新 tag 是 v0.26.0rc2
-0.27 对应分支 releases/v0.27.1rc	api.github.com/repos/vllm-project/vllm-ascend/branches?per_page=100	分支列表含 releases/v0.27.1rc、releases/v0.28.0rc
-Kimi-K3 教程指定 nightly-main-a3	raw.githubusercontent.com/.../main/docs/source/tutorials/models/Kimi-K3.md	原文："based on vLLM-Ascend main with vLLM 0.27.1"，4.1 节 export IMAGE=quay.io/ascend/vllm-ascend:nightly-main-a3
-镜像架构：a3/a5 仅 arm64，310p 双架构，无后缀=A2/amd64	hub.docker.com/v2/repositories/ascendai/vllm-ascend/tags?page_size=100&name=0.27	每条 tag 的 images[].architecture 字段
-Docker Hub 是同一份镜像（可当加速源）	同上，digest 与 quay 完全一致	例：a3 → 两边都是 sha256:d2f33eaf...
-2. tag 命名规则：从「推断」变成「证实」
-我上一轮说 nightly-releases-v0.27.1rc-a3 是 releases/v0.27.1rc 分支构建的 —— 当时这是推断（靠字符串形状 + 分支存在）。你问了之后我读了 CI 原始文件，现在是实锤。
-
-.github/workflows/_schedule_image_build.yaml（release 镜像的合并/发布任务）：
-
-yaml
-复制
-PATTERN="${{ inputs.branch_ref }}"
-PATTERN="${PATTERN//\//-}"        # releases/v0.27.1rc → releases-v0.27.1rc
-...
-type=schedule,pattern=${{ steps.tag_pattern.outputs.pattern }},prefix=nightly-,suffix=${{ env.SUFFIX }}
-type=pep440,pattern={{raw}},suffix=${{ env.SUFFIX }}
-.github/workflows/schedule_image_build_and_push.yaml 给出 suffix ↔ 芯片对照：
-
-json
-复制
-{name:"A2 Ubuntu",   suffix:""},              {name:"A3 Ubuntu",  suffix:"a3"},
-{name:"310P Ubuntu", suffix:"310p"},          {name:"A5 Ubuntu",  suffix:"a5"},
-{name:"A2 openeuler",suffix:"openeuler"},     {name:"A3 openEuler",suffix:"a3-openeuler"}, ...
-两者相乘就精确复现了我给的每一条 tag：nightly- + main + -a3 = nightly-main-a3；nightly- + releases-v0.27.1rc + -a3 = nightly-releases-v0.27.1rc-a3。
-
-同一份文件还解释了「为什么 v0.27.1rc-a3 不存在」：只有 type=pep440 那条规则（on: push tags: v*）才会产出不带 nightly- 前缀的裸版本 tag。0.27 还没打过 v* tag，所以这个形状的 tag 根本没人建过 —— 这不是猜的，是 CI 规则决定的。
-
-另外这份文件顶部写明：镜像其实是在 SWR（swr.cn-north-12.myhuaweicloud.com/ascend/vllm-ascend）构建并合并多架构，再由 sync-tools 同步到 quay.io。所以 quay.io 是镜像站，Docker Hub 的 ascendai/ 是又一层镜像 —— 三者 digest 一致。
-
-3. 我没有验证的部分（重要）
-镜像里到底是不是 vLLM 0.27.1：这句话我只在 Kimi-K3.md 文档里读到，没有实际拉 8 GB 镜像跑 pip show 去验证。它是官方文档的声明，不是我的实测。
-digest 未做拉取比对：sha256:d2f33eaf... 等值来自 quay/Docker Hub 的 API 元数据（两边一致，交叉印证），但我没 docker pull 后比对本地 digest。
-nightly-releases-v0.27.1rc（A2 Ubuntu）为何缺失：CI 里 release 模式本该产出它，实际没有。可能是那次 A2 构建没跑/失败，或被清理了 —— 原因我没查到，不做推测。
-我的第一轮 web_search 其实没给出决定性信息（只贡献了 Docker Hub 仓库名，还夹带了一条 vllm-omni 仓库的 "v0.27.0" 噪声，那是另一个项目的版本号，我没采信）。真正的信息全部来自上面的 API 和原始文件。
-期间还有一次失败：按直觉去取 docs/source/installation.md 返回 404，我改用 GitHub contents API 枚举真实目录才找到文档位置。
-4. 你可以自己复核（可复现）
-bash
-复制
-# tag 是否真实存在 + digest
-curl -s "https://quay.io/api/v1/repository/ascend/vllm-ascend/tag/?specificTag=nightly-releases-v0.27.1rc-a3" | head -c 400
-
-# 镜像内版本自证（最硬的验证）
-docker pull quay.io/ascend/vllm-ascend:nightly-main-a3
-docker run --rm quay.io/ascend/vllm-ascend:nightly-main-a3 python -m pip show vllm vllm-ascend
-⚠️ 提醒一点：nightly-main-a3 是滚动 tag，每天可能变；我给的 digest 是 2026-09-21 那次构建。要可复现就按 Kimi-K3.md 的建议钉 digest：quay.io/ascend/vllm-ascend@sha256:1a0892eab272f4251f143b36eb7391859c3f94a28e415f08e3dc45e89fcc0b99。
+allreduceAicpuKernel
+GroupedMatmul
+MatMulV3BatchInvariant
+allgatherAicpuKernel
+ChunkGatedDeltaRule
+Cast
+MoeInitRoutingV3
+Transpose
+ConcatD
+Add
+Index
+fused_gdn_gating_kernel
+RmsNorm
+SwiGlu
+Slice
+Mul
+CausalConv1d
+IndexPutV2
+FusedInferAttentionScoreBatchInvariant
+MoeGatingTopK
+RecurrentGatedDeltaRule
+MoeTokenUnpermute
+_layer_norm_fwd_1pass_kernel_npu
+BroadcastTo
+l2norm_fwd_kernel2
+IndexCheck
+_clear_ssm_states_kernel
+Sigmoid
+ZerosLike
+split_qkv_rmsnorm_mrope_kernel
+Abs
+Sub
+ArgMaxV2
+ScatterPaKvCache
+Range
+Fill
+GatherElementsV2
+MaskedFill
+GatherV2
+FloorDiv
+_compute_slot_mapping_kernel
+GemmaRmsNorm
+ClipByValueV2
+Greater
+GreaterEqual
+Less
+LogicalAnd
+LogicalNot
