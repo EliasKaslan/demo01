@@ -1,261 +1,120 @@
-# 算子 Batch 不变性（Batch Invariance）——主题总结与验证指南
+从里面找找，0.27的镜像。我之后要用来跑Kimi-K3。你只需要帮我找到下载链接即可
+14:29
 
-> **检索范围**：公司内网 WIKI（wiki.huawei.com），关键词："算子的batch不变性"、"batch不变性 验证"、"算子一致性 训推一致"等，共筛选并通读相关页面 15+ 篇。
-> **文档目的**：汇总内网 WIKI 中与"算子的 batch 不变性"相关的知识（背景、根因、方案），并给出**从理论、实践两个层面验证算子是否满足 batch 不变性**的方法体系。
-> **说明**：本文内容均整理自内网 WIKI，关键结论附来源链接（见文末清单）。官方术语在不同页面中混用"batch不变性 / batch一致性 / batch invariant"，本文统一用"batch 不变性"。
 
----
+17 次工具调用 · 2 条消息
+查完了。先说一个关键前提：vllm-ascend 的 0.27 还没有正式发布 tag（GitHub 上最新 tag 只到 v0.26.0rc2），0.27 只有 releases/v0.27.1rc 分支构建出来的 nightly 镜像。所以镜像名必须带 nightly-releases- 前缀。
 
-## 1. 主题概述
+0.27 的镜像（A3，你的机器）
+官方 registry 是 quay.io：
 
-### 1.1 什么是"算子的 batch 不变性"
-
-- **LLM/推理层面**：固定一条输入（prompt），放置到任意不同大小的 batch（由多条 prompt 构成）的任意位置处，LLM 处理该 batch 得到的输出结果中，对应该条给定输入的输出结果不变（**token_id 和对数概率一致**）。
-- **算子层面（更严格）**：算子不同的请求组合（对算子而言就是不同的 batch 组合）输入所产生的结果，与单个请求（单条）输入产生的结果相同。它比"位置一致"更严格——**输入 shape 不同（batch 数不同）时算子结果仍要一致**。
-- **数学表达（以 bmm 为例）**：`[2, m, k] @ [2, k, n] = [2, m, n]`，若第一个 batch 与第二个 batch 输入数据一致，要求输出也一致；且随着 batch 增加，每个 batch 内的输出不能变——相同输入、相同输出，不受批次组合影响。
-
-### 1.2 相关概念辨析（WIKI 中的一致性层级）
-
-| 概念 | 定义 | 对比 |
-|---|---|---|
-| 算子确定性（幂等性） | 相同输入（shape+值均相同）连续执行多次，结果一致 | 前提是**输入完全相同** |
-| 算子位置一致 | shape 相同、batch 内位置不同，结果一致 | 比确定性更严格 |
-| **算子 batch 不变性** | **输入 shape 不同（batch 组合不同）结果也要一致** | 比位置一致更严格；强一致性，代价是性能下降 |
-| 算子训推一致 | 训练推理结果一致（不同算子保持一致的累加序等） | 比 batch 不变性更严格 |
-
-### 1.3 为什么需要 batch 不变性
-
-1. **训推完全一致（RL 场景）**：如果两个完全一致的推理请求都无法得到 bitwise 相等的结果，就无法保障训推之间的 bitwise 一致性。vLLM 社区已支持 batch 不变性（No More Train-Inference Mismatch: Bitwise Consistent On-Policy RL with vLLM and TorchTitan）；开启后 KL 散度为 0，训推完全对齐；
-2. **推理问题定位、调试、评测**：确定性输出使问题更易定位，数据集精度评测得分无波动；
-3. **客户需求**（如字节）：推理结果可复现。
-
----
-
-## 2. 根因分析（为什么算子的 batch 不变性会被破坏）
-
-### 2.1 底层根因：浮点数非结合性
-
-浮点数精度有限（固定尾数位 + 舍入误差），**不满足结合律**：`(a+b)+c ≠ a+(b+c)`。例：BF16 下 `(256.0 + 1.0) + 1.0 = 256`，而 `256.0 + (1.0 + 1.0) = 258`。对阶→尾数相加→舍入→规格化的过程中，**求和顺序不同 → 阶段性保留的精度不同 → 结果不同**。
-
-### 2.2 机制：动态 batch 下算子为性能动态切分归约轴
-
-尽管是同一请求、同一模型权重，推理过程中**动态批大小不同**，导致内核之间的并行计算策略（数据如何拆分、归约）随之改变，规约（reduce）的累加顺序变化，结果因此不同。典型受影响算子与切分点：
-
-| 算子 | 动态切分行为（原始场景） | 对 batch 不变性的影响 |
-|---|---|---|
-| matmul / bmm / mm | 根据 M/K/N shape 动态切分 K 轴（split-K，多核切 K 优化） | 同一份数据所在 batch（M 维度 = num_token）不同 → splitK 数不同 → K 轴累加序不同 |
-| attention / FIA | 动态切分 KV（split-KV、FlashDecode 特性） | Q·Kᵀ 不切 head_dim 时 S 不受影响，但 KV 被动态切分时结果不同 |
-| rmsnorm / reduce_sum / reduce_mean | 小 batch 场景将规约轴（尾轴）动态切分以打满多核（splitReduceDim） | 不同切分下行的累加求和顺序变化 |
-| softmax / log_softmax | 分核时综合 batch 与尾轴，不同 batch 对尾轴切分方式不同 | 指数和分母累加顺序不同 |
-| add_rms_norm / addrmsnorm | 多个路径（升降精度不同、不同模板） | 输入不同（PD 混调等）走不同模板，精度 cast 逻辑不同 |
-| hccl all_reduce / reduce_scatter | ring allreduce：各卡规约顺序不一致 | TP>2 规约累加不保序，每卡结果有差异 |
-| matmul+allreduce 融合算子 | TP 下融合 MatMul 与 AllReduce（enable_matmul_allreduce） | 破坏 batch 不变性，需关闭 |
-
-**同类对比实验数据**（matmul 评测）：
-- torch matmul（动态切分 K）：偏差 `2568.6406`（npu）
-- triton matmul 动态切分 K：偏差 `1876224.`（npu）
-- triton matmul **固定切分 K=64**：偏差 `0`
-
-### 2.3 不受影响的算子 / 并行维度
-
-- **元素级（功能性）算子**：单个 tensor 元素的功能性处理（exp 等）不涉及规约，天然满足；
-- **规约类算子只要固定累加序**（不管 batch 怎么组合、位置怎么变，K 轴累加序不变）即可满足；
-- 并行策略分析：**DP**（改变 batch size，不影响）、**PP**（层分布不同卡，不影响）、**EP**（router 输入和算子确定，不影响）；**TP/SP/CP 会切到 reduce 轴**，需要确定性 + 位置一致 + batch 不变性算子配合；
-- **注意**：有些算子在 batch 不同时行为不同（走不同内部算子/不同模板），这不属于"规约不确定性"，而是**行为不一致**，必须结合具体实现分析，否则端到端验证中可能无法定位。
-
-### 2.4 框架服务化能力叠加的影响（易混淆源）
-
-| 服务化能力 | 影响 | 达成一致的组合条件 |
-|---|---|---|
-| TP（张量并行） | 切 matmul 的 reduce 轴，用 All-Reduce/Reduce-Scatter | 确定性 + batch 内一致 |
-| SP（序列并行） | 切 kv_seqlen，FA 算子的 reduce 轴 | 确定性 + 位置一致 + batch 不变性算子 |
-| CP（上下文并行） | 切 prompt token，破坏 batch 一致性 | 确定性 + batch 不变性算子 |
-| CPU 负载调度 | 请求到达时间影响调度，两次运行组成 batch 不同 | 确定性 + 关闭错峰分核 + batch 一致性算子替换 |
-| PD 混调 | 纯P / PD混调 / 纯D 走不同算子（不同累加序） | 相同算子路径 + 确定性 + 位置一致 + batch 不变性 |
-| prefix cache | RadixTree 复用 KV，不同 batch 组合下命中不同 | 需算法保证命中的结果一致（待分析） |
-
-### 2.5 业界方案
-
-- **Thinking Machines Lab**：`batch_invariant_ops`（Triton 实现的 batch-invariant 算子集），针对 LLM 推理不同 batch 输出不一致问题；文章 [Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/) 指出根因不是"并发 + 浮点结合律"本身，而是 **Kernel 缺乏批次不变性**：batch size 改变时 Kernel 为追求性能动态改变归约策略（归约顺序、Tensor Core 指令等）。
-- **微软 LLM-42**（不改算子内核的调度层方案）：受投机解码启发，"解码-验证-回滚"（DVR）协议 + 分组验证 + 选择性确定性，把确定性从 kernel 层提升到调度层（本文档不展开，详见 WIKI 讨论页）。
-
----
-
-## 3. 理论验证：如何从理论上验证算子满足 batch 不变性
-
-> 理论验证的目标：**在写测试之前，通过分析算子实现判断其是否可能破坏 batch 不变性，并圈定需要覆盖的测试维度**。WIKI 的经验是："算子侧评估的算子可能不全面（理论分析较多），替换后整网端到端不一定满足"，因此理论分析要结合 profiling 与实验交叉确认。
-
-### 3.1 检查清单（按优先级）
-
-1. **算子归类**：该算子是否有规约（reduce）操作？
-   - 无规约（元素级，如 exp、scale、gather 按行独立处理）→ 理论天然满足（仍需确认无跨行依赖、写隔离、padding 处理）；
-   - 有规约（sum/mean、matmul、attention、norm、softmax、通信 allreduce 等）→ 进入第 2 步。
-
-2. **规约轴切分策略是否随输入 shape（batch 大小、M/seqlen 大小）变化**：
-   - 检查 tiling 是否动态：matmul 的 split-K（DoSingleCoreSplitKTiling / DoDeterministicMultiCoreSplitKTiling 等）、reduce_sum 的 reduce 轴多核切分、attention 的 split-KV / FlashDecode、softmax 的尾轴切分；
-   - 若切分随 batch 变化 → **不满足**（除非固定切分，如"固定切分 K 为 64"或"始终只选用一种 K 累加方式"）；
-   - 若不同 batch 下采用完全相同的切分与累加序 → 理论满足，仍需数值实验确认舍入路径一致。
-
-3. **K 轴（归约轴）累加序不变性**：
-   - bmm：多 batch 载入、bm 合轴**不改变** k 轴累加序 → 不影响 batch 不变性；
-   - mm（M 已 bm 合轴）：影响 K 累加序的特性均可能影响 batch 不变性；
-   - 经验法则（WIKI）：**batch 不同（bmm）或 m 不同（mm）时，K 的处理切分逻辑必须一样**；不能一个走切 k、一个不走切 k；前后都走确定性切 k 理论上也有 batch 不变性。batch 一致性模板可从 **K 的累加方式**上划分，始终只用一种 K 累加方式。
-
-4. **行为分支一致性**（比规约更隐蔽）：
-   - 不同 batch/阶段（纯 P、PD 混调、纯 D）是否走**不同的内部算子**或**不同的 kernel 模板**（如 addrmsnorm 不同输入走不同模板、精度 cast 逻辑不一致；FIA 在 PD 混调下内部算子与纯 P/D 不一致）；
-   - 存在分支差异 → 即使单分支满足也不满足整体 batch 不变性。
-
-5. **通信算子（TP 场景）**：
-   - allreduce/reduce_scatter 的**规约顺序**是否固定（ring 算法各卡规约序不一致）；
-   - 检查 `HCCL_DETERMINISTIC=strict`（满足确定性 + batch 不变性）是否为该硬件/版本支持。
-
-6. **数值与精度路径**：
-   - 同一算子在不同 batch 下是否发生升降精度变化、是否出现 padding/去 padding 的路径差异；
-   - 关注极端 shape 与数值范围（大 K、大 H、极小/极大值）下的舍入路径。
-
-7. **辅助 kernel 与框架侧路径**（v2 runner 中大量 Triton 辅助 kernel，虽非规约算子但也影响端到端结果面）：
-   - row → 请求状态的**映射稳定**（idx_mapping 双射，不同 batch row 不写同一 req_state_idx）；
-   - **padding / 无效 row** 不读旧值、不写有效状态（slot_mapping、block_table 需写 PAD，不能残留 stale 值）；
-   - 同一请求的 position、seq_len、block table、slot mapping 在 BS=1 与 BS=N 下完全一致；
-   - 采样 **seed 与请求进度绑定**，不随 batch row 或调度顺序变化（gumbel/temperature kernel 的 expanded_idx_mapping 不能错位）；
-   - staged write 目标区间不重叠（写隔离）。
-
-### 3.2 理论分析辅助手段
-
-- **profilings 采集**：采集目标模型（如 Qwen3 30B）推理时涉及的全部算子（计算 + 通信）profilings，清单式核对哪些算子涉及规约、哪些批不变性算子被实际执行（确认替换生效）；
-- **triton batch 不变性算子分析工具**（见 Batch不变性_适配分析页）：用工具分析涉及规约的算子；
-- **代码走查**：核查 tiling 函数（split-K 等）、kernel 选择分支、模板选择条件。
-
----
-
-## 4. 实践验证：如何从实验上验证算子满足 batch 不变性
-
-> 实践验证分三个层级：**单算子级 → 特征实验级（shape/组合矩阵）→ 端到端级**。WIKI 中的核心口径是"**固定一条输入，对比其在单条处理 vs 不同 batch 组合处理下的输出是否完全一致（二进制一致）**"。
-
-### 4.1 单算子级验证（以 l2norm 为例，WIKI 实测模板）
-
-参考页面：[batch不变性（l2norm 检验）](https://wiki.huawei.com/domains/171013/wiki/355964/WIKI2026032710566878)，代码仓：`Ascend/MindSpeed mindspeed/lite/ops/triton`。
-
-- **定长前向**：`test_l2norm_fwd.py`，数据来自**随机生成**；
-- **定长反向**：`test_l2norm_bwd.py`，数据来自**随机生成**；
-- **变长前向**：`test_l2norm_fwd_varlen.py`，数据来自 **dump 数据**（真实推理现场）；
-- **变长反向**：`test_l2norm_bwd_varlen.py`，数据来自 **dump 数据**；
-- **shape 覆盖矩阵**：对 `(B, T, H, D)`、`D=128`、`B={2, 4, 32}`、`T={100, 300, 1000, 8000, 32000}`、`H={2, 4, 8, 32}` 全组合验证——**不同 B 下相同 `(T,H,D)` 子结果必须一致**；
-- 经验：最大 shape 下存在风险点；变长 bwd 曾验证不通过，**用 `cdiv` 替代 `//` 后通过**——说明实现细节（取整方式）也会破坏不变性。
-
-**单算子验证的通用做法**：对同一输入数据，分别以"单条"和"打包进 B={2,4,8,...} 的 batch 的各个位置"两种方式调用算子（或同一 batch 内复制相同数据于不同位置），比较对应位置输出是否 bitwise 一致；多组随机种子重复。
-
-### 4.2 特征实验级验证（matmul / bmm，WIKI 实测模板）
-
-参考页面：[RL batch不变性](https://wiki.huawei.com/domains/79152/wiki/131081/WIKI202510308808711)、[【BMM】实现batch一致性](https://wiki.huawei.com/domains/68949/wiki/232736/WIKI2026021110141755)。
-
-**实验 1：bm 合轴一致性（batch 内各行一致）**
-- 构造 A 矩阵每个 batch 的输入一样，对比输出矩阵 `(16, 1, 1024)` 中每个输出 batch 是否完全一样；并与合轴后的 `(16, 7168) @ (1024, 7168)` 输出对比（16 份是否一致）→ batchmatmul 一致性可保证，mm 中 16 份一致。
-
-**实验 2：m 大小不一样（mm 场景）**
-- A 矩阵 16 份相同，分别以 `(16*1, 7168)` 和 `(16*15, 7168)` 与 `(1024, 7168)` 相乘，对比 16 份结果；**多次运行随机种子不同，输出一致**。
-
-**实验 3：前后 batch 数不一致（最关键的 batch 不变性实验）**
-- mm：`(3×16, 7168) @ (1024, 7168)` vs `(20×16, 7168) @ (1024, 7168)`，第一 case 的第 2 组与第二 case 的第 13 组输入完全一样，比较对应位置输出 → **结果不完全一致（均走 MatMulV2）**；
-- bmm：`(3, 16, 7168) @ (1024, 7168)` vs `(20, 16, 7168) @ (1024, 7168)`，对应 batch 比较，换多次随机种子 → **全部通过（均走 BMMV2）**；
-- 结论：**batch 不同或 m 不同时，K 的处理切分逻辑必须一致**；方案是路由到"一致性 kernel list"（K 累加方式相同的 kernel，如 BMMV3/MMV3，或固定切 K、for-batch 循环调用确定性 kernel）。
-
-**实验 4：baseK 实验（验证 Kernel 内部参数不影响结果）**
-- baseK 32→16（减半）、baseM/N 与 baseK 同比例调整（64/128/64）等，前后**二进制结果一致** → 该 kernel 的内部切分参数不破坏不变性。
-
-**验收标准（BMM 需求）**：**单 batch 组合成多 batch 场景，结果二进制一致**；精度标杆"双标杆"。
-
-### 4.3 端到端级验证（vllm-ascend 实测模板）
-
-参考页面：[【需求详设】batch不变性](https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026060611373620)、[RL推理满足batch不变性](https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026081512310528)、[batch不变性e2e验证](https://wiki.huawei.com/domains/64729/wiki/204290/WIKI202512119382989)。
-
-**用例 A：动态 batch + 动态位置（needle 测试）**
-`test_v1_generation_is_deterministic_across_batch_sizes_with_needle`
-1. 阶段1：单独输入 needle_prompt 生成**基线**输出；
-2. 阶段2：将 needle 随机混入不同大小 batch 的**随机位置**，多轮混合批次试验；
-3. 阶段3：提取 needle 位置的输出，**逐 token 与基线比对**（token_id / logprobs）。
-判定：全部匹配 → 通过；任一不匹配 → 打印差异、记录失败。
-
-**用例 B：BS=1 逐个生成 vs BS=N 批量生成**
-`test_logprobs_bitwise_batch_invariance_bs1_vs_bsN`
-1. BS=1 逐个生成，收集每步 logprobs 与 token_ids；
-2. BS=N 批量生成，收集每步 logprobs 与 token_ids；
-3. 逐 Prompt 逐 Token 比对（bitwise），汇总失败详情。
-
-**用例 C：数据集评测稳定性**
-- 打开 batch 不变性开关后，同一数据集（如 math500）**多轮评分完全一致不波动**（实测 10 轮均 95.4；基线在 94.6~95.8 波动）；
-- 对比输出不仅看评分，还需**逐样本对比推理结果完全一致**。
-
-**端到端实验流程（流程图节选）**：设置随机种子 → 创建两个 LLM 引擎（bs=1 和 bs=N）→ 生成基准输出（bs=1 单独运行 needle）→ 多次试验（随机批次、needle 随机位置、bs=N 生成、提取 needle 输出、与基准比较）→ 统计结果判定。
-
-**验证配置与约束（vllm-ascend 实测）**：
-- 模型：Qwen3 系列；设备 A2/A3（A5 需算子包支持）；
-- `export VLLM_BATCH_INVARIANT=1`；`eager=true`（不支持图模式）；`enable_prefix_caching=false`；
-- `enable_chunked_prefill=False`、`block_size=128`、`async_scheduling=False`（按版本要求）；
-- TP 可泛化 2/4（8 亦可），输入/输出 < 2k 常规、2k→20k 需特定 TP；并行 < 64；温度 0 或 0.6；
-- 推荐组合：TP=8、tmp=0、输入 512、输出 512、并行 32、重复 10 次。
-
-**切换开关的对照验证（确认开关真起作用）**：
-- 不打开 batch 不变性开关 → 推理结果因动态 batch 影响而不一致（可稳定复现失败：MAX_TOKENS=35、BATCH_SIZE=144 时 100 组每组 5 次全失败）；
-- 打开开关 → 结果不受动态 batch 影响、保持一致；
-- 替换中间态检查：不替换 matmul 和 attention 一定失败；仅替换其一也失败；全部替换后才通过。
-
-### 4.4 验证时的常见问题与定位手法（WIKI 踩坑实录）
-
-| 现象 | 定位方法 |
-|---|---|
-| 端到端偶现不满足（如 50 轮出现 1 轮） | ① 在 GPU 上跑同测试确认 vllm 社区侧是否满足；② 采集 profiling 核对待替换算子是否已替换；③ 构造模型场景的单算子用例（如 TP allreduce）；WIKI 案例：softmax/addrmsnorm 理论满足、实际不满足 |
-| 长输出场景首 token 对不齐 | 与调度相关：chunk_prefill 使能时 P/D 分开给 FIA，不使能时合并——FIA 在 PD 混调下不支持 batch 不变性；关闭 chunk_prefill 可对齐 |
-| 评分波动但功能测试通过 | 对比两次推理输出是否逐样本一致（不只是评分）；用 msprobe 精度 slice/dump 工具比对 bs=1 与 bs=N 的统计数据 |
-| BS=N 场景采集不到数据 | 请求被**驱逐**后重新调度，prefill 长度 = 原 prompt + 已生成 token 长度，FIA 处理不一致 → 调整 TP/BS 场景重测 |
-| 耗时异常 | CPU 等待 NPU、matmul 耗时异常（`weight.t()` 内存非连续导致 triton 性能差 → 需 .contiguous() 或算子侧处理） |
-| 算子替换不生效/找不到 | 检查算子包与 CANN 版本匹配（A5 需 9.1.0.B082+ 才支持 HCCL_DETERMINISTIC=strict）、`pip show batch_invariant_ops`、`torch.ops.batch_invariant_ops.*` 可注册访问、.json 路径加载 |
-
-### 4.5 使能方式与生效检查（vllm-ascend 落地）
-
-1. 安装 batch 不变性算子包（run 包 + whl 包：`cann-ops-batch_invariant-*`、`batch_invariant-torch_ops_extension`），或 7 月 4 日后 `VLLM_BATCH_INVARIANT=1 pip install -v -e . ...` 内置安装；
-2. 使能：`export VLLM_BATCH_INVARIANT=1`；
-3. 框架自动完成（`init_batch_invariance()`）：
-   - 环境覆盖：`HCCL_DETERMINISTIC=strict`、`LCCL_DETERMINISTIC=1`、`torch.use_deterministic_algorithms(True, warn_only=True)`、关闭 `weight_nz_mode`、关闭 `enable_matmul_allreduce`、`enable_async_exponential=False`；
-   - 算子替换（注册 aten 算子到 batch-invariant 实现）：`addmm/bmm/softmax/_softmax/mm/matmul/sum/linear`、`npu_fused_infer_attention_score`、`add_rms_norm`、`reduce_sum`；优先级 AscendC（batch_invariant_ops）> Triton fallback；
-4. 生效检查：`test_batch_inv.sh` / `test_batch_invariant.py` 反复比较不同 batch size 下相同 prompt 的推理结果。
-
-### 4.6 验收标准汇总
-
-1. 功能验证脚本测试用例**全部通过**（needle 测试 + bs1 vs bsN 逐 token bitwise 对齐）；
-2. 数据集评测满足要求、**评分不波动**，且逐样本输出完全一致；
-3. 单算子验收：**单 batch 组合成多 batch，结果二进制一致**；
-4. 性能劣化可接受（实测端到端劣化约 5%；吞吐劣化 3.4%~4.6%，随并发增大劣化略增）——batch 不变性本质是"固定归约策略换确定性"，需与性能权衡。
-
----
-
-## 5. WIKI 相关页面清单（来源）
-
-| # | 标题 | 链接 | 核心内容 |
-|---|---|---|---|
-| 1 | RL batch不变性 | https://wiki.huawei.com/domains/79152/wiki/131081/WIKI202510308808711 | 定义、bmm/mm 影响因素、batch 一致性实验（bm合轴/m 不同/batch 数不同、baseK） |
-| 2 | Batch不变性（64729） | https://wiki.huawei.com/domains/64729/wiki/204290/WIKI202512019236074 | 入口页，链接到算子一致性讨论 |
-| 3 | 算子一致性（确定性、batch一致性、训推一致） | https://wiki.huawei.com/domains/68949/wiki/232736/WIKI202601289966155 | 概念体系、服务化能力影响、LLM-42 论文解读 |
-| 4 | 【BMM】实现batch一致性 | https://wiki.huawei.com/domains/68949/wiki/232736/WIKI2026021110141755 | BMMV3BatchInvariant 方案、验收标准（二进制一致） |
-| 5 | batch不变性（171013，l2norm 检验） | https://wiki.huawei.com/domains/171013/wiki/355964/WIKI2026032710566878 | 单算子验证模板：定长/变长、fwd/bwd、shape 矩阵、cdiv 修复 |
-| 6 | Batch 不变性（152732） | https://wiki.huawei.com/domains/152732/wiki/325378/WIKI2026062911655366 | 浮点数非结合性入门、rmsnorm/matmul/attention |
-| 7 | 【需求详设】batch不变性 | https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026060611373620 | 需求背景、方案原理（matmul 评测数据）、整体方案、验证流程、测试结果、环境变量 |
-| 8 | Batch不变性算子替换验证 | https://wiki.huawei.com/domains/85423/wiki/146593/WIKI2026060211321063 | Qwen3 30B A3B / 1.7B 精度、速度、算子替换结果 |
-| 9 | 【临时方案】vllm-ascend安装batch不变性ascendc算子 | https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026060311335073 | 算子包下载安装（run/whl）、开关控制、A2/A3/A5 验证 |
-| 10 | batch不变性e2e验证 | https://wiki.huawei.com/domains/64729/wiki/204290/WIKI202512119382989 | e2e 测试流程、显存/耗时/精度踩坑、验证代码流程 |
-| 11 | Qwen3 系列 batch不变性算子分析 | https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026063011664604 | profiling 采集（TP=4、温度0.6、计算/通信算子） |
-| 12 | 跳伞活动-Batch不变性验证 | https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026062311558552 | A3/A5 环境搭建、离线单推与验证脚本、A5 踩坑记录 |
-| 13 | attention batch 不变性 | https://wiki.huawei.com/domains/124182/wiki/290311/WIKI202512059321656 | FA 分块规约原理、特征方向/序列方向、cache 与当前 token 分开规约破坏不变性 |
-| 14 | RL推理满足batch不变性 | https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026081512310528 | 完整原理（split-K/splitReduce/splitKV/allreduce）、算子实现方案、调测案例（A3 偶现、A5 math500/2k推20k）、性能数据、模型支持 |
-| 15 | Batch不变性_适配分析 | https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026073112099926 | v2 runner 使能流程、10 个 Triton kernel 看护清单与 batch invariance 关系分析 |
-| 16 | RL batch不变性（跳伞） | 见 #12 | 同 #12 |
-
----
-
-## 6. 一页速记（TL;DR）
-
-- **定义**：同一输入放在任何 batch 大小/位置，输出（token_id + logprobs）完全不变；对算子：不同 batch 组合的输入，结果与单条一致（比确定性、位置一致更严格）。
-- **根因**：浮点数非结合性 + 算子为性能随 batch 动态切分归约轴（matmul split-K、attention split-KV、reduce split、allreduce 规约序）。
-- **理论验证**：① 是否规约类算子；② tiling 是否随 batch 变；③ K 轴累加序是否恒定；④ 行为分支是否一致（PD 混调、模板选择）；⑤ 通信规约顺序；⑥ 辅助 kernel 的映射/padding/seed 稳定、写隔离。
-- **实践验证**：单算子（l2norm：定长/变长 × fwd/bwd × shape 矩阵）；特征实验（bm 合轴、m 不同、前后 batch 数不同、baseK、二进制一致）；端到端（needle 随机位置对齐、bs1 vs bsN 逐 token bitwise 对齐、数据集多轮评分不波动）；开关对照（关开关必失败、全替换才通过）。
-- **使能**：`VLLM_BATCH_INVARIANT=1` + batch 不变性算子包（AscendC + Triton fallback）+ HCCL_DETERMINISTIC=strict 等；约束：eager、关 prefix caching、关 chunk_prefill 等；代价：端到端性能劣化约 5%。
+bash
+复制
+# Ubuntu 底包（8.15 GB，arm64，构建于 2026-09-07）
+docker pull quay.io/ascend/vllm-ascend:nightly-releases-v0.27.1rc-a3
+# digest: sha256:d2f33eafe1c0ab3acd9e97e6f37d3504bbb8dfc216e752c61fdd3bef3ed4b422
+
+# openEuler 底包（10.08 GB，arm64，构建于 2026-09-21，更新）
+docker pull quay.io/ascend/vllm-ascend:nightly-releases-v0.27.1rc-a3-openeuler
+# digest: sha256:9ec4bfac6da6b22774a8232eb045171f6b534e2924cd9d82560b36d1272b40a9
+⚠️ 坑：quay.io/ascend/vllm-ascend:v0.27.1rc-a3（不带 nightly-releases-）不存在，直接 pull 会报 manifest unknown —— 因为 0.27 没出正式版，docs 里的 {{ vllm_ascend_version }}-a3 模板只对已发布版本成立。
+
+0.27 这一线的全部 tag（filter_tag_name=like:v0.27 全量）：
+
+tag	硬件	底包	架构	大小	构建时间
+nightly-releases-v0.27.1rc-a3	A3	Ubuntu	arm64	8.15 GB	09-07
+nightly-releases-v0.27.1rc-a3-openeuler	A3	openEuler	arm64	10.08 GB	09-21
+nightly-releases-v0.27.1rc-a5 / -a5-openeuler	A5	Ubuntu / openEuler	arm64	7.88 / 10.73 GB	09-08 / 09-21
+nightly-releases-v0.27.1rc-310p / -310p-openeuler	310P	Ubuntu / openEuler	amd64+arm64	~9.4 / 9.8 GB	09-10
+nightly-releases-v0.27.1rc-openeuler	A2（默认）	openEuler	amd64	8.84 GB	09-22
+但你要跑 Kimi-K3，教程指定的是另一个 tag
+仓库里已经有 Kimi-K3 的专门教程 docs/source/tutorials/models/Kimi-K3.md，开头写着 "based on vLLM-Ascend main with vLLM 0.27.1"，第 4.1 节给的镜像不是 0.27.1rc 分支镜像，而是 main 分支镜像：
+
+bash
+复制
+docker pull quay.io/ascend/vllm-ascend:nightly-main-a3
+# 多架构 manifest list，2026-09-21 构建
+# digest: sha256:1a0892eab272f4251f143b36eb7391859c3f94a28e415f08e3dc45e89fcc0b99
+它同样是 vLLM 0.27.1 栈，但比 0.27.1rc 分支镜像新两周。如果你就是照官方教程跑 Kimi-K3（4×Atlas 800 A3，DP4/TP16/EP64，W4A8 全量 1.49 TB），建议直接用它；想钉在 0.27.1rc 发布分支上就用上面的 nightly-releases-v0.27.1rc-a3。
+
+国内拉取更快的镜像站
+Docker Hub 的 ascendai/vllm-ascend 有同名 tag（digest 与 quay 完全一致）：
+
+bash
+复制
+docker pull ascendai/vllm-ascend:nightly-releases-v0.27.1rc-a3
+docker pull ascendai/vllm-ascend:nightly-main-a3
+镜像列表页：quay.io/repository/ascend/vllm-ascend?tab=tags ｜ hub.docker.com/r/ascendai/vllm-ascend/tags
+
+另外顺带说明：quay 上还有 kimi-k3、kimi-k3-a3、kimi-k3-a3-openeuler 这几个专用 tag，但它们构建于 2026-07-27，比 0.27 栈早一个多月，应是早期预览镜像，跑 0.27 不建议用。
+
+拉到后按教程第 4.1 节验证一下版本：python -m pip show vllm vllm-ascend。
+
+
+
+
+
+
+用量 772K tok
+
+用时 2分01秒
+14:31
+这些链接的来源是？你是怎么找到的？
+14:32
+
+
+4 次工具调用 · 1 条消息
+全部来自公开接口和仓库原始文件，没有一条是我猜的链接。只有一处我当时是推断的（tag 命名规则），刚才顺手把它也证实了。 下面按「结论 ← 来源」逐条交代。
+
+1. 溯源表
+我的结论	来源（我实际请求的 URL）	返回了什么
+0.27 的镜像 tag 是 nightly-releases-v0.27.1rc-*，含 digest/大小/日期	quay.io/api/v1/repository/ascend/vllm-ascend/tag/?limit=100&page=1&onlyActiveTags=true	真实 tag 列表 JSON，7 个含 v0.27 的 tag
+0.27 全部变体（a3/a5/310p/openeuler）	同上，加 &filter_tag_name=like:v0.27	精确 7 条，全带 nightly-releases- 前缀
+v0.27.1rc-a3 不存在	同上 like:v0.27 的全量枚举	子串匹配下没有任何不带前缀的 v0.27* tag
+nightly-releases-v0.27.1rc（A2 Ubuntu）也不存在	.../tag/?specificTag=nightly-releases-v0.27.1rc&onlyActiveTags=false	{"tags": []}
+0.27 没有正式发布版	api.github.com/repos/vllm-project/vllm-ascend/tags?per_page=100	最新 tag 是 v0.26.0rc2
+0.27 对应分支 releases/v0.27.1rc	api.github.com/repos/vllm-project/vllm-ascend/branches?per_page=100	分支列表含 releases/v0.27.1rc、releases/v0.28.0rc
+Kimi-K3 教程指定 nightly-main-a3	raw.githubusercontent.com/.../main/docs/source/tutorials/models/Kimi-K3.md	原文："based on vLLM-Ascend main with vLLM 0.27.1"，4.1 节 export IMAGE=quay.io/ascend/vllm-ascend:nightly-main-a3
+镜像架构：a3/a5 仅 arm64，310p 双架构，无后缀=A2/amd64	hub.docker.com/v2/repositories/ascendai/vllm-ascend/tags?page_size=100&name=0.27	每条 tag 的 images[].architecture 字段
+Docker Hub 是同一份镜像（可当加速源）	同上，digest 与 quay 完全一致	例：a3 → 两边都是 sha256:d2f33eaf...
+2. tag 命名规则：从「推断」变成「证实」
+我上一轮说 nightly-releases-v0.27.1rc-a3 是 releases/v0.27.1rc 分支构建的 —— 当时这是推断（靠字符串形状 + 分支存在）。你问了之后我读了 CI 原始文件，现在是实锤。
+
+.github/workflows/_schedule_image_build.yaml（release 镜像的合并/发布任务）：
+
+yaml
+复制
+PATTERN="${{ inputs.branch_ref }}"
+PATTERN="${PATTERN//\//-}"        # releases/v0.27.1rc → releases-v0.27.1rc
+...
+type=schedule,pattern=${{ steps.tag_pattern.outputs.pattern }},prefix=nightly-,suffix=${{ env.SUFFIX }}
+type=pep440,pattern={{raw}},suffix=${{ env.SUFFIX }}
+.github/workflows/schedule_image_build_and_push.yaml 给出 suffix ↔ 芯片对照：
+
+json
+复制
+{name:"A2 Ubuntu",   suffix:""},              {name:"A3 Ubuntu",  suffix:"a3"},
+{name:"310P Ubuntu", suffix:"310p"},          {name:"A5 Ubuntu",  suffix:"a5"},
+{name:"A2 openeuler",suffix:"openeuler"},     {name:"A3 openEuler",suffix:"a3-openeuler"}, ...
+两者相乘就精确复现了我给的每一条 tag：nightly- + main + -a3 = nightly-main-a3；nightly- + releases-v0.27.1rc + -a3 = nightly-releases-v0.27.1rc-a3。
+
+同一份文件还解释了「为什么 v0.27.1rc-a3 不存在」：只有 type=pep440 那条规则（on: push tags: v*）才会产出不带 nightly- 前缀的裸版本 tag。0.27 还没打过 v* tag，所以这个形状的 tag 根本没人建过 —— 这不是猜的，是 CI 规则决定的。
+
+另外这份文件顶部写明：镜像其实是在 SWR（swr.cn-north-12.myhuaweicloud.com/ascend/vllm-ascend）构建并合并多架构，再由 sync-tools 同步到 quay.io。所以 quay.io 是镜像站，Docker Hub 的 ascendai/ 是又一层镜像 —— 三者 digest 一致。
+
+3. 我没有验证的部分（重要）
+镜像里到底是不是 vLLM 0.27.1：这句话我只在 Kimi-K3.md 文档里读到，没有实际拉 8 GB 镜像跑 pip show 去验证。它是官方文档的声明，不是我的实测。
+digest 未做拉取比对：sha256:d2f33eaf... 等值来自 quay/Docker Hub 的 API 元数据（两边一致，交叉印证），但我没 docker pull 后比对本地 digest。
+nightly-releases-v0.27.1rc（A2 Ubuntu）为何缺失：CI 里 release 模式本该产出它，实际没有。可能是那次 A2 构建没跑/失败，或被清理了 —— 原因我没查到，不做推测。
+我的第一轮 web_search 其实没给出决定性信息（只贡献了 Docker Hub 仓库名，还夹带了一条 vllm-omni 仓库的 "v0.27.0" 噪声，那是另一个项目的版本号，我没采信）。真正的信息全部来自上面的 API 和原始文件。
+期间还有一次失败：按直觉去取 docs/source/installation.md 返回 404，我改用 GitHub contents API 枚举真实目录才找到文档位置。
+4. 你可以自己复核（可复现）
+bash
+复制
+# tag 是否真实存在 + digest
+curl -s "https://quay.io/api/v1/repository/ascend/vllm-ascend/tag/?specificTag=nightly-releases-v0.27.1rc-a3" | head -c 400
+
+# 镜像内版本自证（最硬的验证）
+docker pull quay.io/ascend/vllm-ascend:nightly-main-a3
+docker run --rm quay.io/ascend/vllm-ascend:nightly-main-a3 python -m pip show vllm vllm-ascend
+⚠️ 提醒一点：nightly-main-a3 是滚动 tag，每天可能变；我给的 digest 是 2026-09-21 那次构建。要可复现就按 Kimi-K3.md 的建议钉 digest：quay.io/ascend/vllm-ascend@sha256:1a0892eab272f4251f143b36eb7391859c3f94a28e415f08e3dc45e89fcc0b99。
