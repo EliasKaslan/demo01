@@ -1,2 +1,1 @@
-https://arxiv.org/abs/2606.13392
-https://github.com/MiniMax-AI/MiniMax-H3
+https://github.com/vllm-project/vllm-ascend/pull/16959/changes#diff-66b21917fdef167affec4010f8cea319022bbaccb0b714de54ef5cd6231b7fa6
