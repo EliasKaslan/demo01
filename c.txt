@@ -1,1 +1,7 @@
-https://github.com/vllm-project/vllm-ascend/pull/16959/changes#diff-66b21917fdef167affec4010f8cea319022bbaccb0b714de54ef5cd6231b7fa6
+安全风险
+在使用 Docker 容器运行时，需要注意以下安全风险：
+使用 root 用户运行：容器默认以 root 用户身份运行，可能带来安全隐患。建议在生产环境中创建非特权用户来运行应用程序。
+
+Security Risks
+Please be aware of the following security risks when running in Docker containers:
+Running as the root user: Containers run as the root user by default, which may introduce security risks. It is recommended to create a non-privileged user for running applications in production environments.
