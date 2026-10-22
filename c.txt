@@ -1,7 +1,2 @@
-安全风险
-在使用 Docker 容器运行时，需要注意以下安全风险：
-使用 root 用户运行：容器默认以 root 用户身份运行，可能带来安全隐患。建议在生产环境中创建非特权用户来运行应用程序。
-
-Security Risks
-Please be aware of the following security risks when running in Docker containers:
-Running as the root user: Containers run as the root user by default, which may introduce security risks. It is recommended to create a non-privileged user for running applications in production environments.
+commit db9527a46873454610df6dbedf79a36d6bf1a7f6 (HEAD, tag: v0.31.0rc5, tag: v0.31.0, origin/releases/v0.31.0)
+commit 70451936818f21482c298fe8946d5460bd188568 (HEAD -> main, origin/main, origin/HEAD)
