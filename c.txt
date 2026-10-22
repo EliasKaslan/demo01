@@ -1,2 +1,276 @@
-commit db9527a46873454610df6dbedf79a36d6bf1a7f6 (HEAD, tag: v0.31.0rc5, tag: v0.31.0, origin/releases/v0.31.0)
-commit 70451936818f21482c298fe8946d5460bd188568 (HEAD -> main, origin/main, origin/HEAD)
+#!/bin/bash
+# Copyright 2023 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+
+prog="$(basename $0)"
+prog_option="$*"
+MODEL_PATH="/data/LLM/mindSpeed_rl/kimi_k3"
+root_path="/autotest/pytorch"
+model_path="RL_Infer"
+src_path="$root_path/$model_path"
+model_name=${prog#run_}
+model_name=${model_name%.sh}
+workspace="$root_path/torch_autotest/model/run/$model_name"
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /autotest/pytorch/torch_autotest/proxy.sh
+
+export HCCL_CONNECT_TIMEOUT=7200
+
+# help
+help () {
+  echo "Usage: $prog [OPTION]"
+  echo
+  echo "Options:"
+  echo
+  echo "  -m, --mode   [8p2k|8p4k]  8p2k=text 2k->6k, 8p4k=multimodal 4k->32k."
+  echo "  -h, --help   Print this help."
+  echo "  -p, --precision [must_keep_origin_dtype,allow_mix_precision]   The training precision."
+  echo
+}
+
+check_npu_avaiable () {
+  local mode=$1
+  num=$(ls -l /dev | grep -E 'davinci[0-9]+' | wc -l)
+
+  if [ $num == "0" ]; then
+    echo -e "\033[1;31mNo npu device found.\033[1;37m"
+    exit 1
+  fi
+
+  if [ $num -lt "8" ]; then
+    echo -e "\033[1;31mNo 8 npu devices found in 8p mode.\033[1;37m"
+    exit 1
+  fi
+}
+
+prepare_environment () {
+  echo -e "\033[1;34mPrepare environment...\033[1;37m"
+  rm -rf $workspace
+  cp -r $src_path $workspace
+  mkdir -p $workspace/logs
+
+  pip uninstall vllm vllm-ascend xgrammar -y
+  pip install setuptools==82.0.1
+  pip install setuptools-scm==10.0.5
+  pip install setuptools_rust
+  cd $workspace
+
+  # 安装vllm
+  cd vllm
+  export VLLM_TARGET_DEVICE=empty
+  python3 use_existing_torch.py
+  pip install -r requirements/common.txt
+  pip install setuptools_rust setuptools_scm
+  pip install -e . --no-build-isolation
+
+  # 安装vllm-ascend
+  cd ../vllm-ascend
+  sed -i 's/torch-npu/#torch-npu/g' ./requirements.txt
+  sed -i 's/triton-ascend/#triton-ascend/g' ./requirements.txt
+  sed -i '/torch-npu/d' ./pyproject.toml
+  sed -i '/triton-ascend/d' ./pyproject.toml
+  pip install -r requirements.txt
+  export COMPILE_CUSTOM_KERNELS=1
+  pip install -e . --no-build-isolation
+  cd ../
+  pip install flash_linear_attention_npu*.whl
+
+  #安装benchmark
+  git clone https://github.com/AISBench/benchmark
+  cd benchmark
+  pip install -r requirements/api.txt
+  pip install -r requirements/extra.txt
+  pip install -e ./ --use-pep517
+}
+
+run_model () {
+  echo -e "\033[1;34mRun model...\033[1;37m"
+  set -eo pipefail
+  check_npu_avaiable "$mode"
+  PROFILER_CONFIG='{
+    "profiler": "torch",
+    "torch_profiler_dir": "./profiling",
+    "torch_profiler_with_stack": false,
+    "delay_iterations": 3072,
+    "max_iterations": 20,
+    "ignore_frontend": true
+ }'
+
+  export VLLM_VERSION=0.26.0
+  export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+  export OMP_PROC_BIND=false
+  export OMP_NUM_THREADS=100
+  export TASK_QUEUE_ENABLE=1
+  export HCCL_BUFFSIZE=1024
+  export HCCL_OP_EXPANSION_MODE="AIV"
+  cd $workspace/vllm-ascend
+
+  vllm serve ${MODEL_PATH} \
+  --load-format dummy \
+  --served-model-name kimi-k3 \
+  --tensor-parallel-size 8 \
+  --data-parallel-size 1 \
+  --dtype bfloat16 \
+  --enable-prefix-caching \
+  --enable-expert-parallel \
+  --max-num-seqs 16 \
+  --max-model-len 40960 \
+  --max-num-batched-tokens 8192 \
+  --port 20002 \
+  --gpu-memory-utilization 0.85 \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+  --profiler-config "${PROFILER_CONFIG}" \
+  --mm-processor-cache-gb 0 \
+  --additional-config '{"enable_cpu_binding":true,"enable_flashcomm1":true}' \
+  --mm-encoder-tp-mode data \
+  --limit-mm-per-prompt '{"vision_chunk":40}' \
+  --enable-auto-tool-choice \
+  --reasoning-parser kimi_k3 \
+  --tool-call-parser kimi_k3 \
+  --allowed-local-media-path / \
+  --trust-remote-code > $workspace/logs/run_service.log 2>&1 &
+
+  echo "等待 vLLM 服务就绪..."
+  while ! curl -sf http://localhost:20002/health > /dev/null 2>&1; do
+    sleep 5
+  done
+  echo "服务已就绪"
+
+  sleep 60
+  cd $workspace/vllm/benchmarks
+
+  if [ "$mode" == "8p" ] && [ "$precision" == "2k" ]; then
+    echo "===== Running Pure Text Benchmark (2k->6k) ====="
+    total_throughput=0
+    count=0
+    for ((i=1; i<=4; i++)); do
+      echo "===== Text benchmark $i/4 ====="
+      vllm bench serve \
+        --backend vllm \
+        --trust-remote-code \
+        --model "" \
+        --tokenizer ${MODEL_PATH} \
+        --dataset-name random \
+        --random-input-len 2048 \
+        --random-output-len 6144 \
+        --ignore-eos \
+        --num-prompts 16 \
+        --max-concurrency 8 \
+        --metric-percentiles 50,90,99 \
+        --base-url http://localhost:20002 > $workspace/logs/text_2k_6k_$i.log 2>&1
+      throughput=$(grep "Total token throughput" $workspace/logs/text_2k_6k_$i.log | awk '{print $5}')
+      echo "Text benchmark $i throughput: $throughput"
+      if [ "$i" -gt 1 ]; then
+        total_throughput=$(awk "BEGIN {print $total_throughput + $throughput}")
+        count=$((count + 1))
+      fi
+      [ "$i" -lt 4 ] && sleep 30
+    done
+    avg_throughput=$(awk "BEGIN {printf \"%.2f\", $total_throughput / $count}")
+    echo "===== Text AVG Total token throughput: $avg_throughput ====="
+
+  elif [ "$mode" == "8p" ] && [ "$precision" == "4k" ]; then
+    echo "===== Running MM Benchmark (4k->32k) ====="
+    total_mm_throughput=0
+    mm_count=0
+    for ((i=1; i<=4; i++)); do
+      echo "===== MM benchmark $i/4 ====="
+      vllm bench serve \
+        --backend openai-chat \
+        --endpoint /v1/chat/completions \
+        --trust-remote-code \
+        --model "" \
+        --tokenizer ${MODEL_PATH} \
+        --dataset-name random-mm \
+        --random-input-len 4096 \
+        --random-output-len 32768 \
+        --ignore-eos \
+        --num-prompts 16 \
+        --max-concurrency 8 \
+        --metric-percentiles 50,90,99 \
+        --base-url http://localhost:20002 \
+        --random-mm-bucket-config '{(1024, 1024, 1): 1.0}' > $workspace/logs/mm_4k_32k_$i.log 2>&1
+      mm_throughput=$(grep "Total token throughput" $workspace/logs/mm_4k_32k_$i.log | awk '{print $5}')
+      echo "MM benchmark $i throughput: $mm_throughput"
+      if [ "$i" -gt 1 ]; then
+        total_mm_throughput=$(awk "BEGIN {print $total_mm_throughput + $mm_throughput}")
+        mm_count=$((mm_count + 1))
+      fi
+      [ "$i" -lt 4 ] && sleep 30
+    done
+    avg_mm_throughput=$(awk "BEGIN {printf \"%.2f\", $total_mm_throughput / $mm_count}")
+    echo "===== MM AVG Total token throughput: $avg_mm_throughput ====="
+  fi
+}
+
+clean_environment () {
+  echo -e "\033[1;34mClean environment...\033[1;37m"
+  pgrep -f VLLM::Worker | xargs kill -9
+  pkill -f "vllm serve" 2>/dev/null || true
+}
+
+# parse command-line options
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m|--mode)
+        shift
+        if [ -z "$(echo $1 | grep ^-.)" ]; then
+          mode=$1
+          shift
+        fi
+        ;;
+    -p|--precision)
+        shift
+        if [ -z "$(echo $1 | grep ^-.)" ]; then
+          precision=$1
+          shift
+        fi
+        ;;
+    -c|--cluster)
+        shift
+        if [ -z "$(echo $1 | grep ^-.)" ]; then
+          cluster=$1
+          shift
+        fi
+        ;;
+    -n|--node_rank)
+        shift
+        if [ -z "$(echo $1 | grep ^-.)" ]; then
+          node_rank=$1
+          shift
+        fi
+        ;;
+    -h|--help)
+        help >& 2
+        exit 2 ;;
+    -*)
+        echo "${0}: ${1}: invalid option" >&2
+        help >& 2
+        exit 2 ;;
+    *)
+        break ;;
+  esac
+done
+
+[ -z "$mode" ] && help && exit 1
+workspace="$workspace/$mode""_""$precision"
+ascend_log="$workspace/ascend_log"
+mkdir -p $ascend_log
+export ASCEND_PROCESS_LOG_PATH="$ascend_log"
+prepare_environment
+run_model "$mode" "$precision" "$cluster" "$node_rank"
+clean_environment
