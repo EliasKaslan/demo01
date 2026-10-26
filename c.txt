@@ -1,69 +1,119 @@
-# MiniMax 近两周算子/通信更新（2026-10-08 → 10-22）
+# 产品系列 / 产品型号 与 soc_version 参数命名拆分（两张图汇总）
 
-## 1 算子：从"算子级融合"跳到"层即算子"
-
-新增两个 monokernel，每个都是**一张卡跑一个请求、一次 launch 跑完一整层**：
-
-| kernel            | 融合了什么                                                                                                      | 规模                                  |
-| ----------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
-| **MegaAttention** | RMSNorm → QKV 投影 → QK norm+RoPE → 稀疏 attention（TopK 16 页）→ OProj → TP 归约 → residual → post-norm | 144 CTA，8-CTA cluster，整卡独占      |
-| **MegaMoE**       | router → 128 专家 top-4 → FC1 → SwiGLU → FC2 → combine → TP 归约                                          | 136 CTA，cooperative launch，整卡驻留 |
-| **DSpark draft**  | 5 层草稿网络一次 cooperative launch 跑完                                                                        | 替代 SGLang 标准路径的逐层算子序列    |
-
-**为什么这算质变而不是量变**：CUDA Graph 的节点数从"每层十几次"降到 **2 次**（attention + MoE）。对 decode 这种 **launch-bound** 场景，这是数量级收益，不是百分比收益。
-
-**唯一一组官方端到端数字**（draft backbone，4×B300）：18 个测点、kv 长度 7→131,072，加速 **1.31–1.41×，geomean 1.36×**。注意对照组用的是 SGLang 的**已融合**实现（FlashInfer MXFP8 GEMM + fused q/k norm+RoPE + TRT-LLM decode attention + fused TP4 all-reduce），所以 1.36× 是在"对手也已融合"的前提下拿到的。
-另外：**kv=7 的极短上下文下仍有 1.38×**，这反证收益来自 launch 与归约、而不是 attention 本身。
-
-## 2 通信：NCCL 数据面被整体移除
-
-`inference/high_tps/` 全目录下 `all_reduce` / `all_to_all` / `ncclAllReduce` 命中 **0**，只剩 6 处 `all_gather_object` 做控制面（传 IPC handle / 主机名 / UUID）。两套自研机制：
-
-**机制 A — attention 的 TP4 归约：NVLS 多播归约**
-
-一条指令 `multimem.ld_reduce.global.add.v4.bf16x2.acc::f32` 从多播地址加载 8 个 BF16，**在 FP32 累加器里把四卡的贡献加起来**。每个 rank 各读一次就得到 all-reduce 结果——没有 ring、没有 tree、没有单独的归约 kernel，**SM 完全不参与搬运**。顺手在同一条循环里算出平方和，下一层的 RMSNorm/router 不用二次读显存。
-
-**机制 B — MoE 的 combine：IPC arena + 16 字节原子记录**
-
-不用 NVLS，改用**对端显存 arena + 推送式**。一条记录 = 6 个 BF16 + 1 个 epoch，正好 16 字节：
-
-```
-// 16-byte records: one scalar .b128 access is single-copy atomic, so the six
-// BF16 payload values and the generation word are observed together
-// (SASS STG/LDG.E.128.STRONG.SYS). No separate flag or fence is needed;
-// the generation IS the arrival signal.
-```
-
-**epoch 本身就是到达信号**——不需要 flag、不需要 fence，因为它和 payload 在同一次 128-bit 原子访问里被观测到。代价是**4× 写放大**（推送式 all-reduce 的固有成本；对照 NCCL 在 4 卡 ring 全归约是 1.5×）。
-
-**这里有一处设计耦合值得单独记住**：TP4 切的是专家的 **intermediate 维**（3072/4=768），**不是专家本身**（EP=1）。所以 router 权重在四张卡上是**复制的**；又因为 TP4 归约是固定 rank 序、四卡 bitwise 相同 → **router 的 top-4 必然相同 → 路由完全不需要通信**。**"确定性归约"直接买到了"路由零通信"**，全局 top-4 在单个 cluster 内用 DSMEM 就完成了。
-
-**这套设计成立的前提**：batch=1、每层只搬 **98 KB**。在这个尺度上，集合通信的成本 **99% 是延迟而不是带宽**，所以"把归约塞进 kernel、把 launch 干掉"是唯一正确解。反过来说——**它不是通用通信库，是一条为单请求 decode 定制的窄路**。
-
-> **范围边界（必须一起说）**：所谓"零 NCCL"**只对被 monokernel 覆盖的那两段成立**。按插件执行图，`embedding + dense layer 0-2`、`prefill`、`final norm + logits` 仍然走 SGLang 原生模块，那些模块自己的 NCCL 没被替换。准确表述是"**每个 MoE 层内部的两处 TP 归约不再经过 NCCL**"，不是"整个服务没有 NCCL"。
-
-## 3 服务：SGLang 插件，但**不可公开复现**
-
-`--monokernel-backend msa`，只跑「一个请求、恰好 8 个 draft token 的 verify 步骤」。执行图是每层 2 次 persistent launch，其余全走原生。
-
-它最重要的一句话不是性能，是**官方自己写的免责声明**：
-
-> The pinned fork currently requires access permission; its commit is not anonymously accessible, and public SGLang releases do not provide the required `MiniMaxM3Nvfp4KVPool` interface. **Installing the plugin alone therefore does not provide a publicly reproducible server setup.**
-
-所以 M3.1-Flash 的"官方推理栈"是三段式：**kernel 公开、checkpoint 受限、服务框架私有**。
+> 汇总来源：两张评审/梳理截图，纯文字整理，未包含任何图片。
+> 图 1：产品系列（AI IS）↔ 产品系列（TO BE）↔ 产品型号 对照表
+> 图 2：《soc_version：参数命名区隔，在文档中澄清适用场景，历代取值跟随产品名/芯片名一起对外公开》（宋昆鹏）
 
 ---
 
-## 4. 代价：这套东西换掉了什么
+# 第一部分　产品系列 — 产品型号对照（图 1）
 
-| 维度     | 事实                                                                                              | 后果                                   |
-| -------- | ------------------------------------------------------------------------------------------------- | -------------------------------------- |
-| 拓扑     | **只支持单机 4 卡**，EP 不支持，batch>1 不支持，q 固定 8                                          | 扩不到多机                             |
-| 资源     | attention 144 CTA、MoE 136 CTA**整卡驻留**                                                        | 一张卡同时只能服务一个请求，吞吐换延迟 |
-| 后端     | `mega` **没有备用归约后端**（必须 NVLS + 单机 NVLink）                                            | 硬件不满足就无路可走                   |
-| 确定性   | 固定 rank 序 FP32 求和 → 四卡 bitwise 相同                                                       | 放弃了原子累加的自由调度               |
-| 契约     | padded scale 行必须预清零；w1/w3 global scale 必须相等；router 权重四卡复制；negative zero 规范化 | 换权重/换 checkpoint 极易踩            |
-| 平台     | 控制面用`socket.AF_UNIX` + `SCM_RIGHTS` 传 fd                                                     | **Linux 专有**                         |
-| 验证范围 | runtime 只在**SM103/GB300** 验过；SM100/B200 只做了**编译验证**                                   | "B200 也能跑"未经运行验证              |
+## 1.1 表格结构
 
---
+原表 5 列 12 行：产品系列（AI IS）｜产品系列（TO BE）-中文｜产品型号（中文）｜落地时间｜说明。
+图中黄色高亮与红色选框仅为批注标记，未计入正文。
+
+## 1.2 逐行还原（合并单元格已展开）
+
+| # | 产品系列（AI IS） | 产品系列（TO BE）-中文 | 产品型号（中文） | 落地时间 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 新规划产品 | Ascend 970PR & 970DT 系列产品（注：匹配对内芯片名称 David V200） | 暂无 | — | — |
+| 2 | 新规划产品 | Ascend 960PR & 960DT 系列产品 | 暂无 | — | — |
+| 3 | Atlas 350 加速卡 | Ascend 950PR & 950DT 系列产品 | Ascend 950PR 系列产品：Atlas 350 加速卡；Atlas 850 超节点；Atlas 650 服务器 | 930 版本 | 注① |
+| 4 | Atlas 350 加速卡 | Ascend 950PR & 950DT 系列产品 | Ascend 950DT 系列产品：Atlas 850E 超节点；Atlas 650E 服务器；Atlas 950 SuperPoD 超节点 | 930 版本 | 注① |
+| 5 | Atlas A3 训练系列产品 | Atlas A3 系列产品 | Atlas A3 训练系列产品：Atlas 800T A3 超节点服务器；Atlas 9000 A3 SuperPoD 集群算力系统；Atlas 900 A3 SuperPoD 超节点；A200T A3 Box8 超节点服务器 | 930 版本 | 注① |
+| 6 | Atlas A3 推理系列产品 | Atlas A3 系列产品 | Atlas A3 推理系列产品：Atlas 800I A3 超节点服务器 | 930 版本 | 注① |
+| 7 | Atlas A2 训练系列产品 | Atlas A2 系列产品 | Atlas A2 训练系列产品：Atlas 800T A2 训练服务器；Atlas 900 A2 PoD 集群基础单元；Atlas 200T A2 Box16 异构子框 | 930 版本 | 注① |
+| 8 | Atlas A2 推理系列产品 | Atlas A2 系列产品 | Atlas A2 推理系列产品：Atlas 800I A2 推理服务器；Atlas 300I A2 推理卡；A200I A2 Box 异构组件 | 930 版本 | 注① |
+| 9 | Atlas 训练系列产品 | Atlas 训练系列产品 | （空白） | NA | 注② |
+| 10 | Atlas 推理系列产品 | Atlas 推理系列产品 | （空白） | NA | 注② |
+| 11 | Atlas 200I/500 A2 推理产品 | Atlas 200I/500 A2 推理产品 | （空白） | NA | 注② |
+| 12 | Atlas 200/300/500 推理产品 | Atlas 200/300/500 推理产品 | （空白） | NA | 注② |
+
+## 1.3 层级关系
+
+- 新规划产品
+  - Ascend 970PR & 970DT 系列产品 → 型号「暂无」（注：匹配对内芯片名称 David V200）
+  - Ascend 960PR & 960DT 系列产品 → 型号「暂无」
+- Atlas 350 加速卡 → Ascend 950PR & 950DT 系列产品（930 版本）
+  - Ascend 950PR 系列产品：Atlas 350 加速卡、Atlas 850 超节点、Atlas 650 服务器
+  - Ascend 950DT 系列产品：Atlas 850E 超节点、Atlas 650E 服务器、Atlas 950 SuperPoD 超节点
+- Atlas A3 训练 / Atlas A3 推理 → Atlas A3 系列产品（930 版本）
+  - A3 训练：Atlas 800T A3 超节点服务器、Atlas 9000 A3 SuperPoD 集群算力系统、Atlas 900 A3 SuperPoD 超节点、A200T A3 Box8 超节点服务器
+  - A3 推理：Atlas 800I A3 超节点服务器
+- Atlas A2 训练 / Atlas A2 推理 → Atlas A2 系列产品（930 版本）
+  - A2 训练：Atlas 800T A2 训练服务器、Atlas 900 A2 PoD 集群基础单元、Atlas 200T A2 Box16 异构子框
+  - A2 推理：Atlas 800I A2 推理服务器、Atlas 300I A2 推理卡、A200I A2 Box 异构组件
+- 存量/在售系列（型号空白、落地时间 NA）：Atlas 训练系列产品、Atlas 推理系列产品、Atlas 200I/500 A2 推理产品、Atlas 200/300/500 推理产品
+
+## 1.4 注释与合并单元格
+
+- 注①（覆盖第 3–8 行说明列）：950 及后续代际，产品命名遵从《计算产品命名和灵衢口径规则》（2026.6.29 计算 PCMT 已评审）。
+- 注②（覆盖第 9–12 行说明列）：需推理一体机的 RMT 决策之后落地。
+
+| 区域 | 列 | 合并为 |
+| --- | --- | --- |
+| 1–2 行 | 产品系列（AI IS） | 新规划产品 |
+| 3–4 行 | 产品系列（AI IS） | Atlas 350 加速卡 |
+| 3–4 行 | 产品系列（TO BE）-中文 | Ascend 950PR & 950DT 系列产品 |
+| 5–6 行 | 产品系列（TO BE）-中文 | Atlas A3 系列产品 |
+| 7–8 行 | 产品系列（TO BE）-中文 | Atlas A2 系列产品 |
+| 3–8 行 | 落地时间 / 说明 | 930 版本 / 注① |
+| 9–12 行 | 落地时间 / 说明 | NA / 注② |
+
+**一句话结论**：Atlas 350 / A3 / A2 分别对应 Ascend 950（PR+DT）、Atlas A3、Atlas A2 三个"对外产品系列"，统一 930 版本落地，命名按《计算产品命名和灵衢口径规则》；970/960 仍为规划态（型号暂无）；四条老系列型号待定，需等推理一体机 RMT 决策。
+
+---
+
+# 第二部分　soc_version 参数命名拆分方案（图 2）
+
+## 2.1 一句话结论
+
+把"算子包编译"和"atc 模型编译"两处**同名但取值不同**的 `soc_version` 拆开：前者改名为 `soc_series`，后者保持不变；同时在 CANN 文档中公开"产品系列 ↔ soc_series ↔ soc_version"映射，并提供 npu-smi 查询能力。
+
+## 2.2 现状分析与问题
+
+使用场景：算子包编译、atc 模型编译都需要传入 `soc_version`
+- 算子包编译：`soc_version` 与产品系列为 1:1 关系（不区分 PR/DT）
+- atc 模型编译：必须包含芯片完整分 bin 信息（芯片全名）
+
+问题：
+1. 两处 `soc_version` 同名但取值不同，对用户造成困扰
+2. atc 编译需传入芯片全名，枚举值多、易获取性较差、记忆负担重
+3. A3 因历史原因，对外模糊处理
+
+## 2.3 三条优化建议
+
+1. **优化 1（规范命名）**：区隔为 `soc_series` 与 `soc_version`，并在 CANN 文档中对外澄清各自的使用场景和获取方式
+2. **优化 2（公开映射）**：在 CANN 文档中显式公开产品系列与 `soc_series`、`soc_version` 的映射关系
+3. **优化 3（可查询）**：`npu-smi` 新增命令，支持直接查询 `soc_series`、`soc_version`、`NPU_ARCH`，确保开发者有无环境都能获取到这些信息
+
+## 2.4 映射表（核心数据）
+
+| 产品系列 | 算子包编译需传入 `soc_version` → **`soc_series`** | atc 模型编译需传入芯片全名：`soc_version` → **不变** |
+| --- | --- | --- |
+| 昇腾 960PR / 960DT 系列产品 | `Ascend960PR` / `Ascend960DT`（斜体，规划中） | 遵从昇腾芯片分 bin 命名规范（A3 起实施） |
+| 昇腾 950PR / 950DT 系列产品 | `Ascend950` | `Ascend950PR_9589` / `_958b` / `_9579` / `_957b` / `_957c`、`Ascend950DT_9591` / `_9592` / `_9581` / `_9582` / `_9572` / `_9574` 等 |
+| 昇腾 A3 系列产品 | `ascend910_93` | `Ascend910_9372` / `_9381` / `_9382` / `_9391` / `_9392` |
+| 昇腾 A2 系列产品 | `ascend910b`（\*注 1） | `Ascend910B1` / `B2` / `B3` / `B4` / `B4-1` |
+| 昇腾 910 系列产品 | `ascend910` | `Ascend910A` / `Ascend910ProA` / `Ascend910PremiumA` / `Ascend910B` / `Ascend910ProB` |
+| 昇腾 310P 系列产品 | `ascend310p` | `Ascend310P1` / `P3` / `P5` / `P7` |
+| 昇腾 310B 系列产品 | `ascend310b` | `Ascend310B1` / `B2` / `B3` / `B4` |
+| 昇腾 310 系列产品 | NA，不在开源开放范围 | NA，不在开源开放范围 |
+
+## 2.5 三条配套注记（重要约束）
+
+- **新代际**：950 及后续代际按规范设置，`soc_series`、`soc_version` **首字母大写**（故为 `Ascend950`，区别于存量的 `ascend910_xx` 小写风格）
+- **存量**：A3 及以前**建议维持不变**，避免反复适配（改动成本优先于命名一致性）
+- **注 1**：CANN 文档公开 `soc_series` 取值后，会**间接露出 910B**，需评估影响（未公开芯片名的信息披露风险）
+
+## 2.6 页面标题体现的两点意图
+
+- 参数命名要**区隔**，并在文档中**澄清适用场景**与获取方式
+- 历代取值要**跟随产品名/芯片名一起对外公开**，即命名规范与公开口径一并定下来，而不只是改个参数名
+
+---
+
+# 附：两图关系
+
+图 1 给出"对外产品系列—产品型号"的命名基线（950 及后续按《计算产品命名和灵衢口径规则》，930 版本落地）；图 2 把同一套命名基线落到工程参数上——产品系列对应 `soc_series`，具体芯片分 bin 对应 `soc_version`，用"首字母大写 + 逐代对齐产品名"的方式保证两处命名可互相追溯。
