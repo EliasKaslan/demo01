@@ -1,76 +1,69 @@
-MODEL_PATH="/data/LLM/mindSpeed_rl/kimi_k3"
-workspace="/autotest/pytorch/torch_autotest/model/run/MindSpeed_RL_kimi_k3/8p_2k/xmz_issue"
+# MiniMax 近两周算子/通信更新（2026-10-08 → 10-22）
 
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-source /autotest/pytorch/torch_autotest/proxy.sh
+## 1 算子：从"算子级融合"跳到"层即算子"
 
-export HCCL_CONNECT_TIMEOUT=7200
-export PROFILER_CONFIG="${PROFILER_CONFIG:-{}}"
-# export VLLM_VERSION=0.31.0
-export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
-export OMP_PROC_BIND=false
-export OMP_NUM_THREADS=100
-export TASK_QUEUE_ENABLE=1
-export HCCL_BUFFSIZE=1024
-export HCCL_OP_EXPANSION_MODE="AIV"
+新增两个 monokernel，每个都是**一张卡跑一个请求、一次 launch 跑完一整层**：
 
-vllm serve ${MODEL_PATH} \
-  --load-format dummy \
-  --served-model-name kimi-k3 \
-  --tensor-parallel-size 8 \
-  --data-parallel-size 1 \
-  --dtype bfloat16 \
-  --enable-prefix-caching \
-  --enable-expert-parallel \
-  --max-num-seqs 16 \
-  --max-model-len 40960 \
-  --max-num-batched-tokens 8192 \
-  --port 20002 \
-  --gpu-memory-utilization 0.85 \
-  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-  --profiler-config "${PROFILER_CONFIG}" \
-  --mm-processor-cache-gb 0 \
-  --additional-config '{"enable_cpu_binding":true,"enable_flashcomm1":true}' \
-  --mm-encoder-tp-mode data \
-  --limit-mm-per-prompt '{"vision_chunk":40}' \
-  --enable-auto-tool-choice \
-  --reasoning-parser kimi_k3 \
-  --tool-call-parser kimi_k3 \
-  --allowed-local-media-path / \
-  --trust-remote-code > $workspace/logs/run_service.log 2>&1 &
+| kernel            | 融合了什么                                                                                                      | 规模                                  |
+| ----------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| **MegaAttention** | RMSNorm → QKV 投影 → QK norm+RoPE → 稀疏 attention（TopK 16 页）→ OProj → TP 归约 → residual → post-norm | 144 CTA，8-CTA cluster，整卡独占      |
+| **MegaMoE**       | router → 128 专家 top-4 → FC1 → SwiGLU → FC2 → combine → TP 归约                                          | 136 CTA，cooperative launch，整卡驻留 |
+| **DSpark draft**  | 5 层草稿网络一次 cooperative launch 跑完                                                                        | 替代 SGLang 标准路径的逐层算子序列    |
 
-echo "等待 vLLM 服务就绪..."
-while ! curl -sf http://localhost:20002/health > /dev/null 2>&1; do
-  sleep 5
-done
-echo "服务已就绪"
+**为什么这算质变而不是量变**：CUDA Graph 的节点数从"每层十几次"降到 **2 次**（attention + MoE）。对 decode 这种 **launch-bound** 场景，这是数量级收益，不是百分比收益。
 
-sleep 60
-cd $workspace
+**唯一一组官方端到端数字**（draft backbone，4×B300）：18 个测点、kv 长度 7→131,072，加速 **1.31–1.41×，geomean 1.36×**。注意对照组用的是 SGLang 的**已融合**实现（FlashInfer MXFP8 GEMM + fused q/k norm+RoPE + TRT-LLM decode attention + fused TP4 all-reduce），所以 1.36× 是在"对手也已融合"的前提下拿到的。
+另外：**kv=7 的极短上下文下仍有 1.38×**，这反证收益来自 launch 与归约、而不是 attention 本身。
 
-for ((i=1; i<=4; i++)); do
-  echo "===== Text benchmark $i/4 ====="
-  vllm bench serve \
-    --backend vllm \
-    --trust-remote-code \
-    --model "" \
-    --tokenizer ${MODEL_PATH} \
-    --dataset-name random \
-    --random-input-len 2048 \
-    --random-output-len 6144 \
-    --ignore-eos \
-    --num-prompts 16 \
-    --max-concurrency 8 \
-    --metric-percentiles 50,90,99 \
-    --base-url http://localhost:20002 > $workspace/logs/text_2k_6k_$i.log 2>&1
-  throughput=$(grep "Total token throughput" $workspace/logs/text_2k_6k_$i.log | awk '{print $5}')
-  echo "Text benchmark $i throughput: $throughput"
-  if [ "$i" -gt 1 ]; then
-    total_throughput=$(awk "BEGIN {print $total_throughput + $throughput}")
-    count=$((count + 1))
-  fi
-  [ "$i" -lt 4 ] && sleep 30
-done
-avg_throughput=$(awk "BEGIN {printf \"%.2f\", $total_throughput / $count}")
-echo "===== Text AVG Total token throughput: $avg_throughput ====="
+## 2 通信：NCCL 数据面被整体移除
+
+`inference/high_tps/` 全目录下 `all_reduce` / `all_to_all` / `ncclAllReduce` 命中 **0**，只剩 6 处 `all_gather_object` 做控制面（传 IPC handle / 主机名 / UUID）。两套自研机制：
+
+**机制 A — attention 的 TP4 归约：NVLS 多播归约**
+
+一条指令 `multimem.ld_reduce.global.add.v4.bf16x2.acc::f32` 从多播地址加载 8 个 BF16，**在 FP32 累加器里把四卡的贡献加起来**。每个 rank 各读一次就得到 all-reduce 结果——没有 ring、没有 tree、没有单独的归约 kernel，**SM 完全不参与搬运**。顺手在同一条循环里算出平方和，下一层的 RMSNorm/router 不用二次读显存。
+
+**机制 B — MoE 的 combine：IPC arena + 16 字节原子记录**
+
+不用 NVLS，改用**对端显存 arena + 推送式**。一条记录 = 6 个 BF16 + 1 个 epoch，正好 16 字节：
+
+```
+// 16-byte records: one scalar .b128 access is single-copy atomic, so the six
+// BF16 payload values and the generation word are observed together
+// (SASS STG/LDG.E.128.STRONG.SYS). No separate flag or fence is needed;
+// the generation IS the arrival signal.
+```
+
+**epoch 本身就是到达信号**——不需要 flag、不需要 fence，因为它和 payload 在同一次 128-bit 原子访问里被观测到。代价是**4× 写放大**（推送式 all-reduce 的固有成本；对照 NCCL 在 4 卡 ring 全归约是 1.5×）。
+
+**这里有一处设计耦合值得单独记住**：TP4 切的是专家的 **intermediate 维**（3072/4=768），**不是专家本身**（EP=1）。所以 router 权重在四张卡上是**复制的**；又因为 TP4 归约是固定 rank 序、四卡 bitwise 相同 → **router 的 top-4 必然相同 → 路由完全不需要通信**。**"确定性归约"直接买到了"路由零通信"**，全局 top-4 在单个 cluster 内用 DSMEM 就完成了。
+
+**这套设计成立的前提**：batch=1、每层只搬 **98 KB**。在这个尺度上，集合通信的成本 **99% 是延迟而不是带宽**，所以"把归约塞进 kernel、把 launch 干掉"是唯一正确解。反过来说——**它不是通用通信库，是一条为单请求 decode 定制的窄路**。
+
+> **范围边界（必须一起说）**：所谓"零 NCCL"**只对被 monokernel 覆盖的那两段成立**。按插件执行图，`embedding + dense layer 0-2`、`prefill`、`final norm + logits` 仍然走 SGLang 原生模块，那些模块自己的 NCCL 没被替换。准确表述是"**每个 MoE 层内部的两处 TP 归约不再经过 NCCL**"，不是"整个服务没有 NCCL"。
+
+## 3 服务：SGLang 插件，但**不可公开复现**
+
+`--monokernel-backend msa`，只跑「一个请求、恰好 8 个 draft token 的 verify 步骤」。执行图是每层 2 次 persistent launch，其余全走原生。
+
+它最重要的一句话不是性能，是**官方自己写的免责声明**：
+
+> The pinned fork currently requires access permission; its commit is not anonymously accessible, and public SGLang releases do not provide the required `MiniMaxM3Nvfp4KVPool` interface. **Installing the plugin alone therefore does not provide a publicly reproducible server setup.**
+
+所以 M3.1-Flash 的"官方推理栈"是三段式：**kernel 公开、checkpoint 受限、服务框架私有**。
+
+---
+
+## 4. 代价：这套东西换掉了什么
+
+| 维度     | 事实                                                                                              | 后果                                   |
+| -------- | ------------------------------------------------------------------------------------------------- | -------------------------------------- |
+| 拓扑     | **只支持单机 4 卡**，EP 不支持，batch>1 不支持，q 固定 8                                          | 扩不到多机                             |
+| 资源     | attention 144 CTA、MoE 136 CTA**整卡驻留**                                                        | 一张卡同时只能服务一个请求，吞吐换延迟 |
+| 后端     | `mega` **没有备用归约后端**（必须 NVLS + 单机 NVLink）                                            | 硬件不满足就无路可走                   |
+| 确定性   | 固定 rank 序 FP32 求和 → 四卡 bitwise 相同                                                       | 放弃了原子累加的自由调度               |
+| 契约     | padded scale 行必须预清零；w1/w3 global scale 必须相等；router 权重四卡复制；negative zero 规范化 | 换权重/换 checkpoint 极易踩            |
+| 平台     | 控制面用`socket.AF_UNIX` + `SCM_RIGHTS` 传 fd                                                     | **Linux 专有**                         |
+| 验证范围 | runtime 只在**SM103/GB300** 验过；SM100/B200 只做了**编译验证**                                   | "B200 也能跑"未经运行验证              |
+
+--
