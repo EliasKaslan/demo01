@@ -1,119 +1,75 @@
-# 产品系列 / 产品型号 与 soc_version 参数命名拆分（两张图汇总）
+(/mnt/share/vllm/conda_envs/xmz_xq_kimi3) root@8b2cb6062106:/mnt/share/x00886548/multi_device# cat ./set_env.sh 
+#!/bin/bash
 
-> 汇总来源：两张评审/梳理截图，纯文字整理，未包含任何图片。
-> 图 1：产品系列（AI IS）↔ 产品系列（TO BE）↔ 产品型号 对照表
-> 图 2：《soc_version：参数命名区隔，在文档中澄清适用场景，历代取值跟随产品名/芯片名一起对外公开》（宋昆鹏）
+if ifconfig enp48s3u1u1 > /dev/null 2>&1; then
+    export nic_name="enp48s3u1u1"
+elif ifconfig enp48s3u1u2 > /dev/null 2>&1; then
+    export nic_name="enp48s3u1u2"
+else
+    echo "网卡不存在"
+    exit 1
+fi
 
----
+export local_ip=$(ifconfig "${nic_name}" | awk '/inet /{print $2}')
 
-# 第一部分　产品系列 — 产品型号对照（图 1）
+export HCCL_IF_IP=$local_ip
+export HCCL_SOCKET_IFNAME=$nic_name
+export HCCL_BUFFSIZE=1024
+export HCCL_CONNECT_TIMEOUT=7200
+export HCCL_OP_EXPANSION_MODE="AIV"
 
-## 1.1 表格结构
+export GLOO_SOCKET_IFNAME=$nic_name
+export IP_SOCKET_IFNAME=$nic_name
 
-原表 5 列 12 行：产品系列（AI IS）｜产品系列（TO BE）-中文｜产品型号（中文）｜落地时间｜说明。
-图中黄色高亮与红色选框仅为批注标记，未计入正文。
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=100
 
-## 1.2 逐行还原（合并单元格已展开）
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-| # | 产品系列（AS IS） | 产品系列（TO BE）-中文 | 产品型号（中文） | 落地时间 | 说明 |
-| --- | --- | --- | --- | --- | --- |
-| 1 | 新规划产品 | Ascend 970PR & 970DT 系列产品（注：匹配对内芯片名称 David V200） | 暂无 | — | — |
-| 2 | 新规划产品 | Ascend 960PR & 960DT 系列产品 | 暂无 | — | — |
-| 3 | Atlas 350 加速卡 | Ascend 950PR & 950DT 系列产品 | Ascend 950PR 系列产品：Atlas 350 加速卡；Atlas 850 超节点；Atlas 650 服务器 | 930 版本 | 注① |
-| 4 | Atlas 350 加速卡 | Ascend 950PR & 950DT 系列产品 | Ascend 950DT 系列产品：Atlas 850E 超节点；Atlas 650E 服务器；Atlas 950 SuperPoD 超节点 | 930 版本 | 注① |
-| 5 | Atlas A3 训练系列产品 | Atlas A3 系列产品 | Atlas A3 训练系列产品：Atlas 800T A3 超节点服务器；Atlas 9000 A3 SuperPoD 集群算力系统；Atlas 900 A3 SuperPoD 超节点；A200T A3 Box8 超节点服务器 | 930 版本 | 注① |
-| 6 | Atlas A3 推理系列产品 | Atlas A3 系列产品 | Atlas A3 推理系列产品：Atlas 800I A3 超节点服务器 | 930 版本 | 注① |
-| 7 | Atlas A2 训练系列产品 | Atlas A2 系列产品 | Atlas A2 训练系列产品：Atlas 800T A2 训练服务器；Atlas 900 A2 PoD 集群基础单元；Atlas 200T A2 Box16 异构子框 | 930 版本 | 注① |
-| 8 | Atlas A2 推理系列产品 | Atlas A2 系列产品 | Atlas A2 推理系列产品：Atlas 800I A2 推理服务器；Atlas 300I A2 推理卡；A200I A2 Box 异构组件 | 930 版本 | 注① |
-| 9 | Atlas 训练系列产品 | Atlas 训练系列产品 | （空白） | NA | 注② |
-| 10 | Atlas 推理系列产品 | Atlas 推理系列产品 | （空白） | NA | 注② |
-| 11 | Atlas 200I/500 A2 推理产品 | Atlas 200I/500 A2 推理产品 | （空白） | NA | 注② |
-| 12 | Atlas 200/300/500 推理产品 | Atlas 200/300/500 推理产品 | （空白） | NA | 注② |
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 
-## 1.3 层级关系
+#!/bin/bash
 
-- 新规划产品
-  - Ascend 970PR & 970DT 系列产品 → 型号「暂无」（注：匹配对内芯片名称 David V200）
-  - Ascend 960PR & 960DT 系列产品 → 型号「暂无」
-- Atlas 350 加速卡 → Ascend 950PR & 950DT 系列产品（930 版本）
-  - Ascend 950PR 系列产品：Atlas 350 加速卡、Atlas 850 超节点、Atlas 650 服务器
-  - Ascend 950DT 系列产品：Atlas 850E 超节点、Atlas 650E 服务器、Atlas 950 SuperPoD 超节点
-- Atlas A3 训练 / Atlas A3 推理 → Atlas A3 系列产品（930 版本）
-  - A3 训练：Atlas 800T A3 超节点服务器、Atlas 9000 A3 SuperPoD 集群算力系统、Atlas 900 A3 SuperPoD 超节点、A200T A3 Box8 超节点服务器
-  - A3 推理：Atlas 800I A3 超节点服务器
-- Atlas A2 训练 / Atlas A2 推理 → Atlas A2 系列产品（930 版本）
-  - A2 训练：Atlas 800T A2 训练服务器、Atlas 900 A2 PoD 集群基础单元、Atlas 200T A2 Box16 异构子框
-  - A2 推理：Atlas 800I A2 推理服务器、Atlas 300I A2 推理卡、A200I A2 Box 异构组件
-- 存量/在售系列（型号空白、落地时间 NA）：Atlas 训练系列产品、Atlas 推理系列产品、Atlas 200I/500 A2 推理产品、Atlas 200/300/500 推理产品
+# 解析 --node，其值直接作为 data-parallel-start-rank
+NODE=0
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --node) NODE="$2"; shift ;;
+        *) echo "Unknown: $1"; exit 1 ;;
+    esac
+    shift
+done
 
-## 1.4 注释与合并单元格
+CMD=(
+    vllm serve /mnt/weight/xmz_kimi/Kimi-K3-BF16
+    --served-model-name kimi-k3
+    --port 20002
+    --allowed-local-media-path /
+    --trust-remote-code
+    --tensor-parallel-size 8
+    --pipeline-parallel-size 2
+    --data-parallel-size 14
+    --data-parallel-size-local 1
+    --data-parallel-start-rank "$NODE"
+    --data-parallel-address 80.5.25.112
+    --data-parallel-rpc-port 12346
+    --enable-prefix-caching
+    --enable-expert-parallel
+    --max-num-seqs 16
+    --max-model-len 1024
+    --max-num-batched-tokens 1024
+    --gpu-memory-utilization 0.9
+    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+    --profiler-config '{"profiler":"torch","torch_profiler_dir":"./vllm_profile","torch_profiler_with_stack":false}'
+    --mm-processor-cache-gb 0
+    --additional-config '{"enable_cpu_binding":true,"enable_flashcomm1":true}'
+    --mm-encoder-tp-mode data
+    --limit-mm-per-prompt '{"vision_chunk":40}'
+    --enable-auto-tool-choice
+    --reasoning-parser kimi_k3
+    --tool-call-parser kimi_k3
+)
 
-- 注①（覆盖第 3–8 行说明列）：950 及后续代际，产品命名遵从《计算产品命名和灵衢口径规则》（2026.6.29 计算 PCMT 已评审）。
-- 注②（覆盖第 9–12 行说明列）：需推理一体机的 RMT 决策之后落地。
+[ "$NODE" != "0" ] && CMD+=(--headless)
 
-| 区域 | 列 | 合并为 |
-| --- | --- | --- |
-| 1–2 行 | 产品系列（AI IS） | 新规划产品 |
-| 3–4 行 | 产品系列（AI IS） | Atlas 350 加速卡 |
-| 3–4 行 | 产品系列（TO BE）-中文 | Ascend 950PR & 950DT 系列产品 |
-| 5–6 行 | 产品系列（TO BE）-中文 | Atlas A3 系列产品 |
-| 7–8 行 | 产品系列（TO BE）-中文 | Atlas A2 系列产品 |
-| 3–8 行 | 落地时间 / 说明 | 930 版本 / 注① |
-| 9–12 行 | 落地时间 / 说明 | NA / 注② |
-
-**一句话结论**：Atlas 350 / A3 / A2 分别对应 Ascend 950（PR+DT）、Atlas A3、Atlas A2 三个"对外产品系列"，统一 930 版本落地，命名按《计算产品命名和灵衢口径规则》；970/960 仍为规划态（型号暂无）；四条老系列型号待定，需等推理一体机 RMT 决策。
-
----
-
-# 第二部分　soc_version 参数命名拆分方案（图 2）
-
-## 2.1 一句话结论
-
-把"算子包编译"和"atc 模型编译"两处**同名但取值不同**的 `soc_version` 拆开：前者改名为 `soc_series`，后者保持不变；同时在 CANN 文档中公开"产品系列 ↔ soc_series ↔ soc_version"映射，并提供 npu-smi 查询能力。
-
-## 2.2 现状分析与问题
-
-使用场景：算子包编译、atc 模型编译都需要传入 `soc_version`
-- 算子包编译：`soc_version` 与产品系列为 1:1 关系（不区分 PR/DT）
-- atc 模型编译：必须包含芯片完整分 bin 信息（芯片全名）
-
-问题：
-1. 两处 `soc_version` 同名但取值不同，对用户造成困扰
-2. atc 编译需传入芯片全名，枚举值多、易获取性较差、记忆负担重
-3. A3 因历史原因，对外模糊处理
-
-## 2.3 三条优化建议
-
-1. **优化 1（规范命名）**：区隔为 `soc_series` 与 `soc_version`，并在 CANN 文档中对外澄清各自的使用场景和获取方式
-2. **优化 2（公开映射）**：在 CANN 文档中显式公开产品系列与 `soc_series`、`soc_version` 的映射关系
-3. **优化 3（可查询）**：`npu-smi` 新增命令，支持直接查询 `soc_series`、`soc_version`、`NPU_ARCH`，确保开发者有无环境都能获取到这些信息
-
-## 2.4 映射表（核心数据）
-
-| 产品系列 | 算子包编译需传入 `soc_version` → **`soc_series`** | atc 模型编译需传入芯片全名：`soc_version` → **不变** |
-| --- | --- | --- |
-| 昇腾 960PR / 960DT 系列产品 | `Ascend960PR` / `Ascend960DT`（斜体，规划中） | 遵从昇腾芯片分 bin 命名规范（A3 起实施） |
-| 昇腾 950PR / 950DT 系列产品 | `Ascend950` | `Ascend950PR_9589` / `_958b` / `_9579` / `_957b` / `_957c`、`Ascend950DT_9591` / `_9592` / `_9581` / `_9582` / `_9572` / `_9574` 等 |
-| 昇腾 A3 系列产品 | `ascend910_93` | `Ascend910_9372` / `_9381` / `_9382` / `_9391` / `_9392` |
-| 昇腾 A2 系列产品 | `ascend910b`（\*注 1） | `Ascend910B1` / `B2` / `B3` / `B4` / `B4-1` |
-| 昇腾 910 系列产品 | `ascend910` | `Ascend910A` / `Ascend910ProA` / `Ascend910PremiumA` / `Ascend910B` / `Ascend910ProB` |
-| 昇腾 310P 系列产品 | `ascend310p` | `Ascend310P1` / `P3` / `P5` / `P7` |
-| 昇腾 310B 系列产品 | `ascend310b` | `Ascend310B1` / `B2` / `B3` / `B4` |
-| 昇腾 310 系列产品 | NA，不在开源开放范围 | NA，不在开源开放范围 |
-
-## 2.5 三条配套注记（重要约束）
-
-- **新代际**：950 及后续代际按规范设置，`soc_series`、`soc_version` **首字母大写**（故为 `Ascend950`，区别于存量的 `ascend910_xx` 小写风格）
-- **存量**：A3 及以前**建议维持不变**，避免反复适配（改动成本优先于命名一致性）
-- **注 1**：CANN 文档公开 `soc_series` 取值后，会**间接露出 910B**，需评估影响（未公开芯片名的信息披露风险）
-
-## 2.6 页面标题体现的两点意图
-
-- 参数命名要**区隔**，并在文档中**澄清适用场景**与获取方式
-- 历代取值要**跟随产品名/芯片名一起对外公开**，即命名规范与公开口径一并定下来，而不只是改个参数名
-
----
-
-# 附：两图关系
-
-图 1 给出"对外产品系列—产品型号"的命名基线（950 及后续按《计算产品命名和灵衢口径规则》，930 版本落地）；图 2 把同一套命名基线落到工程参数上——产品系列对应 `soc_series`，具体芯片分 bin 对应 `soc_version`，用"首字母大写 + 逐代对齐产品名"的方式保证两处命名可互相追溯。
+"${CMD[@]}"
