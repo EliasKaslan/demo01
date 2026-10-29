@@ -1,75 +1,65 @@
-(/mnt/share/vllm/conda_envs/xmz_xq_kimi3) root@8b2cb6062106:/mnt/share/x00886548/multi_device# cat ./set_env.sh 
-#!/bin/bash
+精确权重核算 (BF16, TP16, EP128, 单卡)
 
-if ifconfig enp48s3u1u1 > /dev/null 2>&1; then
-    export nic_name="enp48s3u1u1"
-elif ifconfig enp48s3u1u2 > /dev/null 2>&1; then
-    export nic_name="enp48s3u1u2"
-else
-    echo "网卡不存在"
-    exit 1
-fi
+一、专家权重 (EP=128, 896÷128=7 experts/rank)
 
-export local_ip=$(ifconfig "${nic_name}" | awk '/inet /{print $2}')
+每专家:
+  w13: 3584 × 6144 = 22,020,096 elem × 2B = 42.0 MiB
+  w2:  3072 × 3584 = 11,010,048 elem × 2B = 21.0 MiB
+  单专家: 63 MiB
 
-export HCCL_IF_IP=$local_ip
-export HCCL_SOCKET_IFNAME=$nic_name
-export HCCL_BUFFSIZE=1024
-export HCCL_CONNECT_TIMEOUT=7200
-export HCCL_OP_EXPANSION_MODE="AIV"
+每 MoE 层 (7专家): 7 × 63 = 441 MiB
+92 层:            441 × 92 = 39.6 GiB
 
-export GLOO_SOCKET_IFNAME=$nic_name
-export IP_SOCKET_IFNAME=$nic_name
+二、Replicated 权重 (TP 不切，每 rank 全量复制)
 
-export OMP_PROC_BIND=false
-export OMP_NUM_THREADS=100
+routed_expert_down_proj ×92:  [3584, 7168] × 2B × 92 = 4.41 GiB
+routed_expert_up_proj   ×92:  [7168, 3584] × 2B × 92 = 4.41 GiB
+MoE gate                ×92:  [896,  7168] × 2B × 92 = 1.10 GiB
+───────────────────────────────────────────────────────
+Replicated 小计:                                        9.92
 
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+三、TP-sharded 权重 (TP=16, per rank 1/16)
 
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+Shared experts ×92 (gate_up+down, intermediate=6144):   1.42 GiB
+Dense layer 0 MLP (intermediate=33792):                 0.09 GiB
+MLA ×24 (fused_qkv_a 是 Replicated! + q_b/kv_b/g/o):    1.30 GiB
+KDA ×69 (full-rank gate 7168→12288, 各种投影):          ~3.50
+Embedding(163840×448) + lm_head(448×163840):            0.28 GiB
+RMSNorm + ResProj + 杂项:                              ~1.00 GiB
+───────────────────────────────────────────────────────
+TP-sharded 小计:                                        7.59 GiB
 
-#!/bin/bash
+四、总计
 
-# 解析 --node，其值直接作为 data-parallel-start-rank
-NODE=0
-while [[ "$#" -gt 0 ]]; do
-    case $1 in
-        --node) NODE="$2"; shift ;;
-        *) echo "Unknown: $1"; exit 1 ;;
-    esac
-    shift
-done
+专家:        39.62 GiB
+Replicated:   9.92 GiB
+TP-sharded:   7.59 GiB
+────────────────────
+总权重:      57.13 GiB  ← 已占 64GB 的 89%
 
-CMD=(
-    vllm serve /mnt/weight/xmz_kimi/Kimi-K3-BF16
-    --served-model-name kimi-k3
-    --port 20002
-    --allowed-local-media-path /
-    --trust-remote-code
-    --tensor-parallel-size 8
-    --pipeline-parallel-size 2
-    --data-parallel-size 14
-    --data-parallel-size-local 1
-    --data-parallel-start-rank "$NODE"
-    --data-parallel-address 80.5.25.112
-    --data-parallel-rpc-port 12346
-    --enable-prefix-caching
-    --enable-expert-parallel
-    --max-num-seqs 16
-    --max-model-len 1024
-    --max-num-batched-tokens 1024
-    --gpu-memory-utilization 0.9
-    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
-    --profiler-config '{"profiler":"torch","torch_profiler_dir":"./vllm_profile","torch_profiler_with_stack":false}'
-    --mm-processor-cache-gb 0
-    --additional-config '{"enable_cpu_binding":true,"enable_flashcomm1":true}'
-    --mm-encoder-tp-mode data
-    --limit-mm-per-prompt '{"vision_chunk":40}'
-    --enable-auto-tool-choice
-    --reasoning-parser kimi_k3
-    --tool-call-parser kimi_k3
-)
+剩余给 KV:    6.87 GiB  ← MLA KV: ~107 KB/token → 仅 ~64K tokens
+剩余给激活:    ~0 GiB   ← 前向需要额外激活内存
+剩余给 NCCL:   ~0 GiB   ← 通信缓冲区
 
-[ "$NODE" != "0" ] && CMD+=(--headless)
+▎ 结论: 57 GB 纯权重 + 7 GB KV/激活/NCCL 必然 OOM。BF16 + 128 卡 + EP=128 根本装不下。
 
-"${CMD[@]}"
+---
+可行方案
+
+给定约束「卡数 = DP × TP = EP」，且 16 卡/机：
+
+| 方案 | DP | TP | EP | 总卡 | 机器 | 专家 | 权重 | KV余 | KV容量 |
+|------|----|----|----|------|------|------|------|------|--------|
+| A |  8 | 16 | 128 | 128 | 8 | 7 | 57G | 7G | 64K | ❌ OOM |
+| B |  4 | 16 | 64 | 64 | 4 | 14 | 79G | ❌ | ❌ | 更糟 |
+| C | 14 | 16 | 224 | 224 | 14 | 4 | 40G | 24G | 223K | ✅ |
+| D | 28 | 16 | 448 | 448 | 28 | 2 | 29G | 35G | 329K | ✅ |
+| E | 56 | 16 | 896 | 896 | 56 | 1 | 23G | 41G | 382K | ✅ |
+| F | 128→PP2 | 16 | 128 | 256 | 16 | 7 | 29G | 35G | 330K |
+
+⭐ 推荐方案 C: DP=14, TP=16, EP=224 → 14 台机器
+
+896/224 = 4 experts/rank → 专家权重: 22.6 GiB
+总权重: 40.2 GiB → KV 剩余: 23.8 GiB ≈ 223K tokens
+
+结论：BF16 + 64GB 卡 + tp16 的前提下，EP 至少 224 才能装下。如果机器数不能超过 8 台，唯一方案是 PP2（方案 F），每台机器做两层 pipeline。
