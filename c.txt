@@ -1,65 +1,21 @@
-精确权重核算 (BF16, TP16, EP128, 单卡)
-
-一、专家权重 (EP=128, 896÷128=7 experts/rank)
-
-每专家:
-  w13: 3584 × 6144 = 22,020,096 elem × 2B = 42.0 MiB
-  w2:  3072 × 3584 = 11,010,048 elem × 2B = 21.0 MiB
-  单专家: 63 MiB
-
-每 MoE 层 (7专家): 7 × 63 = 441 MiB
-92 层:            441 × 92 = 39.6 GiB
-
-二、Replicated 权重 (TP 不切，每 rank 全量复制)
-
-routed_expert_down_proj ×92:  [3584, 7168] × 2B × 92 = 4.41 GiB
-routed_expert_up_proj   ×92:  [7168, 3584] × 2B × 92 = 4.41 GiB
-MoE gate                ×92:  [896,  7168] × 2B × 92 = 1.10 GiB
-───────────────────────────────────────────────────────
-Replicated 小计:                                        9.92
-
-三、TP-sharded 权重 (TP=16, per rank 1/16)
-
-Shared experts ×92 (gate_up+down, intermediate=6144):   1.42 GiB
-Dense layer 0 MLP (intermediate=33792):                 0.09 GiB
-MLA ×24 (fused_qkv_a 是 Replicated! + q_b/kv_b/g/o):    1.30 GiB
-KDA ×69 (full-rank gate 7168→12288, 各种投影):          ~3.50
-Embedding(163840×448) + lm_head(448×163840):            0.28 GiB
-RMSNorm + ResProj + 杂项:                              ~1.00 GiB
-───────────────────────────────────────────────────────
-TP-sharded 小计:                                        7.59 GiB
-
-四、总计
-
-专家:        39.62 GiB
-Replicated:   9.92 GiB
-TP-sharded:   7.59 GiB
-────────────────────
-总权重:      57.13 GiB  ← 已占 64GB 的 89%
-
-剩余给 KV:    6.87 GiB  ← MLA KV: ~107 KB/token → 仅 ~64K tokens
-剩余给激活:    ~0 GiB   ← 前向需要额外激活内存
-剩余给 NCCL:   ~0 GiB   ← 通信缓冲区
-
-▎ 结论: 57 GB 纯权重 + 7 GB KV/激活/NCCL 必然 OOM。BF16 + 128 卡 + EP=128 根本装不下。
-
----
-可行方案
-
-给定约束「卡数 = DP × TP = EP」，且 16 卡/机：
-
-| 方案 | DP | TP | EP | 总卡 | 机器 | 专家 | 权重 | KV余 | KV容量 |
-|------|----|----|----|------|------|------|------|------|--------|
-| A |  8 | 16 | 128 | 128 | 8 | 7 | 57G | 7G | 64K | ❌ OOM |
-| B |  4 | 16 | 64 | 64 | 4 | 14 | 79G | ❌ | ❌ | 更糟 |
-| C | 14 | 16 | 224 | 224 | 14 | 4 | 40G | 24G | 223K | ✅ |
-| D | 28 | 16 | 448 | 448 | 28 | 2 | 29G | 35G | 329K | ✅ |
-| E | 56 | 16 | 896 | 896 | 56 | 1 | 23G | 41G | 382K | ✅ |
-| F | 128→PP2 | 16 | 128 | 256 | 16 | 7 | 29G | 35G | 330K |
-
-⭐ 推荐方案 C: DP=14, TP=16, EP=224 → 14 台机器
-
-896/224 = 4 experts/rank → 专家权重: 22.6 GiB
-总权重: 40.2 GiB → KV 剩余: 23.8 GiB ≈ 223K tokens
-
-结论：BF16 + 64GB 卡 + tp16 的前提下，EP 至少 224 才能装下。如果机器数不能超过 8 台，唯一方案是 PP2（方案 F），每台机器做两层 pipeline。
+	id	name	version	api	api_type	backward	type	standard	shape	dtype	range	numel
+0	0	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[2, 128, 4, 32], [2, 128, 4, 32], [2, 128, 4, 32], [2, 128, 4, 32], [2, 4, 32, 32], [2, 128, 4], [0]]	[['bf16'], ['bf16'], ['fp32'], ['fp32'], ['fp32'], ['fp32'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [64]]	140288
+1	1	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[2, 128, 2, 64], [2, 128, 2, 64], [2, 128, 2, 64], [2, 128, 2, 64], [2, 2, 64, 64], [2, 128, 2], [0]]	[['fp32'], ['bf16'], ['bf16'], ['bf16'], ['bf16'], ['bf16'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [64]]	147968
+2	2	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[1, 128, 4, 64], [1, 128, 4, 64], [1, 128, 4, 64], [1, 128, 4, 64], [1, 4, 64, 64], [1, 128, 4], [0]]	[['bf16'], ['fp32'], ['fp32'], ['bf16'], ['fp32'], ['bf16'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [32]]	147968
+3	3	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[1, 256, 8, 32], [1, 256, 8, 32], [1, 256, 8, 32], [1, 256, 8, 32], [1, 8, 32, 32], [1, 256, 8], [0]]	[['fp32'], ['bf16'], ['bf16'], ['bf16'], ['fp32'], ['bf16'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [32]]	272384
+4	4	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[1, 256, 8, 32], [1, 256, 8, 32], [1, 256, 8, 32], [1, 256, 8, 32], [1, 8, 32, 32], [1, 256, 8], [0]]	[['fp32'], ['bf16'], ['fp32'], ['fp32'], ['bf16'], ['bf16'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [32]]	272384
+5	5	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[1, 256, 8, 32], [1, 256, 8, 32], [1, 256, 8, 32], [1, 256, 8, 32], [1, 8, 32, 32], [1, 256, 8], [0]]	[['bf16'], ['fp32'], ['bf16'], ['bf16'], ['fp32'], ['fp32'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [64]]	272384
+6	6	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[2, 128, 8, 32], [2, 128, 8, 32], [2, 128, 8, 32], [2, 128, 8, 32], [2, 8, 32, 32], [2, 128, 8], [0]]	[['fp32'], ['fp32'], ['bf16'], ['bf16'], ['fp32'], ['bf16'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [32]]	280576
+7	7	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[2, 128, 8, 32], [2, 128, 8, 32], [2, 128, 8, 32], [2, 128, 8, 32], [2, 8, 32, 32], [2, 128, 8], [0]]	[['fp32'], ['bf16'], ['fp32'], ['fp32'], ['fp32'], ['fp32'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [16]]	280576
+8	8	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[2, 128, 8, 32], [2, 128, 8, 32], [2, 128, 8, 32], [2, 128, 8, 32], [2, 8, 32, 32], [2, 128, 8], [0]]	[['fp32'], ['bf16'], ['bf16'], ['bf16'], ['fp32'], ['fp32'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [64]]	280576
+9	9	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[2, 128, 4, 64], [2, 128, 4, 64], [2, 128, 4, 64], [2, 128, 4, 64], [2, 4, 64, 64], [2, 128, 4], [0]]	[['bf16'], ['fp32'], ['fp32'], ['fp32'], ['bf16'], ['bf16'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [32]]	295936
+10	10	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[1, 64, 16, 64], [1, 64, 16, 64], [1, 64, 16, 64], [1, 64, 16, 64], [1, 16, 64, 64], [1, 64, 16], [0]]	[['bf16'], ['fp32'], ['bf16'], ['fp32'], ['bf16'], ['fp32'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [64]]	328704
+11	11	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[1, 64, 16, 64], [1, 64, 16, 64], [1, 64, 16, 64], [1, 64, 16, 64], [1, 16, 64, 64], [1, 64, 16], [0]]	[['bf16'], ['bf16'], ['bf16'], ['bf16'], ['bf16'], ['fp32'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [64]]	328704
+12	12	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[1, 64, 16, 64], [1, 64, 16, 64], [1, 64, 16, 64], [1, 64, 16, 64], [1, 16, 64, 64], [1, 64, 16], [0]]	[['fp32'], ['fp32'], ['fp32'], ['bf16'], ['bf16'], ['bf16'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [64]]	328704
+13	13	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[1, 128, 16, 64], [1, 128, 16, 64], [1, 128, 16, 64], [1, 128, 16, 64], [1, 16, 64, 64], [1, 128, 16], [0]]	[['fp32'], ['bf16'], ['fp32'], ['fp32'], ['bf16'], ['bf16'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [64]]	591872
+14	14	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[1, 128, 16, 64], [1, 128, 16, 64], [1, 128, 16, 64], [1, 128, 16, 64], [1, 16, 64, 64], [1, 128, 16], [0]]	[['bf16'], ['fp32'], ['bf16'], ['fp32'], ['fp32'], ['fp32'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [16]]	591872
+15	15	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[1, 128, 16, 64], [1, 128, 16, 64], [1, 128, 16, 64], [1, 128, 16, 64], [1, 16, 64, 64], [1, 128, 16], [0]]	[['fp32'], ['bf16'], ['fp32'], ['bf16'], ['bf16'], ['fp32'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [32]]	591872
+16	16	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[2, 128, 8, 64], [2, 128, 8, 64], [2, 128, 8, 64], [2, 128, 8, 64], [2, 8, 64, 64], [2, 128, 8], [0]]	[['bf16'], ['fp32'], ['bf16'], ['bf16'], ['bf16'], ['bf16'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [64]]	591872
+17	17	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[1, 256, 16, 64], [1, 256, 16, 64], [1, 256, 16, 64], [1, 256, 16, 64], [1, 16, 64, 64], [1, 256, 16], [0]]	[['bf16'], ['bf16'], ['fp32'], ['fp32'], ['fp32'], ['fp32'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [32]]	1118208
+18	18	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[1, 256, 16, 64], [1, 256, 16, 64], [1, 256, 16, 64], [1, 256, 16, 64], [1, 16, 64, 64], [1, 256, 16], [0]]	[['bf16'], ['fp32'], ['fp32'], ['fp32'], ['fp32'], ['fp32'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [64]]	1118208
+19	19	torch_chunk_bwd_dh	v2.1	pytorch	torch_chunk_bwd_dh	FALSE	[['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['tensor'], ['attr']]	acc={'single_bm': {'type': 'high_performance', 'fp16_error': 0.01, 'fp16_eb': 0.001, 'fp32_error': 0.01, 'fp32_eb': 0.001}} perf='not_key' mem=1.1	[[1, 256, 16, 64], [1, 256, 16, 64], [1, 256, 16, 64], [1, 256, 16, 64], [1, 16, 64, 64], [1, 256, 16], [0]]	[['fp32'], ['fp32'], ['bf16'], ['fp32'], ['bf16'], ['bf16'], ['int']]	[[[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, 0.1]], [[-0.1, -0.1]], [64]]	1118208
