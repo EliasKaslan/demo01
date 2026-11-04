@@ -1,24 +1,25 @@
-标题		内容（责任田）				
-		mindspeed(整体)	mindspeed-llm	mindspeed-mm	mindspeed-core	mindspeed-Ops
-版本号			不涉及	不涉及		
-发布时间			不涉及	不涉及		
-版本概述			MindSpeed LLM新增GLM5.2模型训练和DeepSeekV4长序列支持，权重/数据合一功能覆盖全量模型，显著提升训练能力；下架LLaMA2-13B、Qwen2.5-72B、Qwen3系列、Gemma2、Phi3.5、DeepSeek-V2-Lite、GLM4.5-Air等二十余款模型；下架DPO特性及相关脚本；下架MindSpore架构相关脚本、代码和文档。	MindSpeed MM新增支持Kimi K3、Qwen3.8、Minimax-M3、Minimax-H3、GLM5.3-flash等模型，并优化FSDP2后端，Ascend 950系列产品新增支持Qwen3-Omni模型以及上述所有新增模型，新增chunkmoe、swap core、op replay、preloader、cce triton融合、kv-allgather、低精特性，支持hf权重直接加载和保存。		
-版本详细信息			"1、MindSpeed LLM新增支持GLM5.2模型训练和DeepSeekV4长序列，且权重/数据合一功能覆盖全量模型，显著提升模型训练能力。
-2、MindSpeed LLM 模型下架 模型下架清单：
-LLaMA2-13B、Qwen2.5-72B、Qwen3-0.6B/1.7B/4B/14B/32B、Gemma2-9B/27B、Phi3.5-mini‑instruct、Magistral-24B、PLM-1.8B、Qwen3‑Next、Qwen3‑Coder‑Next、DeepSeek‑V2‑Lite、Ling‑mini‑2.0、Ring-1T、Phi3.5、GLM4.5‑Air、Step3.5‑Flash、GPT‑OSS、MiniMax‑M2.7、Mamba3
-3、MindSpeed LLM特性下架DPO特性以及相关脚本
-4、MindSpeed LLM下架MindSpore架构相关脚本、代码、文档"	"1. 新增支持Kimi K3、Qwen3.8、Minimax-M3、Minimax-H3、GLM5.3-flash等模型，并优化FSDP2后端；
-2. 新增Ascend 950系列产品支持，支持Qwen3-Omni模型以及上述所有新增模型，新增低精特性；
-3. 新增特性chunkmoe、swap core、op replay、preloader、cce triton融合、kv-allgather，支持hf权重直接加载和保存；
-4. 重点模型新增CI看护；
-5.下架Qwen-Image-Edit、Verl-Qwen3VL、Verl-Qwen2.5VL、Verl-Mistral、Qwen2.5VL、Qwen2.5 Omni、InternVL 3.5、Magistral-2509、bagel、deepseek ocr2、Flux、Flus2、Qwen-Image、SD3、SDXL等模型，同步下架仅依赖上述模型的特性与配套脚本。"		
-用户手册链接			不涉及	不涉及		
-版本配套	配套资源		不涉及	不涉及		
-	配套资源版本		不涉及	不涉及		
-	配套资源说明		不涉及	不涉及		
-	配套资源下载链接		不涉及	不涉及		
-软件资源	软件包名称					
-	软件包说明		MindSpeed LLM：基于昇腾生态的大语言模型分布式训练框架，旨在为华为 昇腾芯片 生态合作伙伴提供端到端的大语言模型训练方案，包含分布式预训练、分布式指令微调以及对应的开发工具链，如：数据预处理、权重转换、在线推理、基线评估等。	MindSpeed MM是面向大规模分布式训练的昇腾多模态大模型套件，同时支持多模态生成及多模态理解，旨在为华为 昇腾芯片 提供端到端的多模态训练解决方案, 包含预置业界主流模型，数据工程，分布式训练及加速，预训练、微调、在线推理任务等特性。		
-	下载git链code接		https://gitcode.com/Ascend/MindSpeed-LLM/tree/26.2.0	https://gitcode.com/Ascend/MindSpeed-MM/tree/26.2.0		
-公告概述			不涉及	不涉及		
-公告详情			不涉及	不涉及		
+MindSpeed-Ops（26.2.0）列
+下表按 26.1.0 表的行序排列，可直接作为该列内容粘贴进 26.2.0 的汇总表：
+
+标题	内容（MindSpeed-Ops，26.2.0）
+版本号	26.2.0
+发布时间	2026年10月
+版本概述	MindSpeed-Ops 在 26.2.0 正式将算子编程框架由 Triton、TileLang、ACLNN 三种扩展为五种，新增 ATB、CATLASS 后端及 MatmulAdd、chunk_loss 算子，并增强 Triton 算子在 Ascend 950 系列产品上的能力；同步建成中英文双语文档体系，升级适配 CANN 9.2.0、TorchNPU 26.2.0 和 Triton-Ascend 3.6.0。
+版本详细信息	1、新增 ATB、CATLASS 两种算子编程框架，框架支持由三种扩展为五种，进一步覆盖 GPU 迁移与昇腾原生（Ascend Transformer Boost、Ascend C 模板库）开发路线；<br>2、新增算子 MatmulAdd（npu_matmul_add_fp32/fp16，将 Megatron 权重梯度累加融合为原地计算，省去中间张量与独立 add kernel）与 chunk_loss（分块语言模型交叉熵，一次前向同时产出 hidden states 与词表权重梯度）；<br>3、Triton 算子增强：Clipped_swiglu 新增反向并支持 Ascend 950 系列产品，causal_conv1d 解除 D 维整除约束、修复 A5 反向传参，chunk_scaled_dot_kkt 修复大 g 值精度异常，l2norm、solve_tril 完成编译与性能优化；<br>4、配套工具与工程化：新增 CATLASS 按需编译（MINDSPEED_BUILD_CATLASS）与商发 wheel 日期标签，完成 RPATH、RELRO、栈保护等安全编译整改，新增 GitCode PR 流水线（SCA、恶意识别、pre-commit、四卡并行 UT）及对应 ATK、pytest 用例；<br>5、文档与配套升级：docs 升级为中英文双语，新增 FAQ、安全声明、贡献指南及 Triton、ACLNN、CATLASS、ATB、TileLang 五份算子开发指南；配套升级至 CANN 9.2.0、TorchNPU 26.2.0、Triton-Ascend 3.6.0、Python 3.12。
+用户手册链接	不涉及
+配套资源	不涉及
+配套资源版本	不涉及
+配套资源说明	不涉及
+配套资源下载链接	不涉及
+软件包名称	（留空，与现表一致）
+软件包说明	MindSpeed-Ops 是面向昇腾训练场景的自定义高性能算子库，旨在为华为昇腾芯片生态合作伙伴提供基于 Triton、TileLang、ACLNN、ATB、CATLASS 等多种编程框架的训练业务自定义算子实现，涵盖融合算子、MoE 路由算子、线性注意力算子等，为 MindSpeed 系列套件提供底层算子级加速支撑。
+下载git链接	https://gitcode.com/Ascend/MindSpeed-Ops/tree/26.2.0
+公告概述	不涉及
+公告详情	不涉及
+三点说明
+版本号与发布时间：26.1.0 表里这两行统一写"不涉及"。如果 26.2.0 沿用同一规则，把这两格改成"不涉及"即可。当前填的是仓库侧的权威数据（分支名 26.2.0；版本说明中"产品版本 26.2.0、版本类型 Release、发布时间 2026年10月"）。
+Git 链接：26.1.0 的 Ops 列给的是仓库根地址 .../MindSpeed-Ops.git，与同一行其他仓的 tree/26.1.0 写法不一致。26.2.0 已改为 tree/26.2.0，便于与其他仓格式统一；若要保留原写法，换回 .git 根地址即可。
+用户手册链接：仍按 26.1.0 的口径写"不涉及"。26.2.0 已具备 docs/zh 文档首页，如后续想给链接，可填 
+https://gitcode.com/Ascend/MindSpeed-Ops/tree/26.2.0/docs/zh
+。
+内容依据：26.2.0 分支的 docs/zh/release_notes_ops.md、docs/zh/supported_operators.md、README.md，以及 26.1.0..26.2.0 的 61 个提交（版本说明口径为 CANN 9.2.0、PyTorch 2.10.0、TorchNPU 26.2.0、Triton-Ascend 3.6.0、Python 3.12）。
