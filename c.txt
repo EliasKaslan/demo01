@@ -1,1 +1,10 @@
 
+【计算装备团队发放AI账号通知】
+       姓名：徐铭哲
+       工号：x00886548
+       火山AI网关 
+https://st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com/v1
+       对应API KEY ：6ae09a5f-7301-4f9c-88d7-17f7b0bba06c
+       wiki配置指导文档：https://wiki.huawei.com/domains/164642/wiki/339081/WIKI2026072411992198
+       蓝区AI工具账号使用须知：https://wiki.huawei.com/domains/164642/wiki/339081/WIKI2026070211707335
+       支撑人员 李娜 l30074365
