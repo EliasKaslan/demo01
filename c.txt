@@ -1,21 +1,32 @@
-【需求背景】
-
-vllm-ascend当前支持部分模型的batch一致性，其中FIA算子在开启整图模式时需要支持特性.out的调用形式，batch一致性的FIA算子支持.out形式，能保证在batch一致性特性下，能开启推理整图，提升性能。
-
-【需求详细】
-
-模型名称：qwen3-30B
-
-序列长度：2k-2k（2k输入，2k输出）
-精度：bf16
-数据集：无要求
-机器卡数：A5 DT Pod和A3
-交付质量目标（商用，受限商用，POC，预埋）：商用
-
-【验收标准】
-
-功能支持: 开启batch一致性，同时开始FULL_DECODE_ONLY整图模式
-
-性能要求：开启batch一致性后，进一步开启FULL_DECODE_ONLY，性收益来源于整图，该需求属于特性支持，保证性能无劣化。
-
-精度要求：开启batch一致性情况下，math500数据集评分开启FULL_DECODE_ONLY与不开启FULL_DECODE_ONLY相比无劣化，满足T校验
+标题		内容（责任田）				
+		mindspeed(整体)	mindspeed-llm	mindspeed-mm	mindspeed-core	mindspeed-Ops
+版本号			不涉及	不涉及	不涉及	不涉及
+发布时间			不涉及	不涉及	不涉及	不涉及
+版本概述			MindSpeed LLM支持Seed-OSS、GLM5模型Megatron训练，支持训练权重异步保存，新增Ascend 950系列产品支持，并升级适配CANN 9.1.0、TorchNPU 26.1.0和Triton-Ascend 3.2.2；同时下架InternLM3-8B、LLaMA2-7B/70B、LLaMA3.1-405B、Mamba2-2.7B/8B、Mamba2-Hybrid-8B等模型，以及QLoRA特性和相关脚本。	MindSpeed MM新增支持Qwen3.5、kimi k2.5等模型，并优化FSDP2后端，Ascend 950系列产品新增支持Qwen3 VL、Wan2.2、DanceGRPO、Qwen3.5、kimi k2.5等模型，并对社区资料做了完整性、正确性、易获取性、易理解性的优化。	MindSpeed Core完成对Atlas 950DT的能力支持，现有加速特性全面支持950DT，新增支持mxfp8、hif8的低精训练能力，此外对DSA、GDN的长序列并行进行增强。	MindSpeed-Ops首次正式发布，作为面向昇腾训练场景的自定义高性能算子库，支持基于Triton、TileLang、ACLNN三种编程框架的算子开发，提供融合算子、MoE路由算子、线性注意力算子等训练业务自定义算子实现，为MindSpeed系列套件提供底层算子级加速支撑。
+版本详细信息			"1、支持Seed-OSS、GLM5模型Megatron训练
+2、支持训练权重异步保存，提升大规模训练存档效率
+3、新增Ascend 950系列产品支持，升级适配CANN 9.1.0、TorchNPU 26.1.0和Triton-Ascend 3.2.2
+4、下架InternLM3-8B、LLaMA2-7B/70B、LLaMA3.1-405B、Mamba2-2.7B/8B、Mamba2-Hybrid-8B等模型
+5、下架QLoRA特性及相关脚本"	"1. 新增支持Qwen3.5、kimi k2.5等模型，并优化FSDP2后端；
+2. 新增Ascend 950系列产品支持，支持Qwen3 VL、Wan2.2、DanceGRPO、Qwen3.5、kimi k2.5等模型；
+3. 社区资料完整性、正确性、易获取性、易理解性优化；
+4. 重点模型新增CI看护；
+5.下架InternVL3、Qwen2 VL、CogVideoX 1.5、OpenSoraPlan1.5、OpenSora2.0等模型，同步下架仅依赖上述模型的特性与配套脚本。"	"1、现有加速特性、mcore原生特性Atlas 950DT代际继承；
+2、支持MXFP8/HIF8低精训练，同时支持低精度优化器；
+3、DSA支持TP、TND格式以及KVAllgather的长序列并行方案；
+4、GDN接入融合算子、支持TND格式、支持Ulysses长序列并行；"	"支持Triton、TileLang、ACLNN三种算子编程框架，覆盖GPU迁移及昇腾原生开发路线；
+提供融合算子（FusedCrossEntropyLoss、RmsNormGated、add_rms_norm_bias、Clipped_swiglu等），减少kernel launch开销，提升训练吞吐；
+提供MoE路由算子（Sinkhorn、Sort_chunks_by_idx），支撑MoE模型负载均衡与chunk重排；
+提供线性注意力/SSM算子（Causal_conv1d、Wy_fast等），适配Mamba等新兴架构训练；
+配套算子性能采集工具、pytest单元测试、ATK精度/性能测试及Docker开发环境；
+提供Triton、TileLang、ACLNN三种框架的算子使用与开发文档。"
+用户手册链接			不涉及	不涉及	不涉及	不涉及
+版本配套	配套资源		不涉及	不涉及	不涉及	不涉及
+	配套资源版本		不涉及	不涉及	不涉及	不涉及
+	配套资源说明		不涉及	不涉及	不涉及	不涉及
+	配套资源下载链接		不涉及	不涉及	不涉及	不涉及
+软件资源	软件包名称					
+	软件包说明		MindSpeed LLM：基于昇腾生态的大语言模型分布式训练框架，旨在为华为 昇腾芯片 生态合作伙伴提供端到端的大语言模型训练方案，包含分布式预训练、分布式指令微调以及对应的开发工具链，如：数据预处理、权重转换、在线推理、基线评估等。	MindSpeed MM是面向大规模分布式训练的昇腾多模态大模型套件，同时支持多模态生成及多模态理解，旨在为华为 昇腾芯片 提供端到端的多模态训练解决方案, 包含预置业界主流模型，数据工程，分布式训练及加速，预训练、微调、在线推理任务等特性。	MindSpeed Core是针对昇腾设备推出的亲和加速模块。提供包括并行优化、内存优化、通信优化及计算优化的多维度加速算法，极大提高了模型训练速度，并提升了支持的模型规模。作为套件核心加速模块，为用户提供强劲的性能支持。	MindSpeed-Ops 是面向昇腾训练场景的自定义高性能算子库，旨在为华为昇腾芯片生态合作伙伴提供基于 Triton、TileLang、ACLNN 等多种编程框架的训练业务自定义算子实现，涵盖融合算子、MoE 路由算子、线性注意力算子等，为 MindSpeed 系列套件提供底层算子级加速支撑。
+	下载git链code接		https://gitcode.com/Ascend/MindSpeed-LLM/tree/26.1.0	https://gitcode.com/Ascend/MindSpeed-MM/tree/26.1.0	https://gitcode.com/Ascend/MindSpeed/tree/26.1.0_core_r0.12.1	https://gitcode.com/Ascend/MindSpeed-Ops.git
+公告概述			不涉及	不涉及	不涉及	不涉及
+公告详情			不涉及	不涉及	不涉及	不涉及
