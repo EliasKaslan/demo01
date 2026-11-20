@@ -1,5 +1,35 @@
 # DeepSeek V4.1 Flash 训推一致性修改
 
+## 当前交付版本（2026-11-20）
+
+11 月 19 日这轮调优的运行时代码变化集中在 **vLLM Ascend 的推理侧 mHC**。训练和 RL 框架沿用调优前的验收提交。本文后半部分保留早期文本、eager 验收的源码对照，便于追溯基础对齐改动。
+
+四个公开仓库的交付分支均为 `optimization/countbenchqa-zero-20261119`。按实验总仓锁定的版本复现。
+
+| 仓库 | 验收提交 | 内容 |
+| --- | --- | --- |
+| 实验总仓 | [`8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4`](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/commit/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4) | 运行配方、消融工具、性能与数值验收 |
+| vLLM Ascend | [`aa9500afda0f937f5c55b884e97d2dfda3666751`](https://gitcode.com/EliasKaslan/dsv41-vllm-ascend/commit/aa9500afda0f937f5c55b884e97d2dfda3666751) | 推理侧 mHC 16 行下限与原有推理一致性改动 |
+| FSDPTurbo | [`cdd0c5708706f10dad11fff22184b64387a56eb7`](https://gitcode.com/EliasKaslan/dsv41-fsdp-turbo/commit/cdd0c5708706f10dad11fff22184b64387a56eb7) | 沿用调优前已验收的训练框架 |
+| verl | [`798cfee18da0180e408d281ccdadf72d5b4d30ab`](https://gitcode.com/EliasKaslan/dsv41-verl/commit/798cfee18da0180e408d281ccdadf72d5b4d30ab) | 沿用 CountBenchQA 训练、审计及评分代码 |
+
+### 11 月 19 日运行时代码增量
+
+比较推理仓 `b0b50542f` 至 `aa9500afd`，运行时 diff 位于 `vllm_ascend/ops/batch_invariant_hc.py` 和 `vllm_ascend/envs.py`，另有环境变量文档。实验前已完成的图片占位词屏蔽、BF16 缓存、训练索引器和专家合并属于基线。 [调优前后提交对照](https://gitcode.com/EliasKaslan/dsv41-vllm-ascend/compare/b0b50542f46e8ea82f72672c3b46c4fc99f9e908...aa9500afda0f937f5c55b884e97d2dfda3666751)
+
+- **从每次 128 行改为按真实 token 行数调用。** 首版 `f2313701f` 对合格输入合并分块，直接用实际行数调用同一 CANN mHC 算子。两轮长回答回放分别出现 4 个、1 个 FP32 位差。 [首版提交](https://gitcode.com/EliasKaslan/dsv41-vllm-ascend/commit/f2313701fb6a228d0612509849976d692c532bd8) · [首版差异回执](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/evidence/night8-optimized/frozen-initial-differences.json)
+- **保留 16 行物理下限。** 最终版对合格输入使用 `max(实际行数, 16)`，少于 16 行时补零，算完裁掉补齐行。条件包括 Ascend 950、NPU BF16、隐藏宽度 5,120、实际输入 1–3,072 行、确定性等级 3 和训练 mHC 路径。未命中条件时使用原有 128 行分块。 [最终 mHC 源码](https://gitcode.com/EliasKaslan/dsv41-vllm-ascend/blob/aa9500afda0f937f5c55b884e97d2dfda3666751/vllm_ascend/ops/batch_invariant_hc.py)
+- **前后处理分别开关。** `VLLM_ASCEND_DSV41_MHC_NATIVE_PRE_ROWS` 与 `VLLM_ASCEND_DSV41_MHC_NATIVE_POST_ROWS` 默认都是 `0`，最终配方设置为 `1`。推理路径复用已有 CANN 算子。训练侧仍以 128 行分块，撤回训练分块的候选改变了实测梯度，因此保留原训练实现。 [优化版配方](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/configs/optimized.json) · [详细性能报告](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/%E6%80%A7%E8%83%BD%E5%88%86%E6%9E%90%E6%8A%A5%E5%91%8A.md)
+
+### 与代码绑定的验收结论
+
+- **数值。** 优化版连续运行 100 步真实 GRPO，覆盖 9,600 条回答、1,885,622 个有效 token。推理返回的所选 token 原始 FP32 logprob，与训练 loss 使用的带梯度 Actor 前向逐位相同。每步使用 `bypass_mode=true`，`old_log_probs` 取自 rollout。无梯度前向在独立边界用例另行验证，两条训练前向各对照 2,561 个有效位置，均为零位差。 [百步逐步复核](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/evidence/night22-long/optimized100.json) · [边界验收原始回执](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/evidence/night21-optimized/accepted-recipe.json)
+- **性能。** 相对调优前，96 条固定输出长度的独立推理耗时从 143.79 降至 113.35 秒（−21.18%），吞吐提升 26.88%。同机在线 GRPO 暖态 Rollout 从 144.81 降至 114.07 秒/步（−21.22%），整步从 333.60 降至 274.80 秒/步（−17.63%）。 [同机四步对照](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/evidence/night21-final/online-paired.json) · [固定负载与逐项撤回](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/evidence/night21-final/triplets.json)
+
+## 历史源码对照
+
+以下编号小节对应早期基础对齐快照，保留原始代码解释、当时的模式与结果。其中的「最终提交」「本轮」和 128 行推理行为均以该快照为范围。历史附录的相对链接沿用原归档路径，当前交付以本文顶部的固定提交为准。
+
 ## 1. 代码比较范围
 
 | 仓库        | 比较基线 → 最终提交         |
