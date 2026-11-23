@@ -1,1 +1,574 @@
+#!/bin/bash
+# Copyright 2023 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+# 依据 wiki SR20261013190698【26RP4】【vllm-ascend】batch一致性支持FIA算子的整图模式 编写
+# https://wiki.huawei.com/domains/64729/wiki/204290/WIKI2026111813928176
+prog="$(basename $0)"
+prog_option="$*"
+MODEL_PATH="/data/LLM/mindSpeed_rl/Qwen3-30B-A3B"
+MATH500_JSONL="/data/LLM/datasets/math/test.jsonl"
+TP=${TP:-2}
+PERF_DIE=${PERF_DIE:-0}
+ACC_GRAPH_DIE=${ACC_GRAPH_DIE:-0}
+ACC_EAGER_DIE=${ACC_EAGER_DIE:-1}
+PERF_RATIO_MIN=${PERF_RATIO_MIN:-1.0}
 
+root_path="/autotest/pytorch"
+model_path="RL_Infer"
+src_path="$root_path/$model_path"
+model_name=${prog#run_}
+model_name=${model_name%.sh}
+workspace="$root_path/torch_autotest/model/run/$model_name"
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+unset HCCL_SOCKET_IFNAME
+unset GLOO_SOCKET_IFNAME
+export HCCL_CONNECT_TIMEOUT=1200
+export HCCL_EXEC_TIMEOUT=1200
+# help
+help () {
+  echo "Usage: $prog [OPTION]"
+  echo
+  echo "Options:"
+  echo
+  echo "  -m, --mode   [perf, acc]"
+  echo "               perf = 性能：vllm bench throughput，eager 基线 vs FULL_DECODE_ONLY 整图，各 2 次"
+  echo "               acc  = 精度+批次不变性：MATH-500 graph 10 轮 + eager 1 轮 + 配对检验"
+  echo "  -p, --precision   可选，仅用于工作目录命名，可留空"
+  echo "  -pro, --profile / -c, --cluster / -n, --node_rank   兼容框架保留参数"
+  echo "  -h, --help   Print this help."
+  echo
+}
+
+check_npu_avaiable () {
+  num=$(ls -l /dev | grep -E 'davinci[0-9]+' | wc -l)
+
+  if [ $num == "0" ]; then
+    echo -e "\033[1;31mNo npu device found.\033[1;37m"
+    exit 1
+  fi
+}
+prepare_parameter () {
+  export PYTHONPATH=$(echo "$PYTHONPATH" | sed 's/^://; s/::/:/g; s/:$//')
+  mkdir -p $workspace/out $workspace/bitest
+  cat > $workspace/bitest/math500_rounds.py << 'PYEOF'
+#!/usr/bin/env python3
+"""
+用法：python3 math500_rounds.py --mode graph --rounds 10 --max-tokens 2048 --max-model-len 8192 --max-num-seqs 32
+"""
+import argparse, hashlib, json, os, re, sys, time
+
+BOXED = re.compile(r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}")
+
+def normalize(s):
+    s = (s or "").strip().replace("\\left", "").replace("\\right", "").replace("$", "")
+    s = s.replace("\\!", "").replace("\\,", "").replace(" ", "").replace("\n", "")
+    s = s.replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac")
+    s = re.sub(r"\\text\{([^{}]*)\}", r"\1", s)
+    return s.rstrip(".")
+
+def grade(text, answer):
+    m = BOXED.findall(text or "")
+    return bool(m) and normalize(m[-1]) == normalize(answer)
+
+def text_sha(texts):
+    h = hashlib.sha256()
+    for t in texts:
+        h.update(t.encode("utf-8")); h.update(b"\x00")
+    return h.hexdigest()
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["eager", "graph"], default="graph")
+    ap.add_argument("--rounds", type=int, default=10)
+    ap.add_argument("--max-tokens", type=int, default=2048)
+    ap.add_argument("--max-model-len", type=int, default=8192)
+    ap.add_argument("--max-num-seqs", type=int, default=32)
+    ap.add_argument("--tp", type=int, default=1)
+    ap.add_argument("--tag", default="")
+    ap.add_argument("--model", default=os.environ.get("MODEL_PATH", ""))
+    ap.add_argument("--data", default=os.environ.get("MATH500_JSONL", ""))
+    ap.add_argument("--out", default="")
+    a = ap.parse_args()
+    if not a.model:
+        print("ERROR: --model 未指定（脚本头部 MODEL_PATH 留空？）")
+        return 1
+    if not a.data:
+        print("ERROR: --data 未指定（脚本头部 MATH500_JSONL 留空？）")
+        return 1
+    tag = a.tag or a.mode
+
+    os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    from vllm import LLM, SamplingParams
+
+    graph = a.mode == "graph"
+    llm = LLM(model=a.model, tensor_parallel_size=a.tp, dtype="bfloat16",
+              max_model_len=a.max_model_len, enable_prefix_caching=False, enable_chunked_prefill=False,
+              max_num_seqs=a.max_num_seqs, max_num_batched_tokens=32768, seed=1234,
+              gpu_memory_utilization=0.90, trust_remote_code=True, disable_log_stats=True,
+              enforce_eager=not graph,
+              compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY",
+                                  "cudagraph_capture_sizes": [1, 8, 16, 32]} if graph
+              else {"cudagraph_mode": "NONE"})
+
+    items = [json.loads(l) for l in open(a.data, encoding="utf-8") if l.strip()]
+    tok = llm.get_tokenizer()
+    prompts = []
+    for it in items:
+        msgs = [{"role": "user", "content": it["problem"] + "\n\nSolve the problem and put the final answer in \\boxed{}."}]
+        try:
+            prompts.append(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False))
+        except TypeError:
+            prompts.append(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
+    sp = SamplingParams(temperature=0.0, max_tokens=a.max_tokens, ignore_eos=False)
+    out_dir = a.out or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    base_sha = None
+    for r in range(1, a.rounds + 1):
+        path = os.path.join(out_dir, "math500_%s_r%02d.jsonl" % (tag, r))
+        t0 = time.time()
+        if os.path.exists(path) and os.path.getsize(path) > 0:      # 断点续跑：已有轮次直接复用
+            rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+            reused = True
+        else:
+            outs = llm.generate(prompts, sp, use_tqdm=False)
+            rows, reused = [], False
+            for i, (it, o) in enumerate(zip(items, outs)):
+                text = o.outputs[0].text
+                rows.append({"id": i, "prediction": text, "correct": grade(text, it["answer"]),
+                             "finish_reason": o.outputs[0].finish_reason,
+                             "n_tokens": len(o.outputs[0].token_ids)})
+            with open(path, "w", encoding="utf-8") as f:
+                for x in rows:
+                    f.write(json.dumps(x, ensure_ascii=False) + "\n")
+        texts = [x["prediction"] for x in rows]
+        acc = sum(x["correct"] for x in rows) / len(rows)
+        sha = text_sha(texts)
+        base_sha = base_sha or sha
+        summ = {"round": r, "mode": a.mode, "n": len(rows), "accuracy": round(acc, 6),
+                "text_sha256": sha, "identical_to_round1": sha == base_sha,
+                "mean_tokens": round(sum(x["n_tokens"] for x in rows) / len(rows), 1),
+                "truncated": sum(1 for x in rows if x["finish_reason"] == "length"),
+                "reused": reused, "sec": round(time.time() - t0, 1),
+                "max_tokens": a.max_tokens, "max_num_seqs": a.max_num_seqs}
+        with open(os.path.join(out_dir, "summary_%s_r%02d.json" % (tag, r)), "w", encoding="utf-8") as f:
+            json.dump(summ, f, ensure_ascii=False, indent=1)
+        print("ROUND_SUMMARY " + json.dumps(summ, ensure_ascii=False), flush=True)
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
+
+  # ---- wiki 附件 3) 汇总与配对检验：summary.py ----
+  cat > $workspace/bitest/summary.py << 'PYEOF'
+#!/usr/bin/env python3
+"""汇总（wiki SR20261013190698 附件适配版）：
+逐轮表格 + 跨轮一致性 + graph vs eager 配对检验（McNemar 精确检验 + 配对 t）。
+用法：python3 summary.py --data-dir <输出目录>
+注：批次不变性判定要求整图至少 2 轮（wiki 验收跑 10 轮）。
+"""
+import argparse, glob, json, math, os, sys
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--data-dir", default=".")
+a = ap.parse_args()
+D = a.data_dir
+
+def load_round(tag, r):
+    p = os.path.join(D, "math500_%s_r%02d.jsonl" % (tag, r))
+    return [json.loads(l) for l in open(p, encoding="utf-8") if l.strip()] if os.path.exists(p) else None
+
+def binom_two_sided(b, c):
+    n = b + c
+    if n == 0:
+        return 1.0
+    k = min(b, c)
+    return min(1.0, 2 * sum(math.comb(n, i) for i in range(k + 1)) / (2 ** n))
+
+shas, accs = [], []
+for p in sorted(glob.glob(os.path.join(D, "summary_graph_r*.json"))):
+    d = json.load(open(p, encoding="utf-8"))
+    shas.append(d["text_sha256"]); accs.append(d["accuracy"])
+    print("round=%02d n=%d acc=%.4f mean_tok=%.1f trunc=%d sec=%.0f same_as_r1=%s"
+          % (d["round"], d["n"], d["accuracy"], d["mean_tokens"], d["truncated"], d["sec"],
+             d["identical_to_round1"]))
+print("rounds=%d unique_sha=%d unique_acc=%s" % (len(shas), len(set(shas)), sorted(set(accs))))
+
+# 批次不变性判定：整图各轮逐样本文本 sha256 必须唯一
+if len(shas) < 2:
+    print("RESULT: BI_FAIL (整图轮次不足 2 轮，无法判定批次不变性)")
+    sys.exit(1)
+if len(set(shas)) == 1:
+    print("RESULT: BI_OK (整图 %d 轮逐样本文本 sha256 完全一致，批次不变性成立)" % len(shas))
+else:
+    print("RESULT: BI_FAIL (整图 %d 轮文本 sha256 共 %d 种取值，批次不变性不成立)" % (len(shas), len(set(shas))))
+    sys.exit(1)
+
+g, e = load_round("graph", 1), load_round("eager", 1)
+if not g or not e:
+    print("RESULT: ACC_NO_DATA (缺少 graph_r01 / eager_r01 结果文件，无法配对检验)")
+    sys.exit(1)
+if len(g) != len(e):
+    print("RESULT: ACC_NO_DATA (graph %d 条 vs eager %d 条，样本数不一致)" % (len(g), len(e)))
+    sys.exit(1)
+n = len(g)
+gc = sum(x["correct"] for x in g); ec = sum(x["correct"] for x in e)
+b = sum(1 for x, y in zip(g, e) if x["correct"] and not y["correct"])   # 整图对、基线错
+c = sum(1 for x, y in zip(g, e) if y["correct"] and not x["correct"])   # 基线对、整图错
+same = sum(1 for x, y in zip(g, e) if x["prediction"] == y["prediction"])
+d = [(1 if x["correct"] else 0) - (1 if y["correct"] else 0) for x, y in zip(g, e)]
+mean = sum(d) / n
+se = math.sqrt(sum((v - mean) ** 2 for v in d) / (n - 1) / n)
+p = binom_two_sided(b, c)
+print(json.dumps({"n": n, "acc_graph": round(gc / n, 6), "acc_eager": round(ec / n, 6),
+                  "delta_pp": round((gc - ec) / n * 100, 3),
+                  "graph_right_eager_wrong": b, "eager_right_graph_wrong": c,
+                  "identical_text": same, "paired_t": round(mean / se, 4) if se else 0.0,
+                  "paired_ci95": [round(mean - 1.96 * se, 6), round(mean + 1.96 * se, 6)],
+                  "mcnemar_p": round(p, 6),
+                  "verdict": "NO_SIGNIFICANT_DIFF" if p >= 0.05 else ("DEGRADATION" if c > b else "IMPROVEMENT")},
+                 ensure_ascii=False, indent=1))
+if p >= 0.05:
+    print("RESULT: ACC_OK (McNemar p=%.4f >= 0.05，整图相对 eager 无显著差异、无劣化)" % p)
+else:
+    print("RESULT: ACC_DIFF (McNemar p=%.4f < 0.05，%s，需人工复核)" %
+          (p, "整图劣化" if c > b else "整图提升"))
+    sys.exit(1)
+PYEOF
+
+  # ---- perf bench 日志解析与判定 ----
+  cat > $workspace/bitest/parse_bench.py << 'PYEOF'
+#!/usr/bin/env python3
+"""解析 vllm bench throughput 日志：输出 4 组表格 + 整图/eager 吞吐比判定。
+用法：python3 parse_bench.py <eager1.log> <eager2.log> <graph1.log> <graph2.log> --min-ratio 1.0
+"""
+import argparse, re, sys
+
+def parse(path):
+    out = total = req = None
+    try:
+        f = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return out, total, req
+    for line in f:
+        low = line.lower()
+        m = re.search(r"([\d.]+)\s*$", line.strip())
+        if not m:
+            continue
+        v = float(m.group(1))
+        if "output token throughput" in low:
+            out = v
+        elif "total token throughput" in low:
+            total = v
+        elif "request throughput" in low:
+            req = v
+    f.close()
+    return out, total, req
+
+def fmt(v):
+    return "%.2f" % v if v is not None else "NA"
+
+ap = argparse.ArgumentParser()
+ap.add_argument("logs", nargs=4)
+ap.add_argument("--min-ratio", type=float, default=1.0)
+a = ap.parse_args()
+
+vals = [parse(p) for p in a.logs]
+print("%-12s %-18s %-16s %-14s" % ("组别", "输出吞吐(tok/s)", "总吞吐(tok/s)", "请求速率(req/s)"))
+for lab, (o, t, r) in zip(["eager第1次", "eager第2次", "graph第1次", "graph第2次"], vals):
+    print("%-12s %-18s %-16s %-14s" % (lab, fmt(o), fmt(t), fmt(r)))
+
+ratios = []
+for i in (0, 1):
+    go, eo = vals[i + 2][0], vals[i][0]
+    if go is None or eo is None or eo == 0:
+        print("RESULT: PERF_NO_DATA (第 %d 组配对缺少输出吞吐数据，检查 bench 日志)" % (i + 1))
+        sys.exit(1)
+    ratios.append(go / eo)
+print("整图/eager 输出吞吐比: 第1次 %.3f, 第2次 %.3f" % (ratios[0], ratios[1]))
+if min(ratios) >= a.min_ratio:
+    print("RESULT: PERF_OK (整图/eager 吞吐比均 >= %.2f，无性能劣化)" % a.min_ratio)
+else:
+    print("RESULT: PERF_DEGRADED (整图/eager 吞吐比低于阈值 %.2f: %s)" %
+          (a.min_ratio, ", ".join("%.3f" % r for r in ratios)))
+    sys.exit(1)
+PYEOF
+}
+
+prepare_environment () {
+  echo -e "\033[1;34mPrepare environment...\033[1;37m"
+  rm -rf $workspace
+  cp -r $src_path $workspace
+  mkdir -p $workspace/logs
+  mkdir -p $workspace/out
+
+  git config --global http.sslVerify false
+  pip uninstall vllm vllm-ascend xgrammar -y
+  pip install setuptools==80.10.2
+  pip install setuptools-scm==10.0.5
+  pip install setuptools_rust
+  cd $workspace
+
+  cd vllm
+  export VLLM_TARGET_DEVICE=empty
+  python3 use_existing_torch.py
+  pip install -r requirements/common.txt
+  pip install setuptools_rust setuptools_scm
+  pip install -e . --no-build-isolation
+
+  cd ../vllm-ascend
+  sed -i 's/torch/#torch/g' ./requirements.txt
+  sed -i 's/torch-npu/#torch-npu/g' ./requirements.txt
+  sed -i 's/triton-ascend/#triton-ascend/g' ./requirements.txt
+  sed -i '/torch/d' ./pyproject.toml
+  sed -i '/torch-npu/d' ./pyproject.toml
+  sed -i '/triton-ascend/d' ./pyproject.toml
+  pip install -r requirements.txt
+  git config --global http.sslVerify false
+  export CMAKE_TLS_VERIFY=0
+  export GIT_SSL_NO_VERIFY=true
+  export COMPILE_CUSTOM_KERNELS=1
+  VLLM_BATCH_INVARIANT=1 pip install -e . --no-build-isolation
+  unset VLLM_TARGET_DEVICE
+  unset COMPILE_CUSTOM_KERNELS
+  cd ../
+  # TODO: Qwen3.5 系列线性注意力依赖，按实际权重是否需要决定保留/删除
+  pip install flash_linear_attention_npu*.whl
+  pip install torchvision==0.25.0
+}
+
+# 每次 bench 前校验目标 die「无进程且 HBM <= 10%」（wiki 验收要求）
+check_die_idle () {
+  local die=$1
+  echo "[INFO] 校验 die $die：无进程且 HBM 占用 <= 10% ..."
+  # TODO: npu-smi 输出格式与 die 编号映射随版本/机型不同，这里只落盘现场信息供人工核对，
+  #       不做硬门禁；如需强制校验，请按实际 npu-smi 输出补充解析，并在异常时 return 1。
+  if command -v npu-smi > /dev/null 2>&1; then
+    npu-smi info > $workspace/logs/npu_smi_die_${die}_$(date +%s).log 2>&1
+    cat $workspace/logs/npu_smi_die_${die}_$(date +%s).log
+  else
+    echo "[WARN] 未找到 npu-smi，跳过 die 状态校验"
+  fi
+}
+
+run_model () {
+  echo -e "\033[1;34mRun model...\033[1;37m"
+  unset VLLM_TARGET_DEVICE
+  unset COMPILE_CUSTOM_KERNELS
+  cd $workspace
+  # 二次保险：PYTHONPATH 空条目（bashrc 的 ":/tmp/decord/python"）会把 cwd 注入
+  # 所有 python 子进程的 sys.path，cwd 下的 vllm/ 仓库根目录会抢先变成命名空间包，
+  # from vllm import LLM 报 unknown location。在启动任何推理进程前再洗一遍。
+  export PYTHONPATH=$(echo "$PYTHONPATH" | sed 's/^://; s/::/:/g; s/:$//')
+
+  if [ "$mode" == "16p" ]; then
+    # ---------- 性能：vllm bench throughput，eager 基线 vs FULL_DECODE_ONLY 整图 ----------
+    echo -e "\033[1;34mPerf: vllm bench throughput (BI + eager 基线 vs BI + FULL_DECODE_ONLY 整图, TP=$TP)\033[1;37m"
+    # 16p：16 卡 TP16，卡可见范围不能限制成单 die，否则 worker rank 越界
+    #（vllm-ascend worker: "local rank N is out of bounds for M devices"）
+    export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
+    export VLLM_BATCH_INVARIANT=1
+    export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    export VLLM_ENABLE_V1_MULTIPROCESSING=0
+    # TP 跟 mode 绑：16p 默认 TP16（可外部 TP=xx 覆盖），num-prompts / max-num-seqs 随卡数放大
+    export TP=${TP:-16}
+
+    local COMMON="--model ${MODEL_PATH} \
+ --input-len 2048 --output-len 2048 --num-prompts $((8 * TP)) \
+ --max-model-len 8192 --max-num-seqs $((8 * TP)) \
+ --gpu-memory-utilization 0.9 --dtype bfloat16 --seed 12345 \
+ --tensor-parallel-size ${TP}"
+    # 两组仅 cudagraph 配置不同
+    local EAGER_ARGS="--enforce-eager --compilation-config {\"cudagraph_mode\":\"NONE\"}"
+    local GRAPH_ARGS="--no-enforce-eager --compilation-config {\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[1,8]}"
+
+    local i
+    for i in 1 2; do
+      echo "==========================Baseline: BI + eager (run $i)========================="
+      check_die_idle $PERF_DIE
+      vllm bench throughput $COMMON $EAGER_ARGS 2>&1 | tee $workspace/logs/bench_eager_$i.log
+      if [ ${PIPESTATUS[0]} -ne 0 ]; then
+        echo -e "\033[1;31m[ERROR] bench eager 第 $i 次运行失败，日志: $workspace/logs/bench_eager_$i.log\033[1;37m"
+        return 1
+      fi
+    done
+    for i in 1 2; do
+      echo "==========================Acceptance: BI + FULL_DECODE_ONLY (run $i)========================="
+      check_die_idle $PERF_DIE
+      vllm bench throughput $COMMON $GRAPH_ARGS 2>&1 | tee $workspace/logs/bench_graph_$i.log
+      if [ ${PIPESTATUS[0]} -ne 0 ]; then
+        echo -e "\033[1;31m[ERROR] bench graph 第 $i 次运行失败，日志: $workspace/logs/bench_graph_$i.log\033[1;37m"
+        return 1
+      fi
+    done
+
+    echo "==========================Perf Summary========================="
+    python3 $workspace/bitest/parse_bench.py \
+      $workspace/logs/bench_eager_1.log $workspace/logs/bench_eager_2.log \
+      $workspace/logs/bench_graph_1.log $workspace/logs/bench_graph_2.log \
+      --min-ratio $PERF_RATIO_MIN 2>&1 | tee $workspace/logs/perf_summary.log
+    if [ ${PIPESTATUS[0]} -ne 0 ]; then
+      echo -e "\033[1;31m[ERROR] 性能判定未通过，日志: $workspace/logs/perf_summary.log\033[1;37m"
+      return 1
+    fi
+  else
+    # ---------- 精度：MATH-500 graph 10 轮 + eager 1 轮 + 配对检验 ----------
+    echo -e "\033[1;34mAcc: MATH-500 graph 10 轮 + eager 1 轮 + 配对检验\033[1;37m"
+    export VLLM_BATCH_INVARIANT=1
+    export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    export VLLM_ENABLE_V1_MULTIPROCESSING=0
+    # 可见卡数必须 >= TP，否则 vllm-ascend worker 报
+    # "local rank N is out of bounds for M devices"；
+    # 从起始 die 连续取 TP 张卡（TP=1 时即单 die，等价 wiki 原版配置）
+    _acc_g_first=${ACC_GRAPH_DIE:-0}
+    _acc_e_first=${ACC_EAGER_DIE:-1}
+
+    # 整图：10 轮（wiki 实测 die 0 起）
+    echo "==========================Math500: graph x10 (die ${_acc_g_first}~ TP=$TP)========================="
+    export ASCEND_RT_VISIBLE_DEVICES=$(seq -s, $_acc_g_first $((_acc_g_first + TP - 1)))
+    check_die_idle $_acc_g_first
+    python3 $workspace/bitest/math500_rounds.py \
+      --mode graph --rounds 10 \
+      --max-tokens 2048 --max-model-len 8192 --max-num-seqs 32 \
+      --tp $TP --model ${MODEL_PATH} --data ${MATH500_JSONL} --out $workspace/out \
+      2>&1 | tee $workspace/logs/math500_graph.log
+    if [ ${PIPESTATUS[0]} -ne 0 ]; then
+      echo -e "\033[1;31m[ERROR] graph 轮次运行失败，日志: $workspace/logs/math500_graph.log\033[1;37m"
+      return 1
+    fi
+
+    # 不开图：1 轮对照（wiki 实测用另一张 die；单 die 环境请把 ACC_EAGER_DIE 改成 0）
+    echo "==========================Math500: eager x1 (die ${_acc_e_first}~ TP=$TP)========================="
+    export ASCEND_RT_VISIBLE_DEVICES=$(seq -s, $_acc_e_first $((_acc_e_first + TP - 1)))
+    check_die_idle $_acc_e_first
+    python3 $workspace/bitest/math500_rounds.py \
+      --mode eager --rounds 1 \
+      --max-tokens 2048 --max-model-len 8192 --max-num-seqs 32 \
+      --tp $TP --model ${MODEL_PATH} --data ${MATH500_JSONL} --out $workspace/out \
+      2>&1 | tee $workspace/logs/math500_eager.log
+    if [ ${PIPESTATUS[0]} -ne 0 ]; then
+      echo -e "\033[1;31m[ERROR] eager 对照轮运行失败，日志: $workspace/logs/math500_eager.log\033[1;37m"
+      return 1
+    fi
+
+    # 汇总：逐轮一致性 + graph vs eager 配对检验
+    echo "==========================Summary: 跨轮一致性 + graph vs eager 配对检验========================="
+    python3 $workspace/bitest/summary.py --data-dir $workspace/out 2>&1 | tee $workspace/logs/summary.log
+    if [ ${PIPESTATUS[0]} -ne 0 ]; then
+      echo -e "\033[1;31m[ERROR] 汇总判定未通过（BI_FAIL / ACC_NO_DATA / ACC_DIFF），日志: $workspace/logs/summary.log\033[1;37m"
+      return 1
+    fi
+  fi
+}
+
+clean_environment () {
+  echo -e "\033[1;34mClean environment...\033[1;37m"
+  # 杀掉推理服务进程
+  pgrep -f VLLM::Worker | xargs kill -9
+  pkill -9 -f "vllm.entrypoints.openai.api_server"
+  pkill -9 -f "VLLM::EngineCore"
+}
+
+# parse command-line options
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m|--mode)
+        shift
+        if [ -z "$(echo $1 | grep ^-.)" ]; then
+          # skip the -xx option, in case
+          mode=$1
+          shift
+        fi
+        ;;
+    -p|--precision)
+        shift
+        if [ -z "$(echo $1 | grep ^-.)" ]; then
+          # skip the -xx option, in case
+          precision=$1
+          shift
+        fi
+        ;;
+    -pro|--profile)
+        shift
+        if [ -z "$(echo $1 | grep ^-.)" ]; then
+          # skip the -xx option, in case
+          profile_type=$1
+          shift
+        fi
+        ;;
+    -c|--cluster)
+        shift
+        if [ -z "$(echo $1 | grep ^-.)" ]; then
+          # skip the -xx option, in case
+          cluster=$1
+          shift
+        fi
+        ;;
+    -n|--node_rank)
+        shift
+        if [ -z "$(echo $1 | grep ^-.)" ]; then
+          # skip the -xx option, in case
+          node_rank=$1
+          shift
+        fi
+        ;;
+    -h|--help)
+        help >& 2
+        exit 2 ;;
+    -*)
+        echo "${0}: ${1}: invalid option" >&2
+        help >& 2
+        exit 2 ;;
+    *)
+        break ;;
+  esac
+done
+
+[ -z "$mode" ] && help && exit 1
+
+if [ "$mode" != "16p" ] && [ "$mode" != "acc" ]; then
+  echo -e "\033[1;31mERROR: 未知 mode '$mode'，应为 perf 或 acc\033[1;37m"
+  help
+  exit 1
+fi
+
+# 路径前置校验：未补充的路径直接报错退出，避免装完环境才失败
+if [ -z "$MODEL_PATH" ] || [ ! -d "$MODEL_PATH" ]; then
+  echo -e "\033[1;31mERROR: MODEL_PATH 未配置或目录不存在: '${MODEL_PATH}'（请在脚本头部补充）\033[1;37m"
+  exit 1
+fi
+if [ "$mode" == "acc" ] && { [ -z "$MATH500_JSONL" ] || [ ! -f "$MATH500_JSONL" ]; }; then
+  echo -e "\033[1;31mERROR: MATH500_JSONL 未配置或文件不存在: '${MATH500_JSONL}'（请在脚本头部补充）\033[1;37m"
+  exit 1
+fi
+
+check_npu_avaiable "$mode"
+
+ws_suffix="$mode"
+[ -n "$precision" ] && ws_suffix="${ws_suffix}_${precision}"
+workspace="$workspace/$ws_suffix"
+ascend_log="$workspace/ascend_log"
+mkdir -p $ascend_log
+export ASCEND_PROCESS_LOG_PATH="$ascend_log"
+#prepare_environment
+prepare_parameter
+run_model
+rc=$?
+clean_environment
+exit $rc
