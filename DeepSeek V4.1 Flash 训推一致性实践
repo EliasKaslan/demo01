@@ -1,5 +1,39 @@
 # DeepSeek V4.1 Flash 训推一致性实践
 
+## 2026-11-23 单机 PCP8 实机复验
+
+完整专家版启动脚本使用双机 16 卡，每台一个 DP 实例，推理并行为 TP1 / PCP8 / DP2 / EP16。本次在单机上用 Top32 BF16 减专家权重保留 PCP8，将全局 DP 和 EP 分别设为 1 和 8。两套检查点均为 40 层，减专家版保留 32 个路由专家。指定目录的历史脚本和日志用于核对推理拓扑，本轮实机范围为单机 Top32。 [代码修改说明](DeepSeek%20V4.1%20Flash%20%E8%AE%AD%E6%8E%A8%E4%B8%80%E8%87%B4%E6%80%A7%E4%BF%AE%E6%94%B9) · [单机配方](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/c957ed862b00b5ef3cc7ed454dc25c83cbe0426e/experiments/2026-11-18-countbenchqa/configs/pcp8-countbenchqa.json)
+
+| 配置 | 旧 Top32 配方 | 完整专家推理脚本 | 本次 Top32 单机 |
+| --- | --- | --- | --- |
+| 推理 TP / PCP / DP / EP | 1 / 1 / 8 / 8 | 1 / 8 / 2 / 16 | **1 / 8 / 1 / 8** |
+| 推理 NPU | 单机 8 卡 | 双机 16 卡 | 单机 8 卡 |
+| 训练 | TP1 / CP1 / FSDP8 / EP8 | 目录为推理服务 | TP1 / CP1 / FSDP8 / EP8 |
+
+### 先用固定历史定位，再跑在线 RL
+
+同一道题先生成 token，再把同一串 token 作为固定历史重新 prefill。默认 PCP 路径的缓存 decode 从第 2 个 token 开始出现差异。图模式、eager 和复制 decode 请求的对照均为 40/48 处位差。保持请求分片并关闭 PCP O-proj 权重分片后，固定历史对照为 **0/48**，单请求与混合批次间也为 **0/24**。同一独立推理诊断中，启动日志的 KV 容量从 363,870 变为 268,101 token，减少约 26.3%。[实施代码和快验入口](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/commit/c957ed862b00b5ef3cc7ed454dc25c83cbe0426e)
+
+在第一台机器上，在线首步对比了 96 条回答和 87,216 个有效 token，位差为 0，首步更新成功同步。容器在第二步生成期间停止。换到 177.42.24.1 后缩小批次，每步 4 道 CountBenchQA 题、每题 4 条真实回答，保持 1,024 输入和 2,048 输出上限、异步调度和 `FULL_DECODE_ONLY`。快验初次结束时触发了旧的批次计数断言，修正后完成全部两步。[两步验收摘要](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/c957ed862b00b5ef3cc7ed454dc25c83cbe0426e/experiments/2026-11-18-countbenchqa/evidence/pcp8-20261123/online-quick-validation.json)
+
+| 步骤 | Rollout 权重版本 | 回答数 | 有效 token | FP32 位差 |
+| --- | --- | ---: | ---: | ---: |
+| 1 | 初始权重 | 16 | 16,633 | 0 |
+| 2 | 首步更新后 | 16 | 15,005 | 0 |
+| **合计** | | **32** | **31,638** | **0** |
+
+八个 worker 都记录了实际图重放。核对了两次非零梯度更新，初始权重和两次更新共 432 对敏感 FP32 张量哈希全部匹配。两步的 `logpdiff` 最大值和绝对差总和均为 0。实验退出后八张卡已释放。[逐步结果与代码指纹](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/c957ed862b00b5ef3cc7ed454dc25c83cbe0426e/experiments/2026-11-18-countbenchqa/evidence/pcp8-20261123/online-quick-validation.json)
+
+在已有八卡验收环境中，从实验仓的 CountBenchQA 实验目录执行以下命令。目标主机和并行通信环境沿用本轮机时的配置。[启动脚本](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/c957ed862b00b5ef3cc7ed454dc25c83cbe0426e/experiments/2026-11-18-countbenchqa/tools/launch_trial.py) · [离线验收器](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/c957ed862b00b5ef3cc7ed454dc25c83cbe0426e/experiments/2026-11-18-countbenchqa/tools/verify_training.py)
+
+```bash
+python tools/launch_trial.py "$DSV41_TARGET_HOST" countbenchqa-pcp8-quick \
+  --kind training --arm aligned --rollout-pcp8 --pcp-full-oproj --quick-batch --steps 2 \
+  --recipe configs/pcp8-countbenchqa.json --through-completion
+```
+
+## 2026-11-20 DP8 调优记录
+
 更新于 2026-11-20。**优化版在 CountBenchQA 上连续完成 100 步真实 GRPO，9,600 条回答的 1,885,622 个有效 token 全部达到 `logpdiff=0`。** 对齐版经 mHC 调优后，在线 Rollout 耗时下降 **21.22%**，固定输出长度的独立推理吞吐提升 **26.88%**。 [百步逐步复核](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/evidence/night22-long/optimized100.json) · [详细性能报告](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/%E6%80%A7%E8%83%BD%E5%88%86%E6%9E%90%E6%8A%A5%E5%91%8A.md)
 
 ## 一、交付版本和本轮增量

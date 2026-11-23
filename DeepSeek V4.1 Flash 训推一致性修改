@@ -1,6 +1,22 @@
 # DeepSeek V4.1 Flash 训推一致性修改
 
-## 当前交付版本（2026-11-20）
+## 2026-11-23 单机 PCP8 交付
+
+本轮将 DeepSeek‑V4.1‑Flash Top32 BF16 的 CountBenchQA rollout 从 `TP1 / PCP1 / DP8 / EP8` 切换到 `TP1 / PCP8 / DP1 / EP8`，保持八张卡和同机训练共置。训练采用 TP1 / CP1 / FSDP8 / EP8。以下提交位于三个仓库的 `experiment/countbenchqa-pcp8-20261123` 分支。[固定配方](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/c957ed862b00b5ef3cc7ed454dc25c83cbe0426e/experiments/2026-11-18-countbenchqa/configs/pcp8-countbenchqa.json)
+
+| 仓库 | 提交 | 本轮修改 |
+| --- | --- | --- |
+| verl | [`9bbe79b6107d`](https://gitcode.com/EliasKaslan/dsv41-verl/commit/9bbe79b6107de413a330c269813b3d22015257ca) | 将 PCP 计入 rollout 副本设备数、Ray worker 分组与 vLLM 参数，按 PCP rank 保持训练和推理侧权重传输地址一致。 |
+| vLLM Ascend | [`f8d6ebcfa1ec`](https://gitcode.com/EliasKaslan/dsv41-vllm-ascend/commit/f8d6ebcfa1ec5f548b6796b0f496602526037961) | 对 TP1 / PP1 / DP1 的 PCP 路径，使用已初始化的 PCP 通信组归并专家槽，保持训练侧 FP32 加权顺序。 |
+| 实验与验收 | [`c957ed862b00`](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/commit/c957ed862b00b5ef3cc7ed454dc25c83cbe0426e) | 固化完整 O-proj 配置和 `--quick-batch`，支持 4 题 × 4 条回答的两步复测，验收器按配方校验每 rank 数量、原始 logprob、图重放和权重更新。 |
+
+**专家槽归并。** 先按 PCP rank 汇集 token，再用整数表示保留 BF16 专家槽的原始位模式。各专家槽由对应专家 rank 提供，PCP reduce-scatter 将槽还给所属 token 的 rank，最后按训练侧顺序做 FP32 加权。图执行期直接读取已初始化的通信组，避免依赖只在配置初始化阶段有效的上下文。[MoE 槽实现](https://gitcode.com/EliasKaslan/dsv41-vllm-ascend/blob/f8d6ebcfa1ec5f548b6796b0f496602526037961/vllm_ascend/ops/dsv41_graph_moe.py) · [分发与归并](https://gitcode.com/EliasKaslan/dsv41-vllm-ascend/blob/f8d6ebcfa1ec5f548b6796b0f496602526037961/vllm_ascend/ops/fused_moe/token_dispatcher.py)
+
+**O-proj 舍入。** 默认 PCP prefill 使用完整输出投影权重，缓存 decode 按分片计算并将各 rank 的部分结果分别舍入为 BF16，再做归约。逐层对照中，第 1 层的注意力查询、滑窗 KV 和注意力输出一致，差异在第 2 层查询出现。只设置 `enable_pcp_o_proj_weight_sharding=false` 后，固定历史重算与缓存解码的 FP32 位差由 **40/48 降到 0/48**。默认的 PCP decode 请求分片仍在运行。[快验启动入口](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/c957ed862b00b5ef3cc7ed454dc25c83cbe0426e/experiments/2026-11-18-countbenchqa/tools/launch_trial.py) · [O-proj 通信路径](https://gitcode.com/EliasKaslan/dsv41-vllm-ascend/blob/f8d6ebcfa1ec5f548b6796b0f496602526037961/vllm_ascend/weight_switch/o_proj.py)
+
+**实机验收。** 图模式 `FULL_DECODE_ONLY` 和异步调度下，完成两步真实 GRPO。32 条回答的 31,638 个有效 token 均逐位相等，第二步使用首步更新后的策略，八个 rank 均有实际图重放，432 对敏感 FP32 张量哈希一致。验收覆盖 Ascend 950DT 单机 8 卡的 Top32 BF16 配方。[两步验收摘要](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/c957ed862b00b5ef3cc7ed454dc25c83cbe0426e/experiments/2026-11-18-countbenchqa/evidence/pcp8-20261123/online-quick-validation.json)
+
+## 2026-11-20 DP8 调优交付
 
 11 月 19 日这轮调优的运行时代码变化集中在 **vLLM Ascend 的推理侧 mHC**。训练和 RL 框架沿用调优前的验收提交。本文后半部分保留早期文本、eager 验收的源码对照，便于追溯基础对齐改动。
 
