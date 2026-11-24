@@ -1,200 +1,60 @@
-# DeepSeek V4.1 Flash 训推一致性实践
+## 当前可用的 GitCode 代码仓
 
-## 2026-11-23 单机 PCP8 实机复验
+复现单机八卡 CountBenchQA 百步结果时，四个仓库均使用 `optimization/countbenchqa-zero-20261119` 分支。下表提交已从 GitCode 远端分支回读核对。
 
-完整专家版启动脚本使用双机 16 卡，每台一个 DP 实例，推理并行为 TP1 / PCP8 / DP2 / EP16。本次在单机上用 Top32 BF16 减专家权重保留 PCP8，将全局 DP 和 EP 分别设为 1 和 8。两套检查点均为 40 层，减专家版保留 32 个路由专家。指定目录的历史脚本和日志用于核对推理拓扑，本轮实机范围为单机 Top32。 [代码修改说明](DeepSeek%20V4.1%20Flash%20%E8%AE%AD%E6%8E%A8%E4%B8%80%E8%87%B4%E6%80%A7%E4%BF%AE%E6%94%B9) · [单机配方](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/c957ed862b00b5ef3cc7ed454dc25c83cbe0426e/experiments/2026-11-18-countbenchqa/configs/pcp8-countbenchqa.json)
 
-| 配置 | 旧 Top32 配方 | 完整专家推理脚本 | 本次 Top32 单机 |
-| --- | --- | --- | --- |
-| 推理 TP / PCP / DP / EP | 1 / 1 / 8 / 8 | 1 / 8 / 2 / 16 | **1 / 8 / 1 / 8** |
-| 推理 NPU | 单机 8 卡 | 双机 16 卡 | 单机 8 卡 |
-| 训练 | TP1 / CP1 / FSDP8 / EP8 | 目录为推理服务 | TP1 / CP1 / FSDP8 / EP8 |
+| 仓库                        | 在本项目中的职责                               | 分支提交   | GitCode 入口                                                                                                               |
+| --------------------------- | ---------------------------------------------- | ---------- | -------------------------------------------------------------------------------------------------------------------------- |
+| vLLM Ascend                 | 推理算子、KV 缓存、解码图、MoE 通信和 mHC 优化 | `aa9500af` | [推理代码](https://gitcode.com/EliasKaslan/dsv41-vllm-ascend/tree/optimization/countbenchqa-zero-20261119)                 |
+| FSDPTurbo                   | 训练模型层、mHC 和稀疏注意力的前向与反向       | `cdd0c570` | [训练模型代码](https://gitcode.com/EliasKaslan/dsv41-fsdp-turbo/tree/optimization/countbenchqa-zero-20261119)              |
+| verl                        | GRPO 启动、actor 评分、loss 审计和权重同步     | `798cfee1` | [RL 框架代码](https://gitcode.com/EliasKaslan/dsv41-verl/tree/optimization/countbenchqa-zero-20261119)                     |
+| dsv41-zero-mismatch-private | 启动配方、固定负载、验收脚本与实验回执         | `8bd92c42` | [实验与验收代码](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/tree/optimization/countbenchqa-zero-20261119) |
 
-### 先用固定历史定位，再跑在线 RL
+截至 2026 年 11 月 24 日，已完成验收的是 **40 层、32 个路由专家的 BF16 模型，在单机八卡上运行真实在线 GRPO**。推理使用解码图、异步调度、TP1／DP8／EP8，训练使用 TP1／FSDP8／EP8／CP1。优化版在 CountBenchQA 上连续训练 100 步，9,600 条回答中的 **1,885,622 个有效 token，推理记录的 logprob 和训练实际使用的 logprob 全部 FP32 逐位相同**。推理侧扩展到 PCP8 和 TP8 后分别通过了两步验收。训练 CP4 是这条开发线仍待完成的一步。
 
-同一道题先生成 token，再把同一串 token 作为固定历史重新 prefill。默认 PCP 路径的缓存 decode 从第 2 个 token 开始出现差异。图模式、eager 和复制 decode 请求的对照均为 40/48 处位差。保持请求分片并关闭 PCP O-proj 权重分片后，固定历史对照为 **0/48**，单请求与混合批次间也为 **0/24**。同一独立推理诊断中，启动日志的 KV 容量从 363,870 变为 268,101 token，减少约 26.3%。[实施代码和快验入口](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/commit/c957ed862b00b5ef3cc7ed454dc25c83cbe0426e)
+## 一、训推不一致定位和解决思路
 
-在第一台机器上，在线首步对比了 96 条回答和 87,216 个有效 token，位差为 0，首步更新成功同步。容器在第二步生成期间停止。换到 177.42.24.1 后缩小批次，每步 4 道 CountBenchQA 题、每题 4 条真实回答，保持 1,024 输入和 2,048 输出上限、异步调度和 `FULL_DECODE_ONLY`。快验初次结束时触发了旧的批次计数断言，修正后完成全部两步。[两步验收摘要](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/c957ed862b00b5ef3cc7ed454dc25c83cbe0426e/experiments/2026-11-18-countbenchqa/evidence/pcp8-20261123/online-quick-validation.json)
+同一个模型在训练和推理时，执行顺序天然不同。训练拿到整段回答，一次算出各位置的 logits。推理先处理图文提示，再逐个生成 token，从分页缓存取历史 KV。只要两侧在某一层选了不同的稀疏索引、不同的专家，或在归约前后不同的位置舍入到 BF16，后续层就可能沿着不同的输入继续计算。直接比较两条自然生成的回答，很难定位第一个差异。
 
-| 步骤 | Rollout 权重版本 | 回答数 | 有效 token | FP32 位差 |
-| --- | --- | ---: | ---: | ---: |
-| 1 | 初始权重 | 16 | 16,633 | 0 |
-| 2 | 首步更新后 | 16 | 15,005 | 0 |
-| **合计** | | **32** | **31,638** | **0** |
+前序开发先在四层、384 个路由专家的小模型上固定 token 历史。让同一请求分别经历单独运行、混批、调换顺序、逐 token 解码和整段重新预填充，再把推理结果与训练前向逐位置对照。这一步把“前面已经选了不同的词”和“给定相同历史仍算出不同的数”分开。随后换成保留全部 40 层的 Top32 权重，每个 token 仍从保留的专家中选 6 个，在八卡上检查输入边界和更新后的策略。
 
-八个 worker 都记录了实际图重放。核对了两次非零梯度更新，初始权重和两次更新共 432 对敏感 FP32 张量哈希全部匹配。两步的 `logpdiff` 最大值和绝对差总和均为 0。实验退出后八张卡已释放。[逐步结果与代码指纹](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/c957ed862b00b5ef3cc7ed454dc25c83cbe0426e/experiments/2026-11-18-countbenchqa/evidence/pcp8-20261123/online-quick-validation.json)
+正式开发和验收使用 **CountBenchQA**。Top32 权重保留的是这项任务的热点专家。
 
-在已有八卡验收环境中，从实验仓的 CountBenchQA 实验目录执行以下命令。目标主机和并行通信环境沿用本轮机时的配置。[启动脚本](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/c957ed862b00b5ef3cc7ed454dc25c83cbe0426e/experiments/2026-11-18-countbenchqa/tools/launch_trial.py) · [离线验收器](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/c957ed862b00b5ef3cc7ed454dc25c83cbe0426e/experiments/2026-11-18-countbenchqa/tools/verify_training.py)
+## 二、逐层对齐前向：哪些地方换了算子，哪些地方改了算法
 
-```bash
-python tools/launch_trial.py "$DSV41_TARGET_HOST" countbenchqa-pcp8-quick \
-  --kind training --arm aligned --rollout-pcp8 --pcp-full-oproj --quick-batch --steps 2 \
-  --recipe configs/pcp8-countbenchqa.json --through-completion
-```
+最初尝试统一精度时，很快遇到一个问题：即使两个张量最后都存成 BF16，只要中间一次加法、归一化或专家加权发生在不同精度，最终位模式仍会不同。开发真正要确定的是，每一段以哪一侧的计算为准，以及另一侧如何接入。
 
-## 2026-11-20 DP8 调优记录
 
-更新于 2026-11-20。**优化版在 CountBenchQA 上连续完成 100 步真实 GRPO，9,600 条回答的 1,885,622 个有效 token 全部达到 `logpdiff=0`。** 对齐版经 mHC 调优后，在线 Rollout 耗时下降 **21.22%**，固定输出长度的独立推理吞吐提升 **26.88%**。 [百步逐步复核](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/evidence/night22-long/optimized100.json) · [详细性能报告](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/%E6%80%A7%E8%83%BD%E5%88%86%E6%9E%90%E6%8A%A5%E5%91%8A.md)
+| 模块                     | 改动方向                                          | 最终实现                                                                                                                                                                                                                                                                                                  |
+| ------------------------ | ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| mHC 前、后处理           | **推理侧换用训练同款 CANN 算子**                  | 原生推理使用 HcPre／HcPost。对齐实现采用训练同款 delayed-premix 前处理和后处理，使用`mhc_pre_sinkhorn_premix`、`mhc_post`。<br />先固定行数消除批次形状带来的差异，后续再优化小批次。训练保留有反向实现的封装。                                                                                           |
+| RoPE 位置旋转            | **推理侧对齐训练算法**                            | 推理使用与训练一致的频率表、FP32 旋转及转换顺序。对齐点是逐步计算，另外推理新增支持分页解码的位置输入。                                                                                                                                                                                                   |
+| KV、稀疏索引和注意力     | **推理侧采用训练侧的 BF16 KV 表示和索引选择规则** | 原生推理使用混合量化缓存和配套索引。对齐后采用 BF16 页、按训练规则选 key，在图内按固定容量处理候选，<br />注意力走匹配的 SparseFlashMla 路径。训练有整段序列，推理有页表和增量写入，因此开发了推理专用索引器和写入逻辑。<br />训练保留可微 SFA 封装，使用实际序列长度和`sparse_flash_mla_grad` 计算梯度。 |
+| MoE 门控、专家计算和合并 | **推理侧对齐训练精度与运算顺序**                  | 对齐 RMSNorm 后的 BF16 舍入、FP32 gate、打分、top-k、归一化、SwiGLU 和共享专家相加。<br />专家输出还要按训练顺序加权，这一要求后来直接改变了跨卡通信实现。                                                                                                                                                |
+| 视觉线性层与输出词表     | **推理侧采用训练对应算术和词表规则**              | 视觉线性层使用训练对应的计算路径。图片占位符仍参与输入，推理输出端按训练约定屏蔽该 ID。                                                                                                                                                                                                                   |
+| 所选 token 的 logprob    | **训练侧换用推理侧 V2 评分前向**                  | actor 用自身前向生成的 logits 和实际选中的 token 调用推理同款`compute_token_logprobs`。训练另行实现 FP32 的解析反向，<br />把梯度传回 logits。这个方向与前几项相反。                                                                                                                                      |
 
-## 一、交付版本和本轮增量
+这些改动分布在三个仓库。vLLM Ascend 负责服务端算术、缓存和图执行，FSDPTurbo 负责训练模型层及反向，verl 把真实 rollout、训练 loss 和权重更新串起来。各项代码入口和保存的反向中间量可由算子映射直接查到。
 
-四个公开仓库的交付分支均为 `optimization/countbenchqa-zero-20261119`。按实验总仓锁定的版本复现。
+## 三、其它影响训推一致性的因素
 
-| 仓库 | 验收提交 | 内容 |
-| --- | --- | --- |
-| 实验总仓 | [`8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4`](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/commit/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4) | 运行配方、消融工具、性能与数值验收 |
-| vLLM Ascend | [`aa9500afda0f937f5c55b884e97d2dfda3666751`](https://gitcode.com/EliasKaslan/dsv41-vllm-ascend/commit/aa9500afda0f937f5c55b884e97d2dfda3666751) | 推理侧 mHC 16 行下限与原有推理一致性改动 |
-| FSDPTurbo | [`cdd0c5708706f10dad11fff22184b64387a56eb7`](https://gitcode.com/EliasKaslan/dsv41-fsdp-turbo/commit/cdd0c5708706f10dad11fff22184b64387a56eb7) | 沿用调优前已验收的训练框架 |
-| verl | [`798cfee18da0180e408d281ccdadf72d5b4d30ab`](https://gitcode.com/EliasKaslan/dsv41-verl/commit/798cfee18da0180e408d281ccdadf72d5b4d30ab) | 沿用 CountBenchQA 训练、审计及评分代码 |
 
-11 月 19 日的框架代码增量在推理侧 mHC。合格的小批次从补到 128 行改为最少补到 16 行，继续使用确定性 CANN 算子。Actor 源码和训练配方沿用调优前版本。早期的视觉输入、图回放、分页缓存和原生反向支持构成此次优化的基础。
+| 因素                   | 偏差来源                                                                                                                    | 处理与验证                                                                                                                                                                                          |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 图文输入与输出词表     | 图片占位后的换行会改变输入 token。即使输入相同，<br />推理端若让图片占位 ID 进入 log-softmax 分母，也会改变普通词的分数。   | 逐题核对图像和展开后的 token ID。输入保留占位符，输出屏蔽 ID`129264`。<br />修复后，无梯度和带梯度两组各 2,561 个分数，位差均从 90 处降至 0。                                                       |
+| 解码图回放：索引与 KV  | 捕图时读取主机长度，会把当时的可见范围固化。<br />对非连续 KV 页复制后再写，后续解码读到的仍是旧缓存。                      | 固定索引容量，每次回放从设备读取实际长度和页表，屏蔽无效位置。<br />KV 按原 storage 的偏移和步长写入。用换入新长度、新页表的请求验证回放。                                                          |
+| 解码图回放：mHC 与 MoE | mHC 的动态 Python 分块妨碍整图捕获。<br />MoE 的动态专家槽、无效槽残值和重复归约都可能改变合并结果。                        | 提前注册 mHC 自定义算子，由 NPU 执行真实计算。<br />MoE 固定槽位、清零无效槽，用整数通信保留 BF16 原始位，按原 top-k 顺序做一次 FP32 加权。<br />逐卡回读确定性等级 3，并验证混批、换序后的图回放。 |
+| 更新后的策略与权重     | actor 更新后，若推理副本仍用旧权重，或 FP32 参数在传输中损失精度，<br />两侧就会对同一回答给出不同分数。                    | 按训练步和进程号找到实际执行回放的八个 worker，核对收发权重，再比较下一步的分数。<br />百步运行共核对 14,544 对敏感权重哈希。                                                                       |
+| 验收口径               | bypass 模式下，旧策略分数可能直接引用 rollout 分数，自身相减会得到假零。<br />跨 DP 取平均还会把全局有效 token 数缩小八倍。 | 在真实 loss 入口，用 actor 独立前向和 rollout 原始分数逐位比较。<br />对齐同一回答、因果位置和有效 mask，按全局求和核实比较覆盖数。                                                                 |
 
-**训推对齐采用混合实现。** 推理侧 mHC 复用训练实现，SparseMLA 使用同一扩展的前向接口，训练侧 logprob 复用推理 scorer 并接入一阶梯度。其他环节通过精度、舍入顺序和执行路径对齐。训练侧的反向由专用算子或明确的梯度实现执行。 [代码修改说明](DeepSeek%20V4.1%20Flash%20%E8%AE%AD%E6%8E%A8%E4%B8%80%E8%87%B4%E6%80%A7%E4%BF%AE%E6%94%B9) · [优化版配方](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/configs/optimized.json)
+## 四、性能代价与已完成的优化
 
-## 二、推理 BI、PD 一致性分别改了什么
+推理侧最直接的优化来自 mHC。每卡只有一两条活跃请求时，旧对齐路径仍补到 128 行。开发将小批次补齐下限降至 16 行，保留原有算术。训练侧继续使用原分块，因为取消分块虽然前向逐位相同，反向仍测到梯度位差。最终版完成了 CountBenchQA 百步零位差验收。
 
-这里 PD 指 Prefill/Decode 一致性。**BI 与 PD 共用不少改动，并不存在“换一个 BI 算子，再换一个 PD 算子”这样的一一对应关系。**
 
-表中区分原有 BI 基础设施、前期对齐及本轮调优，实际路径以本次验收配方为准。
+| 指标                     |          基线 |     优化前对齐 |       最终对齐 | 最终版相对基线 |
+| ------------------------ | ------------: | -------------: | -------------: | -------------: |
+| 固定 96 条请求的推理耗时 | 43.747 秒／批 | 143.791 秒／批 | 113.352 秒／批 |       +159.11% |
+| 真实在线 RL 暖步耗时     | 239.39 秒／步 |  333.60 秒／步 |  274.80 秒／步 |        +14.79% |
 
-| 层面           | 原路径 → 对齐路径                                                            | 原因及作用                                                    | 来源                            |
-| -------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------- | ------------------------------- |
-| 矩阵计算       | mm/matmul → AscendC BI 实现；不可用时可选 Triton；addmm/bmm 使用 Triton 实现 | 减少 batch 变化造成的计算路径差异                             | 原有 BI 基础设施                |
-| softmax、sum   | 部分调用替换为 BI 实现                                                        | 固定适用归约的计算方式；sum 有 dtype、维度、`out=` 等回退条件 | 原有基础设施；最新补`out=` 兼容 |
-| AddRMSNorm     | fused add-rmsnorm → add +`npu_rms_norm`                                      | 代码明确注明 fused 接口不能保证 BI                            | 原有 BI 基础设施                |
-| mHC 调用行数 | 基础对齐版固定 128 行，最终版合格输入按实际行数调用并至少补到 16 行 | 减少 decode 小批次的填充与计算 | 前期对齐 + 本轮调优 |
-| mHC pre/post | 推理可调用训练侧 premix/post 算子，确定性等级为 3 | 统一已验收路径的 mHC 算术 | 前期对齐 |
-| MoE 通信 | 本次验收使用 AllGather 固定专家槽，保留 FP32 专家加权合并 | 保持图回放下的专家调度和合并路径 | 最终验收配方 |
-| decoder replay | 新 context 重新开始游标 → 继承并回写`moe_layer_index`                        | 保持从 decoder 后缀进入 replay 时的 MoE 层序号连续            | 最新提交                        |
-
-对应到 PD，需要在不同阶段统一已验收的 mHC 算术、MoE 通信与计算路径，并正确维护 replay 状态。BF16 KV、训练侧索引器和 RoPE 共同参与这条一致性路径。
-
-另外，BI 注册中虽然替换了通用 `npu_fused_infer_attention_score`，**DSV4.1 此处走的是 SparseMLA，不能把通用 attention 的 BI 替换当作 SparseMLA 已获得 BI 的证明。**
-
-## 三、训推前向的对齐方向
-
-表注：下表针对当前指定分支的可选对齐路径；相关开关默认关闭，模型与算子配置也必须选择对应实现。
-
-| 部件             | 对齐方向                         | 实际修改                                                                       |
-| ---------------- | -------------------------------- | ------------------------------------------------------------------------------ |
-| mHC | **推理复用训练算子** | 推理使用训练的 `mhc_pre_sinkhorn_premix` 和 `mhc_post`。训练保持 128 行分块，推理对合格输入使用至少 16 行的调用方式 |
-| SparseMLA        | **两端共用同一扩展包的前向接口** | 都使用`cann_ops_transformer` SparseFlashMla；本次交付训练为 TND，推理为分页 PA_BBND   |
-| KV cache         | **推理向 BF16 训练路径**         | A5 推理绕开 mixed-quant packed attention cache，选择 BF16 路径                 |
-| Router 输入      | **推理向训练**                   | RMSNorm 先按 BF16 舍入，再转 FP32 给 router                                    |
-| Gate 存储、打分  | **两端共同收敛**                 | FP32 gate 权重、稳定分段 sqrt-softplus、匹配归一化                             |
-| MoE route scale  | **训练向推理的舍入顺序对齐**     | 训练移除权重中的 scale，改成 routed 输出合并后乘 scale                         |
-| MoE 合并、SwiGLU | **推理向训练**                   | 对齐 FP32 中间计算、合并及转回 BF16 的位置                                     |
-| RoPE             | **推理向训练**                   | CPU 复数频率表、YaRN 运算顺序、FP32 旋转算术                                   |
-| LM head          | **训练向推理计算精度对齐**       | verl 构建训练模型时选择 BF16 head compute，同时保留所需 FP32 参数              |
-| logprob          | **训练直接复用推理 scorer**      | 训练 logits 交给 vLLM V2`compute_token_logprobs`，外包 autograd Function       |
-| 权重同步         | 训练参数 → 常驻推理 worker      | 保留参数存储精度；sink 经正式 weight loader 加载                               |
-
-理解两端复用算子的边界时，需要同时看实际运行的数值路径和覆盖范围。
-
-- **算子名相同仍需检查数值路径。** dtype、布局、启动规模和归约顺序都可能影响结果。mHC 的 128 行方案用于基础对齐，优化版的推理调用形状另做了实际轨迹和训练更新验收。
-- **当前代码没有全面这样做**：训练主干仍调用 `F.linear`，专家投影仍有 `npu_grouped_matmul` 路径；在所检查的 FSDPTurbo、verl 源码中，没有找到与推理相同的完整 BI 注册初始化。因此只能说指定配置验证过一致，不能声称所有训练 GEMM 都已替换为推理 BI GEMM。
-
-## 四、训练反向与 checkpoint 重算
-
-**1. mHC：有专门的 backward 算子**
-
-```text
-训练 forward
- → 128 行分块、补零
- → _MhcPreSinkhornPremixFunction
- → mhc_pre_sinkhorn_premix
- → 保存输入及归一化等中间结果
-
-loss.backward()
- → 接收各输出梯度，包括跨层 grad_h_pre
- → mhc_pre_sinkhorn_premix_backward
- → 返回 x、phi、alpha、bias、premix 的梯度
-```
-
-post 同样由 `mhc_post_backward` 计算。最新运行代码移除了额外 eager h_pre 梯度补偿，直接让原生 backward 接管。
-
-**2. SparseMLA：前向保存 LSE，反向调用专用 Grad**
-
-```text
-_SparseFlashMlaFunction.forward
- → sparse_flash_mla(return_softmax_lse=True)
- → 保存 Q、KV、输出、softmax LSE、sink 等
-
-backward
- → 构建 backward metadata
- → sparse_flash_mla_grad
- → 返回 dQ、dKV、dCompressedKV、dSink
-```
-
-这是实际梯度算子，不是再调一次前向就获得梯度。训练需要返回 LSE；推理这条路径不需要反向，因此不请求 LSE。
-
-**3. logprob：推理 scorer 没有在此提供反向，训练补了解析 VJP**
-
-```text
-forward：实际调用推理 compute_token_logprobs
-backward：用保存的训练 logits 计算
-          grad_logits = incoming × (one_hot(label) - softmax(logits))
-```
-
-这是**前向复用推理实现，反向手写数学梯度**。它是标准 selected log-softmax 的一阶梯度，不是对 Triton 前向逐条指令求导。
-
-当前有明确边界：调用分支限温度为 1、指定 nested-label 路径；`once_differentiable` 表示没有提供高阶 AD 支持。
-
-**4. 其他计算与 checkpoint**
-
-训练 grouped matmul 的自定义 backward 分别调用 grouped GEMM 算输入梯度和权重梯度；普通可微操作由 autograd 继续传播。
-checkpoint 开启时，流程是：
-
-```text
-首次前向：减少保留的中间激活
- → backward 需要中间量时，重放部分训练前向
- → 恢复中间量
- → 仍调用上述 backward 算子或解析梯度
- → 参数梯度、优化器更新
-```
-
-当前使用 `use_reentrant=False`。
-
-**所以，重算解决的是“反向需要的激活从哪里来”，专用 backward/VJP 解决的是“梯度怎么求”。即使 checkpoint 重跑了一个推理式前向，没有梯度定义也不会自动变得可训练。**
-
-## 五、图模式、异步调度和图文输入
-
-- **SparseMLA 索引与 KV 写入。** 单 query 的索引元数据保留在设备上，图回放时按当前有效长度屏蔽无效位置。分页 KV 通过已有的设备端按行写入接口处理非连续物理行，使回放能使用变化后的长度和页表。
-- **mHC 与 MoE。** mHC 沿用训练算术，用图编译可处理的边界注册和调用。跨 EP rank 传输时，以 INT32 位模式保留未加权专家输出的 BF16 原始位，再按训练顺序执行 FP32 加权合并。
-- **训练与评分。** GRPO 逐步比对实际参与损失计算的训练 FP32 logprob 与对应的 rollout logprob，并核对优化器更新及发往推理 worker 的权重。评分器修复了连续生成 6,084 位数字会触发整数转换异常的问题。早期独立服务的 50 条已有回答上，评分器的重评结果完全一致。
-- **独立服务的输出词表。** 图片占位 token `129264` 用于多模态输入。修复前，独立推理在计算输出 logprob 时仍将它纳入归一化，训练端已屏蔽它。即使实际生成的 token 完全一样，归一化分母也可能改变，使其他 token 的 FP32 logprob 出现位差。修复在对齐模式下将该 token 的输出 logit 设为 `-inf`，使 prompt 和 decode 的 logprob 都使用与训练侧一致的候选集合。图片输入保持原样。
-
-## 六、最终版验收与性能
-
-### 运行配置和数值覆盖
-
-- **部署。** 单机 8 张 Ascend 950DT，BF16 全 40 层 Top32 权重。推理 TP=1、DP=8、EP=8，开启异步调度与 `FULL_DECODE_ONLY`；训练 TP=1、FSDP=8、EP=8。输入、输出上限为 1,024 和 2,048 token。数据使用 CountBenchQA-lite 的真实图文题，450 题训练、50 题留出。百步累计覆盖 444 道不同训练题。
-- **百步比较口径。** 对同一权重和回答，从原始张量读取 rollout 以及参与 loss 的带梯度 Actor 前向分数，按 `response_mask` 逐位比较 FP32 logprob，1,885,622 个有效位置的位差为零。百步配方开启 `bypass_mode`，因此 `old_log_probs` 直接来自 rollout。每步的独立无梯度旧策略重算在这一配方中被跳过。同步到实际推理 worker 的 14,544 组敏感权重哈希全部匹配。 [百步逐步复核](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/evidence/night22-long/optimized100.json)
-- **无梯度与长度边界。** 单独回放 8 条固定轨迹，包含实际 1,024 输入、2,048 输出的样本。Actor 的无梯度和带梯度前向各自对照 2,561 个有效位置，均为零位差。无梯度旧策略重算的长跑覆盖仍待验证。 [边界验收原始回执](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/evidence/night21-optimized/accepted-recipe.json)
-- **模型质量范围。** 百步关闭了训练前及定期验证，原始训练日志没有最终验证集分数。三轮原生与对齐版的同配置答题评分已终止，因此本次没有答题正确率涨跌结论。
-
-### 端到端 RL 和独立推理
-
-| 指标 | 基线 | 优化前对齐 | 优化后对齐 | 优化后较基线 | 优化后较优化前 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 端到端 RL（秒/步） | 239.39 | 333.60 | 274.80 | +14.79% | −17.63% |
-| Actor 训练（秒/步） | 157.29 | 183.20 | 155.89 | −0.89% | −14.91% |
-| 在线 Rollout（秒/步） | 77.13 | 144.81 | 114.07 | +47.89% | −21.22% |
-| 在线 Rollout 吞吐（输出 tok/s） | 1,042.32 | 447.72 | 568.34 | −45.47% | +26.94% |
-| 固定输出长度独立推理（秒/96 条回答） | 43.75 | 143.79 | 113.35 | +159.11% | −21.18% |
-| 独立推理吞吐（输出 tok/s） | 1,993.63 | 606.55 | 769.43 | −61.41% | +26.88% |
-
-在线 RL 取四步实验第 2–4 步均值。基线是可完整反传的兼容配置，保留 TND 稀疏注意力。三版输入相同。基线自然生成 241,197 个 token，优化前后两版均生成 194,499 个，回答逐条相同。Actor 时长变化是整步运行中的观测值，两版 Actor 源码与配置相同。 [同机四步对照](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/evidence/night21-final/online-paired.json) · [兼容基线的运行记录](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/evidence/night21-final/compat-stages.json)
-
-独立推理以原生 vLLM Ascend 为基线，固定每条请求的输入、输出长度和目标 DP rank，每轮 87,216 个输出 token。每版独立启动三次，预热后每次测两轮，百分比取逐组配对的中位数。 [固定负载与逐项撤回](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/evidence/night21-final/triplets.json)
-
-### Rollout 消融
-
-| 对齐改动 | 优化前额外耗时（秒/96 条） | 优化后额外耗时（秒/96 条） |
-| --- | ---: | ---: |
-| BF16 KV 缓存与训练侧索引器 | +34.97 | +35.11 |
-| 全局批次不变性及自动选路 | +49.56 | +22.00 |
-| mHC 对齐 | +41.51 | +11.24 |
-| RoPE 对齐 | +6.02 | +5.98 |
-
-表中每项与同版完整配置配对，部分选路重叠，耗时不能相加。在同一源码上，单开 mHC 前处理优化节省 28.01 秒/批，单开后处理节省 1.86 秒/批。优化前后共核对 17 种撤回配置，其中 13 种取得有效配对计时，4 种在捕图或索引算子阶段失败。 [固定负载与逐项撤回](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/evidence/night21-final/triplets.json) · [详细性能报告](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/blob/8bd92c42ef09a43cfb7ceb2cf6b46b62eff011d4/experiments/2026-11-19-countbenchqa-performance/%E6%80%A7%E8%83%BD%E5%88%86%E6%9E%90%E6%8A%A5%E5%91%8A.md)
+固定推理对比同机原生服务，在线 RL 对比可完整反传的 TND 兼容版。剩余差距主要集中在 Rollout。固定负载消融中，BF16 KV 页与训练式索引器的联合改动解释约 **50.58%** 的相对原生额外耗时，全局批次不变性及其自动选路解释约 **31.65%**，两组路径有重叠。下一步拟评估反向适配，让训练侧使用推理侧优化后的 KV 与索引器。
