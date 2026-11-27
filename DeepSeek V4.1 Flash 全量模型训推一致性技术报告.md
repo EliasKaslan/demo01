@@ -1,5 +1,14 @@
 # DeepSeek V4.1 Flash 全量模型训推一致性技术报告
 
+**代码仓与版本**（GitCode，需相应仓库访问权限）
+
+| 代码仓 | 本报告涉及的实现 |
+|---|---|
+| [实验与验证](https://gitcode.com/EliasKaslan/dsv41-zero-mismatch-private/tree/84d8f57dbf54b2ac60b375dad42edc743c478b20) | 全专家在线 RL 启动配置、训推位差诊断 |
+| [FSDPTurbo](https://gitcode.com/EliasKaslan/dsv41-fsdp-turbo/tree/6bbc8ded3644618ae30e954db0ac78bc4ff7e13e) | Actor 训练、专家分派与空分片合并修复 |
+| [verl](https://gitcode.com/EliasKaslan/dsv41-verl/tree/48b8a2a25d9deb41ac072d5282be01b8c9fedaea) | RL 训练编排、上下文并行下的批量校验 |
+| [vLLM Ascend](https://gitcode.com/EliasKaslan/dsv41-vllm-ascend/tree/a45fc71d241b22ce1cef6aa38c5ecf000d4534c3) | 推理侧适配、分页 KV 与索引器 |
+
 **验收结论（截至 2026 年 11 月 25 日上午）**　在 8 机 64 张 Ascend 950DT 上，40 层、每层 384 个路由专家的 BF16 模型已完成 CountBenchQA 在线强化学习（GRPO）验证。长序列基线连续更新 28 步，覆盖 1,792 条图文回答。对其中 **3,670,016 个有效输出 token**，vLLM 生成时记录的对数概率（logprob）与训练端在真实损失函数中使用的值，全部达到 **FP32 逐位相同**。
 
 推理采用 64 路数据并行和 64 路专家并行（DP64 / EP64）；训练采用 64 路参数分片、64 路专家并行和 4 路上下文并行（FSDP64 / EP64 / CP4）。两端的张量并行度均为 1。视觉编码器及两张 Engram 查找表在训练中冻结。本文的零位差指标衡量同一策略版本下已选 token 的评分一致性，模型回答质量另行评估。
